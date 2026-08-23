@@ -29,10 +29,12 @@ from .audio import (
     AudioDevice,
     AudioRecorder,
     AudioRecorderError,
+    choose_input_device,
     list_input_devices,
 )
 from .config import Settings
 from .credentials import ApiKeyStore, CredentialStoreError
+from .storage import LocalStore, LocalStoreError, TokenTotals
 from .terminal import TerminalBridge, TerminalBridgeError
 from .transcription import GeminiTranscriber, TranscriptionDebug, TranscriptionWorker
 
@@ -67,9 +69,11 @@ class MainWindow(QMainWindow):
         transcriber_factory: Callable[[str], GeminiTranscriber] | None = None,
         microphone_provider: Callable[[], tuple[AudioDevice, ...]] | None = None,
         media_player_factory: MediaPlayerFactory | None = None,
+        local_store: LocalStore | None = None,
     ) -> None:
         super().__init__()
         self.settings = settings
+        self.local_store = local_store
         self.recorder = recorder or AudioRecorder()
         self.transcriber = transcriber
         self.terminal_bridge = terminal_bridge or TerminalBridge()
@@ -190,6 +194,7 @@ class MainWindow(QMainWindow):
         self.audio_debug = self._debug_text_block(debug_layout, "Áudio recebido")
         self.payload_debug = self._debug_text_block(debug_layout, "Payload enviado ao Gemini")
         self.return_debug = self._debug_text_block(debug_layout, "Retorno")
+        self.usage_debug = self._debug_text_block(debug_layout, "Consumo da API Gemini")
         self.debug_dock.setWidget(debug_widget)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.debug_dock)
         self.debug_dock.visibilityChanged.connect(self._sync_debug_button)
@@ -217,37 +222,54 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _refresh_microphones(self) -> None:
-        selected = self.microphone_combo.currentData()
+        current_identity: str | None = None
+        current_item_idx = self.microphone_combo.currentIndex()
+        if current_item_idx >= 0:
+            item_device = self.microphone_combo.itemData(
+                current_item_idx, Qt.ItemDataRole.UserRole + 1
+            )
+            if isinstance(item_device, AudioDevice):
+                current_identity = item_device.identity
+            elif isinstance(item_device, str):
+                current_identity = item_device
+
+        remembered_identity: str | None = None
+        if self.local_store is not None:
+            try:
+                remembered_identity = self.local_store.get_last_microphone_identity()
+            except Exception:
+                remembered_identity = None
+
         provider_error = False
         self._microphone_refreshing = True
         try:
             devices = tuple(self._microphone_provider())
-        except Exception as exc:
+        except Exception:
             provider_error = True
             self.microphone_combo.clear()
             self._microphone_available = False
-            self.status_label.setText(f"Não foi possível detectar microfones: {exc}")
+            self.status_label.setText("Não foi possível detectar microfones.")
         else:
             self.microphone_combo.clear()
-            for device in devices:
+            chosen_device = choose_input_device(
+                devices,
+                remembered_identity=remembered_identity,
+                current_identity=current_identity,
+            )
+            target_index = -1
+            for i, device in enumerate(devices):
                 suffix = " (padrão)" if device.is_default else ""
                 self.microphone_combo.addItem(
                     f"{device.name} (índice {device.index}){suffix}",
                     device.index,
                 )
-            self._microphone_available = bool(devices)
-            target_index = -1
-            if selected is not None:
-                target_index = self.microphone_combo.findData(selected)
-            if target_index < 0:
-                target_index = next(
-                    (
-                        index
-                        for index, device in enumerate(devices)
-                        if device.is_default
-                    ),
-                    0 if devices else -1,
+                self.microphone_combo.setItemData(
+                    i, device, Qt.ItemDataRole.UserRole + 1
                 )
+                if chosen_device is not None and device == chosen_device and target_index < 0:
+                    target_index = i
+
+            self._microphone_available = bool(devices)
             if target_index >= 0:
                 self.microphone_combo.setCurrentIndex(target_index)
         finally:
@@ -260,7 +282,6 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Nenhum microfone de entrada foi detectado.")
         self._select_microphone(self.microphone_combo.currentIndex())
         self._update_actions()
-
     @Slot(int)
     def _select_microphone(self, index: int) -> None:
         if self._microphone_refreshing or index < 0:
@@ -356,17 +377,39 @@ class MainWindow(QMainWindow):
         self.audio_debug.setPlainText("Capturando áudio…\nO WAV ainda não foi enviado.")
         self.payload_debug.clear()
         self.return_debug.clear()
+        self.usage_debug.clear()
         try:
             self.recorder.start()
         except AudioRecorderError as exc:
             self._set_error(str(exc))
             return
 
+        current_idx = self.microphone_combo.currentIndex()
+        selected_device = self.microphone_combo.itemData(
+            current_idx, Qt.ItemDataRole.UserRole + 1
+        )
+        selected_identity: str | None = None
+        if isinstance(selected_device, AudioDevice):
+            selected_identity = selected_device.identity
+        elif isinstance(selected_device, str):
+            selected_identity = selected_device
+
+        persistence_failed = False
+        if selected_identity and self.local_store is not None:
+            try:
+                self.local_store.save_last_microphone_identity(selected_identity)
+            except Exception:
+                persistence_failed = True
+
         self.state = AppState.RECORDING
         self.record_button.setText("Parar e revisar áudio")
-        self.status_label.setText("Gravando… fale em português e clique para parar.")
+        if persistence_failed:
+            self.status_label.setText(
+                "Gravando… não foi possível atualizar a memória do microfone."
+            )
+        else:
+            self.status_label.setText("Gravando… fale em português e clique para parar.")
         self._update_actions()
-
     def _finish_recording(self) -> None:
         try:
             capture = self.recorder.stop()
@@ -403,8 +446,8 @@ class MainWindow(QMainWindow):
             self._media_player.setSourceDevice(self._audio_buffer, QUrl("audio.wav"))
             self._media_player.play()
             self.status_label.setText("Reproduzindo o áudio capturado.")
-        except Exception as exc:
-            self.status_label.setText(f"Não foi possível reproduzir o áudio: {exc}")
+        except Exception:
+            self.status_label.setText("Não foi possível reproduzir o áudio.")
             self._release_audio_source()
 
     def _send_pending_audio(self) -> None:
@@ -443,9 +486,9 @@ class MainWindow(QMainWindow):
         self.editor.setPlainText(text)
         self.editor.selectAll()
         self._render_transcription_debug(debug, text=text)
+        self._record_and_render_usage(debug, "success")
         self.state = AppState.READY
         self.status_label.setText("Transcrição pronta. Revise, copie ou envie ao terminal.")
-        self._update_actions()
 
     @Slot(str, object)
     def _on_transcription_failed(
@@ -454,8 +497,8 @@ class MainWindow(QMainWindow):
         debug: TranscriptionDebug | None,
     ) -> None:
         self._render_transcription_debug(debug, error=message)
+        self._record_and_render_usage(debug, "error")
         self._set_error(message)
-
     @Slot()
     def _on_thread_finished(self) -> None:
         if self._thread is not None:
@@ -481,10 +524,8 @@ class MainWindow(QMainWindow):
 
     @Slot(object, str)
     def _on_media_error(self, error: object, error_string: str = "") -> None:
-        del error
-        self.status_label.setText(
-            error_string or "Não foi possível reproduzir o áudio capturado."
-        )
+        del error, error_string
+        self.status_label.setText("Não foi possível reproduzir o áudio capturado.")
 
     def _release_audio_source(self) -> None:
         if self._audio_buffer is not None:
@@ -544,7 +585,6 @@ class MainWindow(QMainWindow):
                         f"MIME: {debug.audio_mime_type}",
                         f"Áudio: {debug.audio_bytes} bytes",
                         f"Base64: {debug.audio_base64_length} caracteres",
-                        f"Preview Base64: {debug.audio_base64_preview}",
                     )
                 )
             )
@@ -555,6 +595,66 @@ class MainWindow(QMainWindow):
         elif error:
             self.return_debug.setPlainText(f"Erro: {error}")
 
+    def _record_and_render_usage(
+        self,
+        debug: TranscriptionDebug | None,
+        outcome: str,
+    ) -> None:
+        if debug is None or debug.usage is None:
+            self.usage_debug.setPlainText("metadados de consumo não fornecidos")
+            return
+
+        usage = debug.usage
+        totals: TokenTotals | None = None
+        if self.local_store is not None:
+            try:
+                self.local_store.record_token_usage(
+                    debug.model, usage, outcome
+                )
+                totals = self.local_store.get_token_totals()
+            except Exception:
+                self.usage_debug.setPlainText(
+                    "Não foi possível persistir o consumo de tokens."
+                )
+                return
+
+        def _format_token_count(value: int | None) -> str:
+            if value is None:
+                return "indisponível"
+            return str(value)
+
+        lines = [
+            "Chamada atual:",
+            f"Modelo: {debug.model}",
+            f"Entrada: {_format_token_count(usage.input_tokens)}",
+            f"Saída: {_format_token_count(usage.output_tokens)}",
+            f"Pensamento: {_format_token_count(usage.thought_tokens)}",
+            f"Cache: {_format_token_count(usage.cached_tokens)}",
+            f"Ferramentas: {_format_token_count(usage.tool_use_tokens)}",
+            f"Total: {_format_token_count(usage.total_tokens)}",
+        ]
+        if totals is not None:
+            lines.extend(
+                [
+                    "",
+                    "Total acumulado:",
+                    f"Entrada: {_format_token_count(totals.input_tokens)}",
+                    f"Saída: {_format_token_count(totals.output_tokens)}",
+                    f"Pensamento: {_format_token_count(totals.thought_tokens)}",
+                    f"Cache: {_format_token_count(totals.cached_tokens)}",
+                    f"Ferramentas: {_format_token_count(totals.tool_use_tokens)}",
+                    f"Total: {_format_token_count(totals.total_tokens)}",
+                ]
+            )
+        elif self.local_store is None:
+            lines.extend(
+                [
+                    "",
+                    "Total acumulado: indisponível",
+                ]
+            )
+
+        self.usage_debug.setPlainText("\n".join(lines))
     @Slot()
     def copy_text(self) -> None:
         text = self.editor.toPlainText()
@@ -628,7 +728,14 @@ class MainWindow(QMainWindow):
             set_source(QUrl())
         self._release_audio_source()
         self._pending_capture = None
-        if self._thread is not None and self._thread.isRunning():
-            self._thread.quit()
-            self._thread.wait(5000)
+        thread = self._thread
+        if thread is not None and thread.isRunning():
+            thread.quit()
+            if not thread.wait(5000):
+                thread.wait()
+        if self.local_store is not None:
+            try:
+                self.local_store.close()
+            except Exception:
+                pass
         event.accept()

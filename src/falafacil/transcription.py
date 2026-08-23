@@ -24,6 +24,16 @@ class TranscriptionError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class TokenUsage:
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    thought_tokens: int | None = None
+    cached_tokens: int | None = None
+    tool_use_tokens: int | None = None
+    total_tokens: int | None = None
+
+
+@dataclass(frozen=True)
 class TranscriptionDebug:
     model: str
     prompt: str
@@ -33,7 +43,7 @@ class TranscriptionDebug:
     audio_base64_preview: str
     response_text: str
     error: str | None
-
+    usage: TokenUsage | None = None
 
 class GeminiTranscriber:
     def __init__(
@@ -66,6 +76,7 @@ class GeminiTranscriber:
             audio_base64_preview=encoded_audio[:128],
             response_text="",
             error=None,
+            usage=None,
         )
         if not wav_bytes:
             return self._raise_transcription_error("O áudio está vazio.")
@@ -91,7 +102,18 @@ class GeminiTranscriber:
                 _friendly_api_error(exc, secret=self._api_key)
             ) from exc
 
-        text = str(getattr(interaction, "output_text", "")).strip()
+        raw_usage = getattr(interaction, "usage", None)
+        if raw_usage is None and isinstance(interaction, dict):
+            raw_usage = interaction.get("usage")
+        usage = _extract_usage(raw_usage)
+        if usage is not None:
+            self._last_debug = replace_debug(self._last_debug, usage=usage)
+
+        if isinstance(interaction, dict):
+            output_text = interaction.get("output_text", "")
+        else:
+            output_text = getattr(interaction, "output_text", "")
+        text = str(output_text or "").strip()
         if not text:
             raise self._transcription_error(
                 "O Gemini não retornou texto para este áudio."
@@ -123,9 +145,9 @@ class TranscriptionWorker(QObject):
             self.finished.emit(text, _last_debug(self._transcriber))
         except TranscriptionError as exc:
             self.failed.emit(str(exc), _last_debug(self._transcriber))
-        except Exception as exc:  # pragma: no cover - última barreira da UI
+        except Exception:
             self.failed.emit(
-                f"Falha inesperada na transcrição: {exc}",
+                "Falha inesperada na transcrição.",
                 _last_debug(self._transcriber),
             )
 
@@ -153,6 +175,58 @@ def _last_debug(transcriber: Any) -> TranscriptionDebug | None:
     getter = getattr(transcriber, "last_debug", None)
     return getter() if getter is not None else None
 
+
+def _to_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isascii() and stripped.isdigit():
+            return int(stripped)
+    return None
+
+
+def _get_field(raw: Any, key: str) -> Any:
+    if isinstance(raw, dict):
+        return raw.get(key)
+    return getattr(raw, key, None)
+
+
+def _extract_usage(raw_usage: Any) -> TokenUsage | None:
+    if raw_usage is None:
+        return None
+
+    input_tokens = _to_int(_get_field(raw_usage, "total_input_tokens"))
+    output_tokens = _to_int(_get_field(raw_usage, "total_output_tokens"))
+    thought_tokens = _to_int(_get_field(raw_usage, "total_thought_tokens"))
+    cached_tokens = _to_int(_get_field(raw_usage, "total_cached_tokens"))
+    tool_use_tokens = _to_int(_get_field(raw_usage, "total_tool_use_tokens"))
+    total_tokens = _to_int(_get_field(raw_usage, "total_tokens"))
+
+    if all(
+        v is None
+        for v in (
+            input_tokens,
+            output_tokens,
+            thought_tokens,
+            cached_tokens,
+            tool_use_tokens,
+            total_tokens,
+        )
+    ):
+        return None
+
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        thought_tokens=thought_tokens,
+        cached_tokens=cached_tokens,
+        tool_use_tokens=tool_use_tokens,
+        total_tokens=total_tokens,
+    )
+
 def _friendly_api_error(exc: Exception, *, secret: str = "") -> str:
     text = str(exc).strip() or exc.__class__.__name__
     if secret:
@@ -166,4 +240,4 @@ def _friendly_api_error(exc: Exception, *, secret: str = "") -> str:
         return "Limite da API Gemini atingido. Tente novamente mais tarde."
     if any(code in lowered for code in ("500", "503", "504", "unavailable", "deadline")):
         return "O serviço Gemini está indisponível no momento. Tente novamente."
-    return f"Não foi possível transcrever: {text}"
+    return "Não foi possível transcrever o áudio."

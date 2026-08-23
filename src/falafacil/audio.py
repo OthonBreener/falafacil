@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import io
-import threading
-import wave
 from dataclasses import dataclass
-from typing import Any
+import io
+import re
+import threading
+from typing import Any, Literal
+import unicodedata
+import wave
 
 import numpy as np
 
@@ -16,13 +18,28 @@ MIN_RMS_LEVEL = 0.005
 _SAMPLE_RATE_CANDIDATES = (SAMPLE_RATE, 48_000, 44_100, 32_000, 22_050, 8_000)
 
 
+def _normalize_identifier(text: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", text)
+    without_accents = "".join(c for c in nfkd if not unicodedata.combining(c))
+    cleaned = re.sub(r"[\W_]+", " ", without_accents.casefold())
+    return " ".join(cleaned.split())
+
 @dataclass(frozen=True)
 class AudioDevice:
     index: int
     name: str
     max_input_channels: int
     is_default: bool
+    host_api: str = ""
+    kind: Literal["headset", "internal", "other"] = "other"
 
+    @property
+    def identity(self) -> str:
+        normalized_name = _normalize_identifier(self.name)
+        normalized_host = _normalize_identifier(self.host_api)
+        if normalized_host:
+            return f"{normalized_name}::{normalized_host}"
+        return normalized_name
 
 @dataclass(frozen=True)
 class AudioCapture:
@@ -32,6 +49,82 @@ class AudioCapture:
     duration_seconds: float
     rms: float
     peak: float
+
+
+_HEADSET_KEYWORDS = (
+    "headset",
+    "headphone",
+    "earphone",
+    "earbuds",
+    "airpods",
+    "bluetooth",
+    "bluez",
+    "hands free",
+    "handsfree",
+    "hfp",
+    "a2dp",
+    "usb headset",
+)
+
+_INTERNAL_KEYWORDS = (
+    "built in",
+    "builtin",
+    "internal",
+    "interno",
+    "microphone array",
+    "array",
+    "notebook",
+    "laptop",
+    "hda intel",
+    "sof hda",
+)
+
+
+def _classify_input_device(
+    name: str, host_api: str = ""
+) -> Literal["headset", "internal", "other"]:
+    text = _normalize_identifier(f"{name} {host_api}")
+    for keyword in _HEADSET_KEYWORDS:
+        if keyword in text:
+            return "headset"
+    for keyword in _INTERNAL_KEYWORDS:
+        if keyword in text:
+            return "internal"
+    return "other"
+
+
+def choose_input_device(
+    devices: tuple[AudioDevice, ...],
+    *,
+    remembered_identity: str | None = None,
+    current_identity: str | None = None,
+) -> AudioDevice | None:
+    if not devices:
+        return None
+
+    for device in devices:
+        if device.kind == "headset":
+            return device
+
+    if current_identity is not None:
+        for device in devices:
+            if device.identity == current_identity:
+                return device
+
+    if remembered_identity is not None:
+        for device in devices:
+            if device.identity == remembered_identity:
+                return device
+
+    for device in devices:
+        if device.kind == "internal":
+            return device
+
+    for device in devices:
+        if device.is_default:
+            return device
+
+    return devices[0]
 
 
 def list_input_devices() -> tuple[AudioDevice, ...]:
@@ -44,11 +137,31 @@ def list_input_devices() -> tuple[AudioDevice, ...]:
 
     try:
         queried = sd.query_devices()
+        if isinstance(queried, dict):
+            queried = [queried]
         default_device = sd.default.device
         try:
             default_input = int(default_device[0])
         except (TypeError, IndexError, ValueError):
             default_input = int(default_device)
+
+        host_api_names: dict[int, str] = {}
+        if getattr(sd, "query_hostapis", None) is not None:
+            try:
+                hostapis = sd.query_hostapis()
+                if isinstance(hostapis, (list, tuple)):
+                    for position, hostapi_info in enumerate(hostapis):
+                        if isinstance(hostapi_info, dict):
+                            ha_name = str(hostapi_info.get("name", ""))
+                            ha_index = int(hostapi_info.get("index", position))
+                            host_api_names[ha_index] = ha_name
+                elif isinstance(hostapis, dict):
+                    ha_name = str(hostapis.get("name", ""))
+                    ha_index = int(hostapis.get("index", 0))
+                    host_api_names[ha_index] = ha_name
+            except Exception:
+                host_api_names = {}
+
         devices: list[AudioDevice] = []
         for position, info in enumerate(queried):
             if not isinstance(info, dict):
@@ -63,12 +176,23 @@ def list_input_devices() -> tuple[AudioDevice, ...]:
                     _resolve_sample_rate(sd, index)
                 except AudioRecorderError:
                     continue
+
+            host_api_value = info.get("hostapi")
+            host_api_name = ""
+            if isinstance(host_api_value, int) and host_api_value in host_api_names:
+                host_api_name = host_api_names[host_api_value]
+            elif isinstance(host_api_value, str):
+                host_api_name = host_api_value
+
+            kind = _classify_input_device(name, host_api_name)
             devices.append(
                 AudioDevice(
                     index=index,
                     name=name,
                     max_input_channels=max_input_channels,
                     is_default=index == default_input,
+                    host_api=host_api_name,
+                    kind=kind,
                 )
             )
         return tuple(devices)
@@ -182,7 +306,7 @@ class AudioRecorder:
                     stream.close()
                 except Exception:
                     pass
-            raise AudioRecorderError(f"Não foi possível acessar o microfone: {exc}") from exc
+            raise AudioRecorderError("Não foi possível acessar o microfone.") from exc
 
         with self._lock:
             self._capture_sample_rate = sample_rate
@@ -199,16 +323,16 @@ class AudioRecorder:
         stop_error: AudioRecorderError | None = None
         try:
             stream.stop()
-        except Exception as exc:
+        except Exception:
             stop_error = AudioRecorderError(
-                f"Não foi possível parar o microfone: {exc}"
+                "Não foi possível parar o microfone."
             )
         close_error: AudioRecorderError | None = None
         try:
             stream.close()
-        except Exception as exc:
+        except Exception:
             close_error = AudioRecorderError(
-                f"Não foi possível fechar o microfone: {exc}"
+                "Não foi possível fechar o microfone."
             )
         if stop_error is not None:
             raise stop_error

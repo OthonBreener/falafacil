@@ -65,8 +65,8 @@ class TerminalBridge:
             window_id = self._command_output([self._xdotool, "getactivewindow"])
             pid = self._command_output([self._xdotool, "getwindowpid", window_id])
             process_name = self._read_comm(pid).strip().lower()
-        except (OSError, subprocess.SubprocessError, ValueError) as exc:
-            self._reason = f"Não foi possível identificar a janela ativa: {exc}"
+        except (OSError, subprocess.SubprocessError, ValueError):
+            self._reason = "Não foi possível identificar a janela ativa."
             return None
 
         if process_name not in TERMINAL_PROCESSES:
@@ -103,7 +103,7 @@ class TerminalBridge:
                 timeout=2,
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            raise TerminalBridgeError(f"Não foi possível colar no terminal: {exc}") from exc
+            raise TerminalBridgeError("Não foi possível colar no terminal.") from exc
 
     def _command_output(self, command: Sequence[str]) -> str:
         result = self._run(

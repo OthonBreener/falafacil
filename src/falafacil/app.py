@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QApplication
 
 from .config import Settings
 from .credentials import CredentialStoreError, KeyringApiKeyStore
+from .storage import LocalStore, resolve_storage_path
 from .transcription import GeminiTranscriber
 from .ui import MainWindow
 
@@ -14,6 +15,13 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setOrganizationName("FalaFácil")
     app.setApplicationName("FalaFácil")
+    local_store: LocalStore | None = None
+    try:
+        store_path = resolve_storage_path()
+        local_store = LocalStore(store_path)
+    except Exception:
+        local_store = None
+
 
     api_key_store = KeyringApiKeyStore()
     try:
@@ -36,6 +44,7 @@ def main() -> int:
         transcriber=transcriber,
         api_key_store=api_key_store,
         transcriber_factory=transcriber_factory,
+        local_store=local_store,
     )
     window.show()
     return app.exec()

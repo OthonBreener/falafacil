@@ -147,7 +147,7 @@ def test_list_input_devices_filters_inputs_marks_array_default_and_monitors(
 
     assert list_input_devices() == (
         AudioDevice(1, "Microfone USB", 1, False),
-        AudioDevice(2, "Microfone interno", 2, True),
+        AudioDevice(2, "Microfone interno", 2, True, kind="internal"),
     )
 
 
@@ -221,3 +221,198 @@ def test_resampling_preserves_capture_duration() -> None:
     with wave.open(io.BytesIO(capture.wav_bytes), "rb") as wav_file:
         assert wav_file.getframerate() == 16_000
         assert wav_file.getnframes() == 32_000
+
+
+def test_normalize_identifier_and_classification_across_separator_variants() -> None:
+    from falafacil.audio import _classify_input_device, _normalize_identifier
+
+    assert _normalize_identifier("Hands_Free") == "hands free"
+    assert _normalize_identifier("hands-free") == "hands free"
+    assert _normalize_identifier("  hands---free__device  ") == "hands free device"
+    assert _normalize_identifier("Microphone_Array") == "microphone array"
+    assert _normalize_identifier("Microfone Integrado (Áudio)") == "microfone integrado audio"
+
+    # Headset classification with separator variants
+    assert _classify_input_device("Hands_Free") == "headset"
+    assert _classify_input_device("hands-free") == "headset"
+    assert _classify_input_device("hands free") == "headset"
+    assert _classify_input_device("HFP/A2DP Headset", "ALSA") == "headset"
+    assert _classify_input_device("USB_Headset", "PulseAudio") == "headset"
+    assert _classify_input_device("Bluetooth Earbuds") == "headset"
+
+    # Internal classification with separator variants
+    assert _classify_input_device("Microphone_Array") == "internal"
+    assert _classify_input_device("microphone-array") == "internal"
+    assert _classify_input_device("Microphone Array") == "internal"
+    assert _classify_input_device("Built-in Audio") == "internal"
+    assert _classify_input_device("Built_in Audio") == "internal"
+    assert _classify_input_device("sof-hda-dsp") == "internal"
+    assert _classify_input_device("HDA-Intel PCH") == "internal"
+
+    # Ambiguous remains other
+    assert _classify_input_device("USB Audio") == "other"
+    assert _classify_input_device("Line In") == "other"
+    assert _classify_input_device("Microfone Genérico") == "other"
+
+
+def test_audio_device_identity_stability_across_separator_variants() -> None:
+    dev1 = AudioDevice(0, "Hands_Free", 1, False, host_api="ALSA_Audio")
+    dev2 = AudioDevice(1, "hands-free", 1, False, host_api="alsa-audio")
+    dev3 = AudioDevice(2, "hands free", 1, False, host_api="ALSA Audio")
+
+    assert dev1.identity == "hands free::alsa audio"
+    assert dev1.identity == dev2.identity == dev3.identity
+
+    internal1 = AudioDevice(0, "Microphone_Array", 2, True)
+    internal2 = AudioDevice(1, "Microphone-Array", 2, True)
+    internal3 = AudioDevice(2, "Microphone Array", 2, True)
+
+    assert internal1.identity == "microphone array"
+    assert internal1.identity == internal2.identity == internal3.identity
+
+
+def test_choose_input_device_priority_order() -> None:
+    from falafacil.audio import choose_input_device
+
+    headset = AudioDevice(1, "Headset Bluetooth", 1, False, kind="headset")
+    internal = AudioDevice(2, "Built-in Mic", 2, False, kind="internal")
+    default_dev = AudioDevice(3, "USB Mic", 1, True, kind="other")
+    other_dev = AudioDevice(4, "Generic Mic", 1, False, kind="other")
+
+    devices = (other_dev, default_dev, internal, headset)
+
+    # 1. Headset wins even if another device is remembered/current/default
+    assert (
+        choose_input_device(
+            devices,
+            remembered_identity=internal.identity,
+            current_identity=default_dev.identity,
+        )
+        == headset
+    )
+
+    # 2. When headset is absent, current identity wins
+    devices_no_headset = (other_dev, default_dev, internal)
+    assert (
+        choose_input_device(
+            devices_no_headset,
+            remembered_identity=internal.identity,
+            current_identity=default_dev.identity,
+        )
+        == default_dev
+    )
+
+    # 3. When headset and current are absent, remembered identity wins
+    assert (
+        choose_input_device(
+            devices_no_headset,
+            remembered_identity=internal.identity,
+        )
+        == internal
+    )
+
+    # 4. When no headset, current, or remembered: internal wins over default/other
+    assert choose_input_device(devices_no_headset) == internal
+
+    # 5. When no internal: default wins
+    assert choose_input_device((other_dev, default_dev)) == default_dev
+
+    # 6. Fallback to first
+    assert choose_input_device((other_dev,)) == other_dev
+
+    # 7. Empty list returns None
+    assert choose_input_device(()) is None
+
+
+def test_recorder_start_failure_omits_raw_exception_and_secret() -> None:
+    secret = "secret-token-mic-start-1234"
+
+    class FailingStartStream(FakeStream):
+        def start(self):
+            raise RuntimeError(f"ALSA start fault with {secret}")
+
+    recorder = AudioRecorder(stream_factory=lambda **kwargs: FailingStartStream(**kwargs))
+    with pytest.raises(AudioRecorderError) as exc_info:
+        recorder.start()
+
+    message = str(exc_info.value)
+    assert message == "Não foi possível acessar o microfone."
+    assert secret not in message
+    assert "RuntimeError" not in message
+    assert "ALSA" not in message
+
+
+def test_recorder_stop_failure_omits_raw_exception_and_secret_and_closes_stream() -> None:
+    secret = "secret-token-mic-stop-5678"
+    closed_called = False
+
+    class FailingStopStream(FakeStream):
+        def stop(self):
+            raise RuntimeError(f"ALSA stop fault with {secret}")
+
+        def close(self):
+            nonlocal closed_called
+            closed_called = True
+            super().close()
+
+    stream = FailingStopStream()
+    recorder = AudioRecorder(stream_factory=lambda **kwargs: stream)
+    recorder.start()
+
+    with pytest.raises(AudioRecorderError) as exc_info:
+        recorder.stop()
+
+    message = str(exc_info.value)
+    assert message == "Não foi possível parar o microfone."
+    assert secret not in message
+    assert "RuntimeError" not in message
+    assert closed_called is True
+    assert stream.closed is True
+
+
+def test_recorder_close_failure_omits_raw_exception_and_secret() -> None:
+    secret = "secret-token-mic-close-9012"
+
+    class FailingCloseStream(FakeStream):
+        def close(self):
+            raise RuntimeError(f"ALSA close fault with {secret}")
+
+    stream = FailingCloseStream()
+    recorder = AudioRecorder(stream_factory=lambda **kwargs: stream)
+    recorder.start()
+
+    with pytest.raises(AudioRecorderError) as exc_info:
+        recorder.stop()
+
+    message = str(exc_info.value)
+    assert message == "Não foi possível fechar o microfone."
+    assert secret not in message
+    assert "RuntimeError" not in message
+
+
+def test_recorder_both_stop_and_close_failure_preserves_order_and_omits_secret() -> None:
+    stop_secret = "secret-token-mic-both-stop-1111"
+    close_secret = "secret-token-mic-both-close-2222"
+    calls: list[str] = []
+
+    class FailingBothStream(FakeStream):
+        def stop(self):
+            calls.append("stop")
+            raise RuntimeError(f"stop fault with {stop_secret}")
+
+        def close(self):
+            calls.append("close")
+            raise RuntimeError(f"close fault with {close_secret}")
+
+    stream = FailingBothStream()
+    recorder = AudioRecorder(stream_factory=lambda **kwargs: stream)
+    recorder.start()
+
+    with pytest.raises(AudioRecorderError) as exc_info:
+        recorder.stop()
+
+    message = str(exc_info.value)
+    assert message == "Não foi possível parar o microfone."
+    assert stop_secret not in message
+    assert close_secret not in message
+    assert calls == ["stop", "close"]
