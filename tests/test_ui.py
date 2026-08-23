@@ -11,10 +11,10 @@ from PySide6.QtWidgets import QApplication
 from falafacil.audio import AudioCapture, AudioDevice, AudioRecorderError
 from falafacil.config import Settings
 from falafacil.credentials import CredentialStoreError
-from falafacil.storage import LocalStoreError, TokenTotals
+from falafacil.storage import LocalStoreError, TokenTotals, TokenUsageRecord
 from falafacil.terminal import TerminalBridgeError
 from falafacil.transcription import TokenUsage, TranscriptionDebug, TranscriptionError
-from falafacil.ui import AppState, MainWindow
+from falafacil.ui import AppState, MainWindow, TokenUsageChart
 
 
 class FakeRecorder:
@@ -112,15 +112,16 @@ class FakeLocalStore:
         fail_totals: bool = False,
         fail_close: bool = False,
         fail_mic: bool = False,
+        fail_history: bool = False,
     ) -> None:
         self.fail_record = fail_record
         self.fail_totals = fail_totals
         self.fail_close = fail_close
         self.fail_mic = fail_mic
+        self.fail_history = fail_history
         self.records: list[tuple[str, Any, str]] = []
         self.mic_identity: str | None = None
         self.closed = False
-
     def get_last_microphone_identity(self) -> str | None:
         if self.fail_mic:
             raise LocalStoreError("erro ao ler microfone")
@@ -164,6 +165,27 @@ class FakeLocalStore:
             total_tokens=_calc_total("total_tokens"),
         )
 
+    def get_token_usage_history(self, limit: int = 30) -> tuple[TokenUsageRecord, ...]:
+        if self.fail_history:
+            raise LocalStoreError("erro ao ler histórico")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0 or limit > 100:
+            raise LocalStoreError(f"Limite inválido para histórico de tokens: {limit!r}")
+        history = [
+            TokenUsageRecord(
+                id=i + 1,
+                recorded_at="",
+                model=m,
+                input_tokens=getattr(u, "input_tokens", None),
+                output_tokens=getattr(u, "output_tokens", None),
+                thought_tokens=getattr(u, "thought_tokens", None),
+                cached_tokens=getattr(u, "cached_tokens", None),
+                tool_use_tokens=getattr(u, "tool_use_tokens", None),
+                total_tokens=getattr(u, "total_tokens", None),
+                outcome=o,
+            )
+            for i, (m, u, o) in enumerate(self.records)
+        ]
+        return tuple(history[-limit:])
     def close(self) -> None:
         if self.fail_close:
             raise LocalStoreError("erro ao fechar")
@@ -774,8 +796,44 @@ def test_debug_dock_contains_four_separate_blocks(qapp) -> None:
     assert window.payload_debug is not None
     assert window.return_debug is not None
     assert window.usage_debug is not None
-    widgets = {window.audio_debug, window.payload_debug, window.return_debug, window.usage_debug}
-    assert len(widgets) == 4
+    assert window.usage_chart is not None
+    assert isinstance(window.usage_chart, TokenUsageChart)
+    assert window.debug_dock.widget() is not None
+    widgets = {
+        window.audio_debug,
+        window.payload_debug,
+        window.return_debug,
+        window.usage_debug,
+        window.usage_chart,
+    }
+    assert len(widgets) == 5
+    window.close()
+
+
+def test_debug_dock_widget_set_and_rendered_with_positive_dimensions(qapp) -> None:
+    window, _ = make_window(qapp)
+
+    managed_widget = window.debug_dock.widget()
+    assert managed_widget is not None
+    assert window.audio_debug.parentWidget() is managed_widget
+    assert window.payload_debug.parentWidget() is managed_widget
+    assert window.return_debug.parentWidget() is managed_widget
+    assert window.usage_debug.parentWidget() is managed_widget
+    assert window.usage_chart.parentWidget() is managed_widget
+
+    assert not window.debug_dock.isVisible()
+    window.debug_button.click()
+    qapp.processEvents()
+
+    assert window.debug_dock.isVisible()
+    assert window.debug_dock.width() > 0
+    assert managed_widget.width() > 0
+    assert managed_widget.height() > 0
+    assert window.audio_debug.height() > 0
+    assert window.payload_debug.height() > 0
+    assert window.return_debug.height() > 0
+    assert window.usage_debug.height() > 0
+    assert window.usage_chart.height() > 0
     window.close()
 
 
@@ -829,8 +887,11 @@ def test_usage_debug_recorded_and_rendered_on_success(qapp) -> None:
     assert "Entrada: 5" in usage_text2
     assert "Total: 7" in usage_text2
     assert "Total: 21" in usage_text2
+    assert len(window.usage_chart.records) == 2
+    assert window.usage_chart.records[0].outcome == "success"
+    assert window.usage_chart.records[1].outcome == "success"
+    assert window.usage_chart.status_message == ""
     window.close()
-
 
 def test_usage_debug_recorded_and_rendered_on_failure(qapp) -> None:
     local_store = FakeLocalStore()
@@ -855,8 +916,11 @@ def test_usage_debug_recorded_and_rendered_on_failure(qapp) -> None:
     assert "Total: 20" in usage_text
     assert window.state is AppState.ERROR
     assert "sem texto" in window.status_label.text()
+    assert len(window.usage_chart.records) == 1
+    assert window.usage_chart.records[0].outcome == "error"
+    assert window.usage_chart.records[0].total_tokens == 20
+    assert window.usage_chart.status_message == ""
     window.close()
-
 
 def test_no_usage_does_not_record_to_store_or_crash(qapp) -> None:
     local_store = FakeLocalStore()
@@ -870,8 +934,9 @@ def test_no_usage_does_not_record_to_store_or_crash(qapp) -> None:
     window._on_transcription_failed("erro", None)
     assert local_store.records == []
     assert window.usage_debug.toPlainText() == "metadados de consumo não fornecidos"
+    assert window.usage_chart.records == ()
+    assert window.usage_chart.status_message == "Nenhum registro de consumo no histórico."
     window.close()
-
 
 def test_usage_debug_cleared_on_new_recording(qapp) -> None:
     local_store = FakeLocalStore()
@@ -929,8 +994,8 @@ def test_usage_store_failure_displays_diagnostic_and_preserves_flow(qapp) -> Non
     assert "Transcrição pronta" in window.status_label.text()
     assert window.editor.toPlainText() == "texto ok"
     assert "Não foi possível persistir o consumo de tokens." in window.usage_debug.toPlainText()
+    assert window.usage_chart.status_message == "Não foi possível persistir o consumo de tokens."
     window.close()
-
 
 def test_usage_without_local_store_renders_current_usage_and_indisponivel_totals(qapp) -> None:
     window, _ = make_window(qapp, local_store=None)
@@ -945,8 +1010,266 @@ def test_usage_without_local_store_renders_current_usage_and_indisponivel_totals
     assert "Saída: 3" in usage_text
     assert "Total: 15" in usage_text
     assert "Total acumulado: indisponível" in usage_text
+    assert window.usage_chart.records == ()
+    assert window.usage_chart.status_message == "Histórico local indisponível."
     window.close()
 
+
+def test_token_usage_chart_empty_state_renders_safely(qapp) -> None:
+    chart = TokenUsageChart()
+    chart.set_history((), status_message="")
+    assert chart.records == ()
+    assert chart.status == ""
+    pixmap = chart.grab()
+    assert pixmap.width() > 0
+    assert pixmap.height() > 0
+
+
+def test_token_usage_chart_status_message_state_renders_safely(qapp) -> None:
+    chart = TokenUsageChart()
+    chart.set_status_message("Histórico local indisponível.")
+    assert chart.status == "Histórico local indisponível."
+    pixmap = chart.grab()
+    assert pixmap.width() > 0
+    assert pixmap.height() > 0
+
+
+def test_token_usage_chart_known_records_distinguish_success_and_error(qapp) -> None:
+    chart = TokenUsageChart()
+    rec1 = TokenUsageRecord(
+        id=1,
+        recorded_at="2026-08-23T10:00:00Z",
+        model="gemini-3.7-flash",
+        input_tokens=10,
+        output_tokens=4,
+        thought_tokens=0,
+        cached_tokens=0,
+        tool_use_tokens=0,
+        total_tokens=14,
+        outcome="success",
+    )
+    rec2 = TokenUsageRecord(
+        id=2,
+        recorded_at="2026-08-23T10:05:00Z",
+        model="gemini-3.7-flash",
+        input_tokens=20,
+        output_tokens=0,
+        thought_tokens=0,
+        cached_tokens=0,
+        tool_use_tokens=0,
+        total_tokens=20,
+        outcome="error",
+    )
+    chart.set_records((rec1, rec2))
+    assert chart.records == (rec1, rec2)
+    assert chart.status_message == ""
+
+    success_colors = chart.get_outcome_colors(rec1.outcome)
+    error_colors = chart.get_outcome_colors(rec2.outcome)
+    unknown_colors = chart.get_outcome_colors("unknown")
+
+    assert success_colors == TokenUsageChart.OUTCOME_COLORS["success"]
+    assert error_colors == TokenUsageChart.OUTCOME_COLORS["error"]
+    assert success_colors != error_colors
+    assert success_colors != unknown_colors
+    assert error_colors != unknown_colors
+
+    pixmap = chart.grab()
+    assert pixmap.width() > 0
+    assert pixmap.height() > 0
+    image = pixmap.toImage()
+
+    assert len(chart.last_rendered_bar_rects) == 2
+    c1 = chart.last_rendered_bar_rects[0].center()
+    c2 = chart.last_rendered_bar_rects[1].center()
+    color1 = image.pixelColor(int(c1.x()), int(c1.y()))
+    color2 = image.pixelColor(int(c2.x()), int(c2.y()))
+
+    assert color1 == TokenUsageChart.SUCCESS_FILL_COLOR
+    assert color2 == TokenUsageChart.ERROR_FILL_COLOR
+    assert color1 != color2
+
+
+def test_token_usage_chart_null_or_unknown_totals_render_safely(qapp) -> None:
+    chart = TokenUsageChart()
+    rec_unknown = TokenUsageRecord(
+        id=1,
+        recorded_at="2026-08-23T10:00:00Z",
+        model="gemini-3.7-flash",
+        input_tokens=10,
+        output_tokens=None,
+        thought_tokens=None,
+        cached_tokens=None,
+        tool_use_tokens=None,
+        total_tokens=None,
+        outcome="success",
+    )
+    chart.set_records((rec_unknown,))
+    assert rec_unknown.total_tokens is None
+
+    unknown_colors = TokenUsageChart.get_outcome_colors("unknown")
+    none_colors = TokenUsageChart.get_outcome_colors(None)
+    assert unknown_colors == TokenUsageChart.OUTCOME_COLORS["unknown"]
+    assert none_colors == TokenUsageChart.OUTCOME_COLORS["unknown"]
+    assert TokenUsageChart.UNKNOWN_FILL_COLOR == unknown_colors[0]
+    assert TokenUsageChart.UNKNOWN_BORDER_COLOR == unknown_colors[1]
+
+    pixmap = chart.grab()
+    assert pixmap.width() > 0
+    assert pixmap.height() > 0
+    image = pixmap.toImage()
+
+    assert len(chart.last_rendered_bar_rects) == 1
+    c = chart.last_rendered_bar_rects[0].center()
+    color = image.pixelColor(int(c.x()), int(c.y()))
+    assert color == TokenUsageChart.UNKNOWN_FILL_COLOR
+
+
+def test_token_usage_chart_legend_and_outcome_color_mappings(qapp) -> None:
+    labels = [item[0] for item in TokenUsageChart.LEGEND_ITEMS]
+    keys = [item[1] for item in TokenUsageChart.LEGEND_ITEMS]
+    dashed_flags = [item[2] for item in TokenUsageChart.LEGEND_ITEMS]
+
+    assert "Sucesso" in labels
+    assert "Erro" in labels
+    assert "Indisponível" in labels
+
+    assert keys == ["success", "error", "unknown"]
+    assert dashed_flags == [False, False, True]
+
+    fills = {k: colors[0] for k, colors in TokenUsageChart.OUTCOME_COLORS.items()}
+    borders = {k: colors[1] for k, colors in TokenUsageChart.OUTCOME_COLORS.items()}
+
+    assert len({f.name() for f in fills.values()}) == 3
+    assert len({b.name() for b in borders.values()}) == 3
+
+    chart = TokenUsageChart()
+    chart.resize(200, 140)
+    rec_ok = TokenUsageRecord(1, "t1", "m", 10, 5, 0, 0, 0, 15, "success")
+    rec_err = TokenUsageRecord(2, "t2", "m", 5, 0, 0, 0, 0, 5, "error")
+    rec_unk = TokenUsageRecord(3, "t3", "m", 0, 0, 0, 0, 0, None, "other")
+    chart.set_records((rec_ok, rec_err, rec_unk))
+    pixmap = chart.grab()
+    assert not pixmap.isNull()
+    assert pixmap.width() >= 200
+    assert pixmap.height() >= 140
+    image = pixmap.toImage()
+
+    # Assert visual seam populated
+    assert set(chart.last_rendered_legend_rects.keys()) == {"success", "error", "unknown"}
+    assert set(chart.last_rendered_legend_text_rects.keys()) == {"success", "error", "unknown"}
+    assert len(chart.last_rendered_bar_rects) == 3
+    assert chart.last_rendered_plot_rect is not None
+
+    # Assert legend geometry fits strictly within minimum width 200 with no clipping
+    for k in ("success", "error", "unknown"):
+        icon_rect = chart.last_rendered_legend_rects[k]
+        text_rect = chart.last_rendered_legend_text_rects[k]
+        assert icon_rect.left() >= 0
+        assert icon_rect.right() <= 200
+        assert text_rect.left() >= 0
+        assert text_rect.right() <= 200
+        assert icon_rect.top() >= 0
+        assert text_rect.bottom() <= chart.last_rendered_plot_rect.top()
+
+    # Verify pixel colors at center of legend icons
+    c_ok = chart.last_rendered_legend_rects["success"].center()
+    c_err = chart.last_rendered_legend_rects["error"].center()
+    c_unk = chart.last_rendered_legend_rects["unknown"].center()
+    color_ok = image.pixelColor(int(c_ok.x()), int(c_ok.y()))
+    color_err = image.pixelColor(int(c_err.x()), int(c_err.y()))
+    color_unk = image.pixelColor(int(c_unk.x()), int(c_unk.y()))
+
+    assert color_ok == TokenUsageChart.SUCCESS_FILL_COLOR
+    assert color_err == TokenUsageChart.ERROR_FILL_COLOR
+    assert color_unk == TokenUsageChart.UNKNOWN_FILL_COLOR
+    assert color_ok != color_err
+    assert color_ok != color_unk
+    assert color_err != color_unk
+
+    # Verify pixel colors at center of bars
+    bar_c_ok = chart.last_rendered_bar_rects[0].center()
+    bar_c_err = chart.last_rendered_bar_rects[1].center()
+    bar_c_unk = chart.last_rendered_bar_rects[2].center()
+    bar_color_ok = image.pixelColor(int(bar_c_ok.x()), int(bar_c_ok.y()))
+    bar_color_err = image.pixelColor(int(bar_c_err.x()), int(bar_c_err.y()))
+    bar_color_unk = image.pixelColor(int(bar_c_unk.x()), int(bar_c_unk.y()))
+
+    assert bar_color_ok == TokenUsageChart.SUCCESS_FILL_COLOR
+    assert bar_color_err == TokenUsageChart.ERROR_FILL_COLOR
+    assert bar_color_unk == TokenUsageChart.UNKNOWN_FILL_COLOR
+    assert bar_color_ok != bar_color_err
+    assert bar_color_ok != bar_color_unk
+    assert bar_color_err != bar_color_unk
+
+
+def test_token_usage_chart_layout_at_various_widths(qapp) -> None:
+    chart = TokenUsageChart()
+    rec_ok = TokenUsageRecord(1, "t1", "m", 10, 5, 0, 0, 0, 15, "success")
+    rec_err = TokenUsageRecord(2, "t2", "m", 5, 0, 0, 0, 0, 5, "error")
+    rec_unk = TokenUsageRecord(3, "t3", "m", 0, 0, 0, 0, 0, None, "other")
+    chart.set_records((rec_ok, rec_err, rec_unk))
+
+    # Test width 200: all legend items fit inside 200px (wrapping across lines)
+    chart.resize(200, 140)
+    chart.grab()
+    assert chart.last_rendered_plot_rect is not None
+    assert chart.last_rendered_plot_rect.width() > 10
+    assert chart.last_rendered_plot_rect.height() > 10
+    for k in ("success", "error", "unknown"):
+        assert chart.last_rendered_legend_rects[k].right() <= 200
+        assert chart.last_rendered_legend_text_rects[k].right() <= 200
+
+    # Test width 280: sizeHint width
+    chart.resize(280, 180)
+    chart.grab()
+    assert chart.last_rendered_plot_rect is not None
+    for k in ("success", "error", "unknown"):
+        assert chart.last_rendered_legend_rects[k].right() <= 280
+        assert chart.last_rendered_legend_text_rects[k].right() <= 280
+
+    # Test width 500: wide dock
+    chart.resize(500, 200)
+    chart.grab()
+    assert chart.last_rendered_plot_rect is not None
+    for k in ("success", "error", "unknown"):
+        assert chart.last_rendered_legend_rects[k].right() <= 500
+        assert chart.last_rendered_legend_text_rects[k].right() <= 500
+
+    # Clearing or status message clears seam
+    chart.set_status_message("Erro no carregamento")
+    chart.grab()
+    assert chart.last_rendered_legend_rects == {}
+    assert chart.last_rendered_legend_text_rects == {}
+    assert chart.last_rendered_bar_rects == ()
+    assert chart.last_rendered_plot_rect is None
+
+
+def test_token_usage_chart_small_size_boundary(qapp) -> None:
+    chart = TokenUsageChart()
+    chart.resize(10, 10)
+    pixmap = chart.grab()
+    assert not pixmap.isNull()
+
+def test_token_usage_chart_refreshed_on_startup(qapp) -> None:
+    local_store = FakeLocalStore()
+    usage = TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15)
+    local_store.record_token_usage("gemini-3.7-flash", usage, "success")
+
+    window, _ = make_window(qapp, local_store=local_store)
+    assert len(window.usage_chart.records) == 1
+    assert window.usage_chart.records[0].total_tokens == 15
+    assert window.usage_chart.records[0].outcome == "success"
+    assert window.usage_chart.status_message == ""
+    window.close()
+
+
+def test_token_usage_chart_history_load_failure_handled(qapp) -> None:
+    local_store = FakeLocalStore(fail_history=True)
+    window, _ = make_window(qapp, local_store=local_store)
+    assert window.usage_chart.records == ()
+    assert window.usage_chart.status_message == "Não foi possível carregar o histórico de consumo."
+    window.close()
 
 def test_close_window_closes_local_store_and_absorbs_store_error(qapp) -> None:
     store1 = FakeLocalStore()

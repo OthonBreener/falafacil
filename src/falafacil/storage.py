@@ -24,6 +24,20 @@ class TokenTotals:
     total_tokens: int | None = 0
 
 
+@dataclass(frozen=True)
+class TokenUsageRecord:
+    id: int
+    recorded_at: str
+    model: str
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    thought_tokens: int | None = None
+    cached_tokens: int | None = None
+    tool_use_tokens: int | None = None
+    total_tokens: int | None = None
+    outcome: Literal["success", "error"] | str = "success"
+
+
 def _extract_token_count(usage: Any, field: str) -> int | None:
     if usage is None:
         return None
@@ -272,6 +286,95 @@ class LocalStore:
         except sqlite3.Error as exc:
             raise LocalStoreError(
                 f"Erro ao calcular totais de tokens: {exc}"
+            ) from exc
+
+    def get_token_usage_history(
+        self, limit: int = 30
+    ) -> tuple[TokenUsageRecord, ...]:
+        conn = self._ensure_open()
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0 or limit > 100:
+            raise LocalStoreError(
+                f"Limite inválido para histórico de tokens: {limit!r}"
+            )
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    recorded_at,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    thought_tokens,
+                    cached_tokens,
+                    tool_use_tokens,
+                    total_tokens,
+                    outcome
+                FROM (
+                    SELECT
+                        id,
+                        recorded_at,
+                        model,
+                        input_tokens,
+                        output_tokens,
+                        thought_tokens,
+                        cached_tokens,
+                        tool_use_tokens,
+                        total_tokens,
+                        outcome
+                    FROM token_usage
+                    ORDER BY recorded_at DESC, id DESC
+                    LIMIT ?
+                )
+                ORDER BY recorded_at ASC, id ASC;
+                """,
+                (limit,),
+            )
+            rows = cursor.fetchall()
+            records = [
+                TokenUsageRecord(
+                    id=int(row["id"]),
+                    recorded_at=str(row["recorded_at"]),
+                    model=str(row["model"]),
+                    input_tokens=(
+                        int(row["input_tokens"])
+                        if row["input_tokens"] is not None
+                        else None
+                    ),
+                    output_tokens=(
+                        int(row["output_tokens"])
+                        if row["output_tokens"] is not None
+                        else None
+                    ),
+                    thought_tokens=(
+                        int(row["thought_tokens"])
+                        if row["thought_tokens"] is not None
+                        else None
+                    ),
+                    cached_tokens=(
+                        int(row["cached_tokens"])
+                        if row["cached_tokens"] is not None
+                        else None
+                    ),
+                    tool_use_tokens=(
+                        int(row["tool_use_tokens"])
+                        if row["tool_use_tokens"] is not None
+                        else None
+                    ),
+                    total_tokens=(
+                        int(row["total_tokens"])
+                        if row["total_tokens"] is not None
+                        else None
+                    ),
+                    outcome=str(row["outcome"]),
+                )
+                for row in rows
+            ]
+            return tuple(records)
+        except sqlite3.Error as exc:
+            raise LocalStoreError(
+                f"Erro ao consultar histórico de tokens: {exc}"
             ) from exc
 
     def close(self) -> None:

@@ -6,7 +6,7 @@ O FalaFácil é um aplicativo desktop local para Ubuntu. A composição abaixo d
 
 `falafacil.app:main` cria a única `QApplication`, define os nomes da aplicação (`FalaFácil`), inicializa de forma fail-soft o `LocalStore` no diretório de dados da aplicação (`AppDataLocation`), lê a credencial persistida e compõe `Settings`, `GeminiTranscriber` e `MainWindow` em `src/falafacil/app.py`. Se o banco local não puder ser inicializado, a aplicação prossegue com `local_store=None` sem interromper o fluxo do usuário. A janela é exibida somente depois dessa composição. O entry point `falafacil` e `python -m falafacil` chegam ao mesmo ponto; `src/falafacil/__main__.py` apenas encaminha a chamada de módulo.
 
-`MainWindow` e `AppState` vivem em `src/falafacil/ui.py`. A UI coordena seleção e detecção de microfone, persistência do último dispositivo usado, gravação, pré-visualização, reprodução em memória, envio explícito, editor de texto, painel lateral de debug (áudio, payload, retorno e consumo Gemini), diálogo de chave, clipboard e o ciclo do `QThread`. Os estados observáveis são `IDLE`, `RECORDING`, `AUDIO_READY`, `TRANSCRIBING`, `READY` e `ERROR`; uma falha deixa a janela recuperável.
+`MainWindow` e `AppState` vivem em `src/falafacil/ui.py`. A UI coordena seleção e detecção de microfone, persistência do último dispositivo usado, gravação, pré-visualização, reprodução em memória, envio explícito, editor de texto, painel lateral de debug com blocos de texto (áudio, payload, retorno e métricas de consumo Gemini) e o bloco gráfico de histórico de consumo de tokens (`TokenUsageChart`), diálogo de chave, clipboard e o ciclo do `QThread`. Os estados observáveis são `IDLE`, `RECORDING`, `AUDIO_READY`, `TRANSCRIBING`, `READY` e `ERROR`; uma falha deixa a janela recuperável.
 
 ## Áudio
 
@@ -37,7 +37,7 @@ A única ação que inicia a chamada é `Enviar para Gemini`, depois de uma capt
 
 ## Armazenamento local
 
-`src/falafacil/storage.py` implementa `LocalStore`, `LocalStoreError` e `TokenTotals`, utilizando a biblioteca padrão `sqlite3`.
+`src/falafacil/storage.py` implementa `LocalStore`, `LocalStoreError`, `TokenTotals` e `TokenUsageRecord`, utilizando a biblioteca padrão `sqlite3`.
 
 O caminho do banco é resolvido por `resolve_storage_path()` via `QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)` apontando para `falafacil.sqlite3`. O diretório pai é criado com permissões privadas (`0o700`) e o arquivo do banco com `0o600` quando suportado pelo sistema.
 
@@ -46,7 +46,9 @@ O schema é versionado via `PRAGMA user_version = 1`:
 - Tabela `token_usage(id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER, thought_tokens INTEGER, cached_tokens INTEGER, tool_use_tokens INTEGER, total_tokens INTEGER, outcome TEXT NOT NULL CHECK(outcome IN ('success', 'error')))`: armazena o histórico de consumo de tokens por chamada.
 - Índice `idx_token_usage_recorded_at ON token_usage(recorded_at)` para ordenação cronológica.
 
-A conexão opera exclusivamente no thread principal com `check_same_thread=True` e `PRAGMA busy_timeout = 2000`. A retenção é local e cumulativa, sem rotinas de expiração automática. A consulta `get_token_totals()` realiza agregação com tratamento de nulos (retorna contagem zero apenas quando a tabela está vazia e preserva valores ausentes quando aplicável).
+A conexão opera exclusivamente no thread principal com `check_same_thread=True` e `PRAGMA busy_timeout = 2000`. A retenção é local e cumulativa, sem rotinas de expiração automática. A consulta `get_token_totals()` realiza agregação com tratamento de nulos (retorna contagem zero apenas quando a tabela está vazia e preserva valores ausentes quando aplicável). A consulta `get_token_usage_history(limit=30)` retorna tuplas de `TokenUsageRecord` em ordem cronológica ascendente (mais antigas primeiro entre as últimas chamadas registradas), preservando campos nulos/indisponíveis e o desfecho (`success` ou `error`).
+
+Esse histórico persistido alimenta diretamente o widget customizado `TokenUsageChart` (`Gráfico de consumo de tokens`) no painel de debug da UI. As barras do gráfico representam o `total_tokens` conhecido de cada chamada, distinguindo visualmente sucessos (verde) e erros (vermelho), enquanto totais indisponíveis são identificados sem fabricação de valores ou quebra de renderização. O histórico e o gráfico medem estritamente consumo de tokens, não precificação monetária da API, e nenhum cálculo ou conversão monetária é realizado.
 
 O ciclo de vida do armazenamento é gerenciado pela UI com tratamento fail-soft: erros de escrita ou leitura nunca interrompem gravação, reprodução ou transcrição. No fechamento da janela (`MainWindow.closeEvent`), o gravador e o player são parados, o worker é finalizado e o `LocalStore.close()` é executado antes da aceitação do evento.
 
@@ -88,7 +90,7 @@ tests ──────> módulos via dependências injetadas
 ## Invariantes
 1. Nenhuma chave Gemini é gravada em código, testes, `pyproject.toml`, desktop entry, logs, arquivos gerados, argumentos do launcher ou banco SQLite local. A fonte ativa segue a precedência definida em `config.py` e a credencial persistida fica exclusivamente no Secret Service.
 2. O banco de dados local SQLite (`LocalStore`) armazena estritamente a allowlist de metadados: identidade do último microfone usado, timestamp `recorded_at`, identificador do modelo, contagens de tokens (entrada, saída, pensamento, cache, ferramentas e total, preservando valores ausentes/nulos) e outcome (`success` ou `error`). A retenção é local e cumulativa, sem rotinas de limpeza automática. O banco nunca armazena chaves de API, áudio PCM/WAV, previews/payloads em base64, texto do prompt, transcrições/respostas textuais, mensagens de exceção brutas ou outros payloads sensíveis.
-3. Campos de tokens não fornecidos pela API permanecem indisponíveis (`None`), sem conversão em zero artificial; o total agregado exibe zero somente quando não há registros no histórico. A aplicação não calcula nem estima preços monetários.
+3. Campos de tokens não fornecidos pela API permanecem indisponíveis (`None`), sem conversão em zero artificial; o total agregado e o gráfico tratam valores ausentes com segurança e exibem zero somente quando não há registros no histórico. As barras do gráfico diferenciam visualmente sucesso e erro para valores conhecidos de `total_tokens`. A aplicação mede exclusivamente consumo de tokens, não precificação monetária da API, e não calcula nem estima preços.
 4. A conexão com o banco local pertence e é acessada exclusivamente no thread principal; falhas no armazenamento local são fail-soft e não impedem captura de áudio, transcrição ou uso do clipboard.
 5. Widgets Qt, `QMediaPlayer`, clipboard e demais objetos de UI só são acessados no thread principal. O worker de transcrição comunica resultados por sinais; o callback de áudio não toca em widgets nem em banco de dados.
 6. A captura fecha o stream em sucesso e em falha, conserva o formato mono/`int16`/16 kHz e não envia áudio vazio ou abaixo do nível mínimo. A prioridade de seleção automática segue headset -> sessão atual -> memória persistida -> interno -> padrão do sistema.

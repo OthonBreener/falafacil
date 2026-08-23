@@ -2,11 +2,30 @@ from __future__ import annotations
 
 from dataclasses import replace
 from enum import Enum, auto
-from typing import Callable
+from typing import Callable, Sequence
 
 import numpy as np
-from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QThread, QUrl, Qt, Slot
-from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtCore import (
+    QByteArray,
+    QBuffer,
+    QIODevice,
+    QRectF,
+    QSize,
+    QThread,
+    QUrl,
+    Qt,
+    Slot,
+)
+from PySide6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QFont,
+    QKeySequence,
+    QPainter,
+    QPaintEvent,
+    QPen,
+    QShortcut,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
@@ -34,7 +53,7 @@ from .audio import (
 )
 from .config import Settings
 from .credentials import ApiKeyStore, CredentialStoreError
-from .storage import LocalStore, LocalStoreError, TokenTotals
+from .storage import LocalStore, LocalStoreError, TokenTotals, TokenUsageRecord
 from .terminal import TerminalBridge, TerminalBridgeError
 from .transcription import GeminiTranscriber, TranscriptionDebug, TranscriptionWorker
 
@@ -57,6 +76,349 @@ def _default_media_player_factory(parent: QWidget) -> tuple[QMediaPlayer, QAudio
     player.setAudioOutput(audio_output)
     return player, audio_output
 
+
+class TokenUsageChart(QWidget):
+    """Widget customizado para renderização gráfica do histórico de consumo de tokens."""
+
+    SUCCESS_FILL_COLOR = QColor(46, 125, 50)
+    SUCCESS_BORDER_COLOR = QColor(30, 90, 35)
+    ERROR_FILL_COLOR = QColor(198, 40, 40)
+    ERROR_BORDER_COLOR = QColor(150, 20, 20)
+    UNKNOWN_FILL_COLOR = QColor(120, 120, 120)
+    UNKNOWN_BORDER_COLOR = QColor(80, 80, 80)
+
+    OUTCOME_COLORS: dict[str, tuple[QColor, QColor]] = {
+        "success": (SUCCESS_FILL_COLOR, SUCCESS_BORDER_COLOR),
+        "error": (ERROR_FILL_COLOR, ERROR_BORDER_COLOR),
+        "unknown": (UNKNOWN_FILL_COLOR, UNKNOWN_BORDER_COLOR),
+    }
+
+    LEGEND_ITEMS: tuple[tuple[str, str, bool], ...] = (
+        ("Sucesso", "success", False),
+        ("Erro", "error", False),
+        ("Indisponível", "unknown", True),
+    )
+
+    @classmethod
+    def get_outcome_colors(cls, outcome: str | None) -> tuple[QColor, QColor]:
+        normalized = (outcome or "").strip().lower()
+        if normalized == "success":
+            return cls.OUTCOME_COLORS["success"]
+        if normalized == "error":
+            return cls.OUTCOME_COLORS["error"]
+        return cls.OUTCOME_COLORS["unknown"]
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.records: tuple[TokenUsageRecord, ...] = ()
+        self.status_message: str = ""
+        self.last_rendered_legend_rects: dict[str, QRectF] = {}
+        self.last_rendered_legend_text_rects: dict[str, QRectF] = {}
+        self.last_rendered_bar_rects: tuple[QRectF, ...] = ()
+        self.last_rendered_plot_rect: QRectF | None = None
+        self.setMinimumHeight(140)
+
+    @property
+    def status(self) -> str:
+        return self.status_message
+
+    def set_history(
+        self,
+        records: Sequence[TokenUsageRecord] | None = None,
+        status_message: str = "",
+    ) -> None:
+        self.records = tuple(records) if records is not None else ()
+        self.status_message = status_message
+        self.update()
+
+    def set_records(
+        self,
+        records: Sequence[TokenUsageRecord] | None = None,
+        status_message: str = "",
+    ) -> None:
+        self.set_history(records, status_message)
+
+    def set_status_message(self, message: str) -> None:
+        self.status_message = message
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        return QSize(280, 180)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(200, 140)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        rect = self.rect()
+        width = rect.width()
+        height = rect.height()
+
+        palette = self.palette()
+        base_color = palette.color(palette.ColorRole.Base)
+        text_color = palette.color(palette.ColorRole.Text)
+        mid_color = palette.color(palette.ColorRole.Mid)
+
+        painter.fillRect(rect, base_color)
+        painter.setPen(QPen(mid_color, 1))
+        painter.drawRect(0, 0, width - 1, height - 1)
+
+        self.last_rendered_legend_rects = {}
+        self.last_rendered_legend_text_rects = {}
+        self.last_rendered_bar_rects = ()
+        self.last_rendered_plot_rect = None
+
+        if self.status_message:
+            painter.setPen(QPen(text_color))
+            painter.drawText(
+                rect.adjusted(10, 10, -10, -10),
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                self.status_message,
+            )
+            return
+
+        if not self.records:
+            painter.setPen(QPen(text_color))
+            painter.drawText(
+                rect.adjusted(10, 10, -10, -10),
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                "Nenhum registro de consumo no histórico.",
+            )
+            return
+
+        small_font = painter.font()
+        if small_font.pointSize() > 0:
+            small_font.setPointSize(max(8, small_font.pointSize() - 2))
+        painter.setFont(small_font)
+        fm = painter.fontMetrics()
+
+        margin_left = 10.0
+        margin_right = 10.0
+        margin_top = 8.0
+        line_spacing = 4.0
+        icon_size = 10.0
+        gap_icon_text = 4.0
+        item_gap = 8.0
+
+        line_height = max(icon_size, float(fm.height()))
+        max_x = float(width - margin_right)
+
+        legend_data: list[tuple[str, str, bool, float, float]] = []
+        total_legend_w = 0.0
+        for idx, (label, outcome_key, is_dashed) in enumerate(self.LEGEND_ITEMS):
+            text_w = float(fm.horizontalAdvance(label))
+            item_w = icon_size + gap_icon_text + text_w
+            legend_data.append((label, outcome_key, is_dashed, text_w, item_w))
+            total_legend_w += item_w
+            if idx < len(self.LEGEND_ITEMS) - 1:
+                total_legend_w += item_gap
+
+        title = "Tokens / chamada"
+        title_w = float(fm.horizontalAdvance(title))
+
+        if margin_left + title_w + 14.0 + total_legend_w <= max_x:
+            title_rect = QRectF(margin_left, margin_top, title_w + 2.0, line_height)
+            painter.setPen(QPen(text_color))
+            painter.drawText(
+                title_rect,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                title,
+            )
+
+            cur_x = max(float(margin_left + title_w + 14.0), max_x - total_legend_w)
+            cur_y = float(margin_top)
+            for label, outcome_key, is_dashed, text_w, item_w in legend_data:
+                fill_col, border_col = self.OUTCOME_COLORS.get(
+                    outcome_key, self.OUTCOME_COLORS["unknown"]
+                )
+                icon_rect = QRectF(
+                    cur_x,
+                    cur_y + (line_height - icon_size) / 2.0,
+                    icon_size,
+                    icon_size,
+                )
+                painter.fillRect(icon_rect, fill_col)
+                pen_style = Qt.PenStyle.DashLine if is_dashed else Qt.PenStyle.SolidLine
+                painter.setPen(QPen(border_col, 1, pen_style))
+                painter.drawRect(icon_rect)
+
+                text_rect = QRectF(
+                    cur_x + icon_size + gap_icon_text,
+                    cur_y,
+                    text_w + 2.0,
+                    line_height,
+                )
+                painter.setPen(QPen(text_color))
+                painter.drawText(
+                    text_rect,
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    label,
+                )
+
+                self.last_rendered_legend_rects[outcome_key] = icon_rect
+                self.last_rendered_legend_text_rects[outcome_key] = text_rect
+                cur_x += item_w + item_gap
+            last_y = cur_y + line_height
+        else:
+            title_rect = QRectF(margin_left, margin_top, title_w + 2.0, line_height)
+            painter.setPen(QPen(text_color))
+            painter.drawText(
+                title_rect,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                title,
+            )
+
+            cur_x = float(margin_left)
+            cur_y = float(margin_top + line_height + line_spacing)
+
+            for label, outcome_key, is_dashed, text_w, item_w in legend_data:
+                if cur_x > margin_left and cur_x + item_w > max_x:
+                    cur_x = float(margin_left)
+                    cur_y += line_height + line_spacing
+
+                fill_col, border_col = self.OUTCOME_COLORS.get(
+                    outcome_key, self.OUTCOME_COLORS["unknown"]
+                )
+                icon_rect = QRectF(
+                    cur_x,
+                    cur_y + (line_height - icon_size) / 2.0,
+                    icon_size,
+                    icon_size,
+                )
+                painter.fillRect(icon_rect, fill_col)
+                pen_style = Qt.PenStyle.DashLine if is_dashed else Qt.PenStyle.SolidLine
+                painter.setPen(QPen(border_col, 1, pen_style))
+                painter.drawRect(icon_rect)
+
+                text_rect = QRectF(
+                    cur_x + icon_size + gap_icon_text,
+                    cur_y,
+                    text_w + 2.0,
+                    line_height,
+                )
+                painter.setPen(QPen(text_color))
+                painter.drawText(
+                    text_rect,
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    label,
+                )
+
+                self.last_rendered_legend_rects[outcome_key] = icon_rect
+                self.last_rendered_legend_text_rects[outcome_key] = text_rect
+                cur_x += item_w + item_gap
+            last_y = cur_y + line_height
+
+        pad_left = 42
+        pad_right = 10
+        pad_top = int(last_y + 8.0)
+        pad_bottom = 22
+
+        plot_w = width - pad_left - pad_right
+        plot_h = height - pad_top - pad_bottom
+
+        if plot_w <= 10 or plot_h <= 10:
+            return
+
+        self.last_rendered_plot_rect = QRectF(pad_left, pad_top, plot_w, plot_h)
+
+        valid_totals = [
+            r.total_tokens
+            for r in self.records
+            if r.total_tokens is not None and r.total_tokens >= 0
+        ]
+        max_tokens = max(valid_totals) if valid_totals else 10
+        if max_tokens <= 0:
+            max_tokens = 10
+
+        axis_pen = QPen(mid_color, 1)
+        grid_pen = QPen(palette.color(palette.ColorRole.Midlight), 1, Qt.PenStyle.DotLine)
+
+        y_zero = pad_top + plot_h
+        painter.setPen(axis_pen)
+        painter.drawLine(pad_left, int(y_zero), int(pad_left + plot_w), int(y_zero))
+        painter.drawLine(pad_left, int(pad_top), pad_left, int(y_zero))
+
+        painter.setPen(QPen(text_color))
+        painter.drawText(
+            2,
+            int(y_zero - 6),
+            pad_left - 6,
+            12,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            "0",
+        )
+
+        y_max = pad_top
+        painter.setPen(grid_pen)
+        painter.drawLine(pad_left, int(y_max), int(pad_left + plot_w), int(y_max))
+        painter.setPen(QPen(text_color))
+        painter.drawText(
+            2,
+            int(y_max - 6),
+            pad_left - 6,
+            12,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            f"{max_tokens}",
+        )
+
+        if plot_h >= 40:
+            y_mid = pad_top + plot_h / 2.0
+            painter.setPen(grid_pen)
+            painter.drawLine(pad_left, int(y_mid), pad_left + plot_w, int(y_mid))
+            painter.setPen(QPen(text_color))
+            painter.drawText(
+                2,
+                int(y_mid - 6),
+                pad_left - 6,
+                12,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                f"{max_tokens // 2}",
+            )
+
+        n = len(self.records)
+        step = plot_w / float(n)
+        bar_w = max(1.0, min(24.0, step * 0.75))
+        offset = (step - bar_w) / 2.0
+
+        rendered_bars: list[QRectF] = []
+        for i, rec in enumerate(self.records):
+            bar_x = pad_left + i * step + offset
+            total = rec.total_tokens
+            outcome = (rec.outcome or "").lower()
+
+            fill_color, border_color = self.get_outcome_colors(outcome)
+
+            if total is not None and total >= 0:
+                bar_h = (float(total) / float(max_tokens)) * plot_h
+                bar_h = max(1.0, min(plot_h, bar_h)) if total > 0 else 1.0
+                bar_y = y_zero - bar_h
+
+                bar_rect = QRectF(bar_x, bar_y, bar_w, bar_h)
+                painter.fillRect(bar_rect, fill_color)
+                painter.setPen(QPen(border_color, 1))
+                painter.drawRect(bar_rect)
+                rendered_bars.append(bar_rect)
+            else:
+                mark_h = min(8.0, plot_h / 4.0)
+                mark_y = y_zero - mark_h
+                mark_rect = QRectF(bar_x, mark_y, bar_w, mark_h)
+                painter.fillRect(mark_rect, self.UNKNOWN_FILL_COLOR)
+                painter.setPen(QPen(self.UNKNOWN_BORDER_COLOR, 1, Qt.PenStyle.DashLine))
+                painter.drawRect(mark_rect)
+                rendered_bars.append(mark_rect)
+
+            if bar_w >= 14 and n <= 15:
+                painter.setPen(QPen(text_color))
+                painter.drawText(
+                    QRectF(bar_x - 4, y_zero + 2, bar_w + 8, 16),
+                    Qt.AlignmentFlag.AlignCenter,
+                    f"#{rec.id}" if rec.id else f"#{i+1}",
+                )
+
+        self.last_rendered_bar_rects = tuple(rendered_bars)
 
 class MainWindow(QMainWindow):
     def __init__(
@@ -98,6 +460,7 @@ class MainWindow(QMainWindow):
         self._connect_media_signals()
         self._build_ui()
         self._refresh_microphones()
+        self._refresh_token_usage_chart()
         self._update_actions()
 
     def _connect_media_signals(self) -> None:
@@ -195,6 +558,7 @@ class MainWindow(QMainWindow):
         self.payload_debug = self._debug_text_block(debug_layout, "Payload enviado ao Gemini")
         self.return_debug = self._debug_text_block(debug_layout, "Retorno")
         self.usage_debug = self._debug_text_block(debug_layout, "Consumo da API Gemini")
+        self.usage_chart = self._debug_chart_block(debug_layout, "Gráfico de consumo de tokens")
         self.debug_dock.setWidget(debug_widget)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.debug_dock)
         self.debug_dock.visibilityChanged.connect(self._sync_debug_button)
@@ -207,6 +571,12 @@ class MainWindow(QMainWindow):
         editor.setMaximumBlockCount(200)
         layout.addWidget(editor, stretch=1)
         return editor
+
+    def _debug_chart_block(self, layout: QVBoxLayout, title: str) -> TokenUsageChart:
+        layout.addWidget(QLabel(title, self))
+        chart = TokenUsageChart(self)
+        layout.addWidget(chart, stretch=1)
+        return chart
 
     @Slot()
     def _toggle_debug_panel(self) -> None:
@@ -616,7 +986,13 @@ class MainWindow(QMainWindow):
                 self.usage_debug.setPlainText(
                     "Não foi possível persistir o consumo de tokens."
                 )
+                self.usage_chart.set_history(
+                    self.usage_chart.records,
+                    status_message="Não foi possível persistir o consumo de tokens.",
+                )
                 return
+
+        self._refresh_token_usage_chart()
 
         def _format_token_count(value: int | None) -> str:
             if value is None:
@@ -655,6 +1031,27 @@ class MainWindow(QMainWindow):
             )
 
         self.usage_debug.setPlainText("\n".join(lines))
+
+    def _refresh_token_usage_chart(self) -> None:
+        if self.local_store is None:
+            self.usage_chart.set_history(
+                (), status_message="Histórico local indisponível."
+            )
+            return
+
+        try:
+            history = self.local_store.get_token_usage_history()
+        except Exception:
+            self.usage_chart.set_history(
+                (), status_message="Não foi possível carregar o histórico de consumo."
+            )
+            return
+        if not history:
+            self.usage_chart.set_history(
+                (), status_message="Nenhum registro de consumo no histórico."
+            )
+        else:
+            self.usage_chart.set_history(history, status_message="")
     @Slot()
     def copy_text(self) -> None:
         text = self.editor.toPlainText()
