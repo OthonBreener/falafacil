@@ -11,6 +11,7 @@ from falafacil.config import DEFAULT_MODEL
 from falafacil.transcription import (
     INLINE_LIMIT_BYTES,
     PROMPT,
+    REQUEST_TIMEOUT_MS,
     GeminiTranscriber,
     TokenUsage,
     TranscriptionDebug,
@@ -186,6 +187,22 @@ def test_unclassified_api_error_does_not_leak_raw_exception_or_secret() -> None:
         ("429 Resource Exhausted", "Limite da API Gemini"),
         ("quota exceeded", "Limite da API Gemini"),
         ("rate_limit reached", "Limite da API Gemini"),
+        (
+            "Error code: 429 - {'error': {'message': 'Your prepayment credits "
+            "are depleted. Please go to AI Studio at https://ai.studio/projects "
+            "to manage your project and billing.', 'code': "
+            "'too_many_requests'}}",
+            "Créditos pré-pagos da API Gemini esgotados",
+        ),
+        (
+            "prepayment credits are depleted",
+            "Créditos pré-pagos da API Gemini esgotados",
+        ),
+        ("ReadTimeout", "não respondeu dentro do tempo limite"),
+        (
+            "The read operation timed out",
+            "não respondeu dentro do tempo limite",
+        ),
         ("500 Internal Server Error", "O serviço Gemini está indisponível"),
         ("503 Service Unavailable", "O serviço Gemini está indisponível"),
         ("504 Gateway Timeout", "O serviço Gemini está indisponível"),
@@ -236,7 +253,31 @@ def test_transcriber_builds_genai_client_with_api_key(monkeypatch) -> None:
     transcriber = GeminiTranscriber(api_key="synthetic-client-token")
 
     assert transcriber.client.__class__ is ConstructedClient
-    assert calls == [{"api_key": "synthetic-client-token"}]
+    assert calls == [
+        {
+            "api_key": "synthetic-client-token",
+            "http_options": {"timeout": REQUEST_TIMEOUT_MS},
+        }
+    ]
+
+
+def test_transcriber_bounds_requests_with_a_positive_timeout(monkeypatch) -> None:
+    calls = []
+
+    class ConstructedClient(FakeClient):
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            super().__init__()
+
+    monkeypatch.setattr(
+        "falafacil.transcription.genai.Client",
+        ConstructedClient,
+    )
+
+    GeminiTranscriber()
+
+    assert REQUEST_TIMEOUT_MS > 0
+    assert calls == [{"http_options": {"timeout": REQUEST_TIMEOUT_MS}}]
 
 
 def test_transcriber_rejects_empty_and_oversized_audio() -> None:
