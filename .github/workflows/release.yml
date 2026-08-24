@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag de release (ex: v0.2.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,6 +18,8 @@ jobs:
   release:
     name: Build, Test, Package, Release & Sync Tap
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,7 +41,7 @@ jobs:
       - name: Validate tag format and package version equality
         id: version_check
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${RELEASE_TAG}"
           if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "::error::Tag '$TAG' não é um SemVer válido no formato vX.Y.Z"
             exit 1
@@ -116,10 +124,12 @@ jobs:
 
       - name: Audit, install and test Formula
         run: |
-          brew audit --formula homebrew-tap/Formula/falafacil.rb
-          brew install --build-from-source homebrew-tap/Formula/falafacil.rb
-          brew test homebrew-tap/Formula/falafacil.rb
-
+          brew tap-new --no-git OthonBreener/falafacil
+          mkdir -p "$(brew --repo OthonBreener/falafacil)/Formula"
+          cp homebrew-tap/Formula/falafacil.rb "$(brew --repo OthonBreener/falafacil)/Formula/falafacil.rb"
+          brew audit --formula OthonBreener/falafacil/falafacil
+          brew install --build-from-source OthonBreener/falafacil/falafacil
+          brew test OthonBreener/falafacil/falafacil
       - name: Commit and push Formula update to Tap
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

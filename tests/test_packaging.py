@@ -816,13 +816,21 @@ def test_release_workflow_contract() -> None:
     assert workflow_path.is_file()
     content = workflow_path.read_text(encoding="utf-8")
 
-    # Gatilho de tags
+    # Gatilhos: push de tags v*.*.* e workflow_dispatch com input obrigatório de tag
     assert "tags:" in content
     assert "'v*.*.*'" in content or '"v*.*.*"' in content
+    assert "workflow_dispatch:" in content
+    assert "inputs:" in content
+    assert "tag:" in content
+    assert "required: true" in content
+    assert "type: string" in content
 
     # Permissões e runner
     assert "contents: write" in content
     assert "runs-on: ubuntu-24.04" in content
+
+    # Normalização de tag de release no job env para suportar push de tag e dispatch manual em main
+    assert "RELEASE_TAG: ${{ inputs.tag || github.ref_name }}" in content
 
     # Checkouts seguros sem credenciais persistidas
     assert "persist-credentials: false" in content
@@ -834,9 +842,12 @@ def test_release_workflow_contract() -> None:
     assert content.index("libpulse0") < content.index("QT_QPA_PLATFORM=offscreen poetry run pytest -q")
     assert content.index("libegl1") < content.index("QT_QPA_PLATFORM=offscreen poetry run pytest -q")
     assert content.index("libportaudio2") < content.index("QT_QPA_PLATFORM=offscreen poetry run pytest -q")
-    # Validação da tag e versão antes de poetry install, com PYTHONPATH=src
+    # Validação da tag normalizada e versão antes de poetry install, com PYTHONPATH=src
+    assert 'TAG="${RELEASE_TAG}"' in content
     assert "^v[0-9]+\\.[0-9]+\\.[0-9]+$" in content
     assert "PYTHONPATH=src python3 -c \"import falafacil; print(falafacil.__version__)\"" in content
+    assert 'echo "version=$VERSION" >> "$GITHUB_OUTPUT"' in content
+    assert 'echo "tag=$TAG" >> "$GITHUB_OUTPUT"' in content
 
     # Instalação com split explícito de dependências (incluindo dev e build extras) e pacote raiz
     assert "poetry install --extras dev --extras build\n          poetry run pip install --no-deps -e ." in content
@@ -846,14 +857,14 @@ def test_release_workflow_contract() -> None:
 
     # Build e probe
     assert "./scripts/build_executable.sh" in content
-    assert "./dist/falafacil --update-probe" in content
+    assert './dist/falafacil --update-probe "${{ steps.version_check.outputs.version }}"' in content
 
     # Assets de release e permissões 0755
     assert "falafacil-linux-x86_64" in content
     assert "chmod 0755" in content
     assert "tar --owner=0 --group=0 --numeric-owner -czf" in content
 
-    # Invocação do helper de release determinístico
+    # Invocação do helper de release determinístico com outputs do version_check
     assert "python scripts/publish_release.py" in content
     assert '--tag "${{ steps.version_check.outputs.tag }}"' in content
     assert '--version "${{ steps.version_check.outputs.version }}"' in content
@@ -878,12 +889,135 @@ def test_release_workflow_contract() -> None:
     assert "rm -f \"$ASKPASS_SH\"" in content
     assert "scripts/render_homebrew_formula.py" in content
     assert "Homebrew/actions/setup-homebrew@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4" in content
-    assert "brew audit --formula" in content
-    assert "brew install --build-from-source" in content
-    assert "brew test" in content
+
+    # Criação de tap temporário local e auditoria/instalação/teste por nome lógico exato
+    assert "brew tap-new --no-git OthonBreener/falafacil" in content
+    assert 'mkdir -p "$(brew --repo OthonBreener/falafacil)/Formula"' in content
+    assert 'cp homebrew-tap/Formula/falafacil.rb "$(brew --repo OthonBreener/falafacil)/Formula/falafacil.rb"' in content
+    assert "brew audit --formula OthonBreener/falafacil/falafacil" in content
+    assert "brew install --build-from-source OthonBreener/falafacil/falafacil" in content
+    assert "brew test OthonBreener/falafacil/falafacil" in content
+
+    # Rejeição estrita de comandos brew por caminho de arquivo (rejeitados no Homebrew 6)
+    assert not re.search(r"brew\s+(?:audit|install|test)\s+.*homebrew-tap", content)
+    assert not re.search(r"brew\s+(?:audit|install|test)\s+.*\.rb", content)
+
+
+def test_release_workflow_tag_validation_simulation(tmp_path: Path) -> None:
+    import subprocess
+
+    workflow_path = ROOT / ".github" / "workflows" / "release.yml"
+    content = workflow_path.read_text(encoding="utf-8")
+
+    # Extrai o script de validação de versão do step version_check
+    assert 'TAG="${RELEASE_TAG}"' in content
+
+    bash_script = """
+    set -euo pipefail
+    TAG="${RELEASE_TAG}"
+    if ! echo "$TAG" | grep -Eq '^v[0-9]+\\.[0-9]+\\.[0-9]+$'; then
+      echo "Tag '$TAG' não é um SemVer válido no formato vX.Y.Z" >&2
+      exit 1
+    fi
+    VERSION="${TAG#v}"
+    PACKAGE_VERSION=$(PYTHONPATH=src python3 -c "import falafacil; print(falafacil.__version__)")
+    if [ "$VERSION" != "$PACKAGE_VERSION" ]; then
+      echo "Versão da tag '$VERSION' diverge de falafacil.__version__ '$PACKAGE_VERSION'" >&2
+      exit 1
+    fi
+    echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+    echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+    """
+
+    output_file = tmp_path / "github_output.txt"
+
+    # 1. Caso válido correspondente à versão do pacote (v0.2.0)
+    output_file.write_text("", encoding="utf-8")
+    env = os.environ.copy()
+    env["RELEASE_TAG"] = "v0.2.0"
+    env["GITHUB_OUTPUT"] = str(output_file)
+    env["PYTHONPATH"] = str(ROOT / "src")
+    res = subprocess.run(
+        ["bash", "-c", bash_script],
+        env=env,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, res.stderr
+    out_text = output_file.read_text(encoding="utf-8")
+    assert "version=0.2.0\n" in out_text
+    assert "tag=v0.2.0\n" in out_text
+
+    # 2. Caso com divergência de versão (v0.3.0)
+    env["RELEASE_TAG"] = "v0.3.0"
+    res = subprocess.run(
+        ["bash", "-c", bash_script],
+        env=env,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 1
+    assert "diverge de falafacil.__version__" in res.stderr
+
+    # 3. Caso de branch name em vez de tag SemVer (ex: main)
+    env["RELEASE_TAG"] = "main"
+    res = subprocess.run(
+        ["bash", "-c", bash_script],
+        env=env,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 1
+    assert "não é um SemVer válido" in res.stderr
+
+    # 4. Caso sem prefixo 'v' (ex: 0.2.0)
+    env["RELEASE_TAG"] = "0.2.0"
+    res = subprocess.run(
+        ["bash", "-c", bash_script],
+        env=env,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 1
+    assert "não é um SemVer válido" in res.stderr
+
+    # 5. Caso inválido SemVer (ex: v0.2.0-beta)
+    env["RELEASE_TAG"] = "v0.2.0-beta"
+    res = subprocess.run(
+        ["bash", "-c", bash_script],
+        env=env,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 1
+    assert "não é um SemVer válido" in res.stderr
+
+    # 6. Caso vazio
+    env["RELEASE_TAG"] = ""
+    res = subprocess.run(
+        ["bash", "-c", bash_script],
+        env=env,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 1
+    assert "não é um SemVer válido" in res.stderr
+
+
 def test_tar_asset_structure_assumptions(tmp_path: Path) -> None:
     import tarfile
-
     # Cria binário sintético
     build_dir = tmp_path / "tar_root"
     build_dir.mkdir()
