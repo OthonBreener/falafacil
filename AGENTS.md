@@ -63,6 +63,7 @@ As restrições e dependências declaradas em `pyproject.toml` são:
 | Caminho | Responsabilidade |
 |---|---|
 | `README.md` | Entrada do projeto, navegação e começo rápido. |
+| `CLAUDE.md` | Symlink para `AGENTS.md`; mantém um único contrato de agentes sob os dois nomes. |
 | `ARQUITETURA.md` | Mapa arquitetural, fluxo de dependências e invariantes técnicos. |
 | `docs/` | Índice, contrato dos agentes de desenvolvimento e gate de smoke. |
 | `.omp/agents/` | Definições dos papéis delegados de implementador, testador e revisor. |
