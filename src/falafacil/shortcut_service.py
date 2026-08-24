@@ -23,6 +23,9 @@ _MOUSE_CODE_NAMES = {
     "BTN_BACK": "back",
     "BTN_TASK": "task",
 }
+_PRIMARY_CODE_NAMES = {"BTN_LEFT": "primary", "BTN_RIGHT": "primary"}
+_EXTRA_BUTTON_CODE_NAMES = {f"BTN_{index}": "extra" for index in range(10)}
+_MOUSE_REJECTION_CODES = frozenset({"primary_button", "unsupported_button"})
 _MODIFIER_CODE_NAMES = {
     "KEY_LEFTCTRL": "ctrl",
     "KEY_RIGHTCTRL": "ctrl",
@@ -184,14 +187,18 @@ class ShortcutSession:
         self._close()
         return False
 
-    def handle_mouse_press(self, button: str) -> None:
-        canonical = normalize_mouse_button_name(button)
-        if canonical is None:
-            return
+    def handle_mouse_press(
+        self, button: str | None, *, rejection: str | None = None
+    ) -> None:
+        canonical = normalize_mouse_button_name(button) if button is not None else None
         if self._mouse_capture:
+            if canonical is None:
+                if rejection in _MOUSE_REJECTION_CODES:
+                    self._send_line(f"ERROR mouse {self._mouse_generation} {rejection}")
+                return
             self._mouse_capture = False
             self._send_line(f"CAPTURED_MOUSE {self._mouse_generation} {canonical}")
-        elif self._mouse_binding == canonical:
+        elif canonical is not None and self._mouse_binding == canonical:
             self._send_line(f"ACTIVATED_MOUSE {self._mouse_generation} {canonical}")
 
     def handle_keyboard_press(self, shortcut: str | None, *, unsafe: bool = False) -> None:
@@ -292,7 +299,7 @@ class InputDeviceMonitor(QObject):
 
     def __init__(
         self,
-        dispatch_mouse: Callable[[str], None],
+        dispatch_mouse: Callable[[str | None, str | None], None],
         dispatch_keyboard: Callable[[str | None, bool], None],
         notify_error: Callable[[str], None],
         *,
@@ -327,6 +334,12 @@ class InputDeviceMonitor(QObject):
         self._kinds: dict[str, str] = {}
         self._modifiers_by_device: dict[str, set[str]] = {}
         self._mouse_codes = _code_map(_MOUSE_CODE_NAMES, self._ecodes)
+        self._primary_codes = frozenset(_code_map(_PRIMARY_CODE_NAMES, self._ecodes))
+        self._button_codes = (
+            frozenset(self._mouse_codes)
+            | self._primary_codes
+            | frozenset(_code_map(_EXTRA_BUTTON_CODE_NAMES, self._ecodes))
+        )
         self._modifier_codes = _code_map(_MODIFIER_CODE_NAMES, self._ecodes)
         self._terminal_codes = _code_map(_TERMINAL_CODE_NAMES, self._ecodes)
         self._watcher = watcher or QFileSystemWatcher(self)
@@ -386,6 +399,8 @@ class InputDeviceMonitor(QObject):
         key_codes = set(capabilities.get(ev_key, ()))
         if key_codes.intersection(self._modifier_codes | self._terminal_codes):
             return "keyboard"
+        if key_codes.intersection(self._button_codes):
+            return "mouse"
         return None
 
     def _drain(self, path: str) -> None:
@@ -397,12 +412,11 @@ class InputDeviceMonitor(QObject):
             for event in events:
                 if int(event.type) != int(getattr(self._ecodes, "EV_KEY")):
                     continue
-                if self._kinds[path] == "mouse":
-                    self._handle_mouse_event(int(event.code), int(event.value))
+                code, value = int(event.code), int(event.value)
+                if code in self._button_codes:
+                    self._handle_mouse_event(code, value)
                 else:
-                    self._handle_keyboard_event(
-                        path, int(event.code), int(event.value)
-                    )
+                    self._handle_keyboard_event(path, code, value)
         except BlockingIOError:
             return
         except (OSError, RuntimeError):
@@ -415,7 +429,12 @@ class InputDeviceMonitor(QObject):
             return
         button = self._mouse_codes.get(code)
         if button is not None:
-            self._dispatch_mouse(button)
+            self._dispatch_mouse(button, None)
+            return
+        self._dispatch_mouse(
+            None,
+            "primary_button" if code in self._primary_codes else "unsupported_button",
+        )
 
     def _handle_keyboard_event(self, path: str, code: int, value: int) -> None:
         modifier = self._modifier_codes.get(code)
@@ -485,9 +504,9 @@ class ShortcutService(QObject):
             self.sessions.add(session)
             socket.disconnected.connect(lambda target=session: self.sessions.discard(target))
 
-    def _dispatch_mouse(self, button: str) -> None:
+    def _dispatch_mouse(self, button: str | None, rejection: str | None) -> None:
         for session in tuple(self.sessions):
-            session.protocol.handle_mouse_press(button)
+            session.protocol.handle_mouse_press(button, rejection=rejection)
 
     def _dispatch_keyboard(self, shortcut: str | None, unsafe: bool) -> None:
         for session in tuple(self.sessions):

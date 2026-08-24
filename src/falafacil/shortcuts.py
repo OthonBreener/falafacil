@@ -18,6 +18,17 @@ BACKEND_FAILURE_MESSAGE = "Não foi possível ativar o atalho global."
 SOURCE_INSTALL_UNAVAILABLE_MESSAGE = (
     "A autorização automática está disponível no aplicativo instalado."
 )
+PRIMARY_MOUSE_BUTTON_MESSAGE = (
+    "Os botões esquerdo e direito não são aceitos. "
+    "Use um botão lateral ou o botão do meio."
+)
+UNSUPPORTED_MOUSE_BUTTON_MESSAGE = (
+    "Esse botão não é reconhecido pela integração global. Use um botão lateral, "
+    "o botão do meio, ou remapeie-o no software do mouse."
+)
+MOUSE_CAPTURE_HINT_MESSAGES = frozenset(
+    {PRIMARY_MOUSE_BUTTON_MESSAGE, UNSUPPORTED_MOUSE_BUTTON_MESSAGE}
+)
 
 _ALLOWED_MOUSE_BUTTONS = frozenset({"middle", "x1", "x2", "forward", "back", "task"})
 _MOUSE_ALIASES = {"button8": "x1", "button9": "x2"}
@@ -30,6 +41,8 @@ _ERROR_MESSAGES = {
     "input_access": INPUT_ACCESS_MESSAGE,
     "no_devices": NO_COMPATIBLE_DEVICE_MESSAGE,
     "unsafe_key": BACKEND_FAILURE_MESSAGE,
+    "primary_button": PRIMARY_MOUSE_BUTTON_MESSAGE,
+    "unsupported_button": UNSUPPORTED_MOUSE_BUTTON_MESSAGE,
 }
 
 SocketFactory = Callable[[], QLocalSocket]

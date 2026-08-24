@@ -113,6 +113,23 @@ poetry install --extras build
    - Toda a autorização ocorre dentro da própria interface gráfica via prompt administrativo do Ubuntu: você não precisa abrir terminal, usar `sudo`, editar grupos de usuários ou reiniciar a sessão.
    - Aceite a autorização quando solicitada; o aplicativo instala o serviço local por UID e retoma a captura do atalho automaticamente.
    - Os atalhos globais e os controles manuais (`Gravar` e tecla `Espaço`) podem coexistir e funcionar simultaneamente.
+   - Ao acionar um atalho global, a janela é restaurada e trazida à frente antes de a gravação alternar, mesmo se estiver minimizada. Em X11 o foco é imediato; alguns compositores Wayland apenas sinalizam a janela como pronta.
+   - Se um botão não for aceito, o diálogo explica o motivo; se nenhuma entrada for reconhecida, ele orienta o remapeamento no software do fabricante.
+
+#### Botões do mouse que o Linux não enxerga
+
+Alguns botões de mouses gamer são resolvidos dentro do próprio dispositivo e **não emitem evento algum** em `/dev/input`. Nenhum aplicativo Linux consegue detectá-los, incluindo o FalaFácil. O caso mais comum é o botão sniper (mira) do Corsair M65, cuja função padrão é um DPI-shift em firmware.
+
+Botões assim costumam ser reprogramáveis: ao receber uma ação de botão ou tecla no lugar da função de firmware, o dispositivo passa a reportá-la por HID e o atalho volta a funcionar. O remapeamento precisa ser feito no software do fabricante, e mouses gamer guardam o perfil em memória onboard — basta remapear uma vez e a configuração acompanha o dispositivo.
+
+Para o Corsair M65 RGB ULTRA especificamente:
+
+- O **iCUE** não roda no Linux, mas o perfil de hardware gravado por ele persiste no mouse. Remapear o botão uma única vez em uma máquina Windows e salvar no perfil onboard resolve de forma definitiva, sem exigir software rodando no Linux.
+- O **ckb-next**, alternativa livre para dispositivos Corsair, ainda **não suporta este modelo** (`1b1c:1b9e`): o suporte está em aberto na [issue #912](https://github.com/ckb-next/ckb-next/issues/912) e não faz parte da versão empacotada pelo Ubuntu. Para outros modelos Corsair já suportados, ele cumpre o mesmo papel.
+
+Ao remapear, escolha `Mouse 4` ou `Mouse 5` — que chegam ao sistema como `x1`/`x2` — ou uma tecla de `F13` a `F24`, aceita como atalho de teclado. Depois reabra **Configurações → atalho do mouse → Configurar** e capture o botão.
+
+Para conferir se um botão emite evento, `sudo evtest` (pacote `evtest`) mostra os eventos brutos do dispositivo escolhido: se nada aparecer ao pressioná-lo, o botão não chega ao sistema.
 
 ### 7. Verificação e solução de problemas
 

@@ -59,12 +59,15 @@ class FakeEcodes:
     EV_REL = 2
     REL_X = 10
     REL_Y = 11
+    BTN_LEFT = 18
+    BTN_RIGHT = 19
     BTN_MIDDLE = 20
     BTN_SIDE = 21
     BTN_EXTRA = 22
     BTN_FORWARD = 23
     BTN_BACK = 24
     BTN_TASK = 25
+    BTN_0 = 26
     KEY_LEFTCTRL = 30
     KEY_RIGHTCTRL = 31
     KEY_LEFTALT = 32
@@ -261,11 +264,11 @@ def test_monitor_filters_mouse_keyboard_release_repeat_and_extra_modifiers(tmp_p
     )
     devices = {"/dev/input/mouse": mouse, "/dev/input/keyboard": keyboard}
     paths = list(devices)
-    mouse_events: list[str] = []
+    mouse_events: list[tuple[str | None, str | None]] = []
     keyboard_events: list[tuple[str | None, bool]] = []
     errors: list[str] = []
     monitor = InputDeviceMonitor(
-        mouse_events.append,
+        lambda button, rejection: mouse_events.append((button, rejection)),
         lambda shortcut, unsafe: keyboard_events.append((shortcut, unsafe)),
         errors.append,
         input_dir=tmp_path,
@@ -297,8 +300,12 @@ def test_monitor_filters_mouse_keyboard_release_repeat_and_extra_modifiers(tmp_p
     )
     monitor._drain("/dev/input/keyboard")
 
-    assert mouse_events == ["x1"]
-    assert keyboard_events == [("ctrl+alt+r", False), ("ctrl+alt+shift+r", False)]
+    assert mouse_events == [("x1", None)]
+    assert keyboard_events == [
+        (None, True),
+        ("ctrl+alt+r", False),
+        ("ctrl+alt+shift+r", False),
+    ]
     assert errors == []
 
 
@@ -310,7 +317,7 @@ def test_monitor_hotplug_removal_closes_device_and_clears_stuck_modifiers(tmp_pa
     paths = ["first", "second"]
     observed: list[tuple[str | None, bool]] = []
     monitor = InputDeviceMonitor(
-        lambda _button: None,
+        lambda _button, _rejection: None,
         lambda shortcut, unsafe: observed.append((shortcut, unsafe)),
         lambda _code: None,
         input_dir=tmp_path,
@@ -333,7 +340,7 @@ def test_monitor_hotplug_removal_closes_device_and_clears_stuck_modifiers(tmp_pa
 def test_monitor_reports_access_and_no_device_errors(tmp_path: Path) -> None:
     errors: list[str] = []
     InputDeviceMonitor(
-        lambda _button: None,
+        lambda _button, _rejection: None,
         lambda _shortcut, _unsafe: None,
         errors.append,
         input_dir=tmp_path,
@@ -380,7 +387,7 @@ def test_input_device_monitor_default_list_devices_requests_readable_only(
     monkeypatch.setattr("falafacil.shortcut_service._evdev_module", lambda: FakeEvdevModule)
 
     monitor = InputDeviceMonitor(
-        lambda _button: None,
+        lambda _button, _rejection: None,
         lambda _shortcut, _unsafe: None,
         lambda _error: None,
         input_dir=tmp_path,
@@ -400,7 +407,7 @@ def test_input_device_monitor_default_list_devices_requests_readable_only(
         return []
 
     injected_monitor = InputDeviceMonitor(
-        lambda _button: None,
+        lambda _button, _rejection: None,
         lambda _shortcut, _unsafe: None,
         lambda _error: None,
         input_dir=tmp_path,
@@ -410,3 +417,154 @@ def test_input_device_monitor_default_list_devices_requests_readable_only(
     )
     assert injected_called is True
     assert calls == []
+
+
+def test_rejected_button_reports_error_only_while_capturing() -> None:
+    lines: list[str] = []
+    session = ShortcutSession(lines.append, lambda: None)
+    session.handle_line("HELLO 1")
+    session.handle_line("WATCH_MOUSE 1 x1")
+    lines.clear()
+
+    session.handle_mouse_press(None, rejection="primary_button")
+    session.handle_mouse_press(None, rejection="unsupported_button")
+    assert lines == []
+
+    assert session.handle_line("CAPTURE_MOUSE 2")
+    session.handle_mouse_press(None, rejection="primary_button")
+    session.handle_mouse_press(None, rejection="unsupported_button")
+    assert lines == [
+        "ERROR mouse 2 primary_button",
+        "ERROR mouse 2 unsupported_button",
+    ]
+
+    session.handle_mouse_press("x1")
+    assert lines[-1] == "CAPTURED_MOUSE 2 x1"
+    session.handle_mouse_press("x1")
+    assert lines[-1] == "CAPTURED_MOUSE 2 x1"
+
+
+def test_rejection_vocabulary_is_closed() -> None:
+    lines: list[str] = []
+    session = ShortcutSession(lines.append, lambda: None)
+    session.handle_line("HELLO 1")
+    session.handle_line("CAPTURE_MOUSE 1")
+    lines.clear()
+
+    session.handle_mouse_press(None, rejection="/dev/input/event3")
+    session.handle_mouse_press(None, rejection="BTN_TRIGGER_HAPPY")
+    session.handle_mouse_press(None)
+    assert lines == []
+
+
+def test_monitor_routes_button_codes_on_a_keyboard_classified_node(
+    tmp_path: Path,
+) -> None:
+    _qapp()
+    combo = FakeDevice(
+        {
+            FakeEcodes.EV_KEY: [
+                FakeEcodes.KEY_LEFTCTRL,
+                FakeEcodes.KEY_R,
+                FakeEcodes.BTN_0,
+                FakeEcodes.BTN_SIDE,
+            ]
+        }
+    )
+    devices = {"/dev/input/combo": combo}
+    mouse_events: list[tuple[str | None, str | None]] = []
+    keyboard_events: list[tuple[str | None, bool]] = []
+    monitor = InputDeviceMonitor(
+        lambda button, rejection: mouse_events.append((button, rejection)),
+        lambda shortcut, unsafe: keyboard_events.append((shortcut, unsafe)),
+        lambda _error: None,
+        input_dir=tmp_path,
+        list_devices=lambda: list(devices),
+        device_factory=devices.__getitem__,
+        notifier_factory=FakeNotifier,
+        ecodes=FakeEcodes,
+    )
+    assert monitor.device_paths == frozenset({"/dev/input/combo"})
+    assert combo.closed is False
+
+    combo.events.extend(
+        [
+            FakeEvent(FakeEcodes.EV_KEY, FakeEcodes.BTN_SIDE, 1),
+            FakeEvent(FakeEcodes.EV_KEY, FakeEcodes.BTN_0, 1),
+            FakeEvent(FakeEcodes.EV_KEY, FakeEcodes.KEY_LEFTCTRL, 1),
+            FakeEvent(FakeEcodes.EV_KEY, FakeEcodes.KEY_R, 1),
+        ]
+    )
+    monitor._drain("/dev/input/combo")
+
+    assert mouse_events == [("x1", None), (None, "unsupported_button")]
+    assert keyboard_events == [("ctrl+r", False)]
+
+
+def test_monitor_admits_button_only_node(tmp_path: Path) -> None:
+    _qapp()
+    device = FakeDevice({FakeEcodes.EV_KEY: [FakeEcodes.BTN_SIDE]})
+    devices = {"/dev/input/buttons": device}
+    mouse_events: list[tuple[str | None, str | None]] = []
+    monitor = InputDeviceMonitor(
+        lambda button, rejection: mouse_events.append((button, rejection)),
+        lambda _shortcut, _unsafe: None,
+        lambda _error: None,
+        input_dir=tmp_path,
+        list_devices=lambda: list(devices),
+        device_factory=devices.__getitem__,
+        notifier_factory=FakeNotifier,
+        ecodes=FakeEcodes,
+    )
+    assert monitor.device_paths == frozenset({"/dev/input/buttons"})
+    assert device.closed is False
+
+    device.events.append(FakeEvent(FakeEcodes.EV_KEY, FakeEcodes.BTN_SIDE, 1))
+    monitor._drain("/dev/input/buttons")
+    assert mouse_events == [("x1", None)]
+
+
+def test_primary_and_unknown_buttons_report_distinct_rejections(
+    tmp_path: Path,
+) -> None:
+    _qapp()
+    mouse = FakeDevice(
+        {
+            FakeEcodes.EV_REL: [FakeEcodes.REL_X, FakeEcodes.REL_Y],
+            FakeEcodes.EV_KEY: [
+                FakeEcodes.BTN_LEFT,
+                FakeEcodes.BTN_RIGHT,
+                FakeEcodes.BTN_SIDE,
+                FakeEcodes.BTN_0,
+            ],
+        }
+    )
+    devices = {"/dev/input/mouse": mouse}
+    mouse_events: list[tuple[str | None, str | None]] = []
+    monitor = InputDeviceMonitor(
+        lambda button, rejection: mouse_events.append((button, rejection)),
+        lambda _shortcut, _unsafe: None,
+        lambda _error: None,
+        input_dir=tmp_path,
+        list_devices=lambda: list(devices),
+        device_factory=devices.__getitem__,
+        notifier_factory=FakeNotifier,
+        ecodes=FakeEcodes,
+    )
+
+    mouse.events.extend(
+        [
+            FakeEvent(FakeEcodes.EV_KEY, FakeEcodes.BTN_LEFT, 0),
+            FakeEvent(FakeEcodes.EV_KEY, FakeEcodes.BTN_LEFT, 2),
+            FakeEvent(FakeEcodes.EV_KEY, FakeEcodes.BTN_LEFT, 1),
+            FakeEvent(FakeEcodes.EV_KEY, FakeEcodes.BTN_RIGHT, 1),
+            FakeEvent(FakeEcodes.EV_KEY, FakeEcodes.BTN_0, 1),
+        ]
+    )
+    monitor._drain("/dev/input/mouse")
+
+    assert mouse_events == [
+        (None, "primary_button"),
+        (None, "primary_button"),
+        (None, "unsupported_button"),
+    ]

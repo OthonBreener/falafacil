@@ -64,6 +64,7 @@ from .storage import LocalStore, LocalStoreError, TokenTotals, TokenUsageRecord
 from .shortcut_install import ShortcutServiceInstaller
 from .shortcuts import (
     BACKEND_FAILURE_MESSAGE,
+    MOUSE_CAPTURE_HINT_MESSAGES,
     InputShortcutBridge,
     normalize_keyboard_shortcut,
     normalize_mouse_button_name,
@@ -82,6 +83,9 @@ class AppState(Enum):
 
 
 MediaPlayerFactory = Callable[[QWidget], tuple[QMediaPlayer, QAudioOutput]]
+
+CAPTURE_WAITING_TEXT = "Aguardando entrada…"
+CAPTURE_HINT_DELAY_MS = 8000
 
 
 def _default_media_player_factory(parent: QWidget) -> tuple[QMediaPlayer, QAudioOutput]:
@@ -1119,7 +1123,7 @@ class MainWindow(QMainWindow):
         )
         prompt.setWordWrap(True)
         layout.addWidget(prompt)
-        status = QLabel("Aguardando entrada…", dialog)
+        status = QLabel(CAPTURE_WAITING_TEXT, dialog)
         status.setWordWrap(True)
         layout.addWidget(status)
         buttons = QDialogButtonBox(dialog)
@@ -1141,6 +1145,10 @@ class MainWindow(QMainWindow):
             if kind == "mouse"
             else self.input_shortcut_bridge.begin_keyboard_capture()
         )
+        pending = self._capture_generation
+        QTimer.singleShot(
+            CAPTURE_HINT_DELAY_MS, lambda: self._hint_capture_timeout(kind, pending)
+        )
         result = dialog.exec()
         captured = self._captured_shortcut
         disabled = self._capture_disable
@@ -1160,6 +1168,23 @@ class MainWindow(QMainWindow):
                 self.input_shortcut_bridge.stop_mouse()
             else:
                 self.input_shortcut_bridge.stop_keyboard()
+
+    def _hint_capture_timeout(self, kind: str, generation: int) -> None:
+        """Explain a silent capture instead of waiting on input that never comes."""
+        if (
+            self._is_closing
+            or self._capture_status_label is None
+            or self._capture_kind != kind
+            or self._capture_generation != generation
+        ):
+            return
+        if self._capture_status_label.text() != CAPTURE_WAITING_TEXT:
+            return
+        self._capture_status_label.setText(
+            "Nenhuma entrada foi reconhecida. Alguns botões existem apenas no firmware "
+            "do dispositivo e não chegam ao sistema; remapeie-o no software do "
+            "fabricante ou escolha outro botão."
+        )
 
     @Slot()
     def _mark_capture_disabled(self) -> None:
@@ -1305,7 +1330,19 @@ class MainWindow(QMainWindow):
     def _activate_recording_shortcut(self) -> None:
         if self._is_closing or self.state is AppState.TRANSCRIBING:
             return
+        self._raise_to_front()
         self._toggle_recording()
+
+    def _raise_to_front(self) -> None:
+        """Show the window above other applications, restoring it if minimized."""
+        if not self.isVisible():
+            self.show()
+        self.setWindowState(
+            (self.windowState() & ~Qt.WindowState.WindowMinimized)
+            | Qt.WindowState.WindowActive
+        )
+        self.raise_()
+        self.activateWindow()
 
     @Slot(str, int, str)
     def _on_shortcut_failed(self, kind: str, generation: int, message: str) -> None:
@@ -1322,6 +1359,15 @@ class MainWindow(QMainWindow):
                 "Uma letra ou dígito isolado não é aceito. Use Ctrl, Alt ou Meta, "
                 "ou escolha uma tecla de função/mídia."
             )
+            return
+        if (
+            kind == "mouse"
+            and self._capture_kind == kind
+            and self._capture_generation == generation
+            and self._capture_status_label is not None
+            and message in MOUSE_CAPTURE_HINT_MESSAGES
+        ):
+            self._capture_status_label.setText(message)
             return
         if (
             self._capture_dialog is not None

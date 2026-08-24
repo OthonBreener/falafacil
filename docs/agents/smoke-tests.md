@@ -48,6 +48,7 @@ Além dos comandos gerais, validar o fluxo crítico afetado com os testes determ
 - mouse e teclado independentes e simultâneos em ambientes declarados X11/Wayland; pressão correspondente alterna via `_toggle_recording`, enquanto soltura, repetição, trigger diferente, modificador extra e geração antiga não alternam;
 - normalização segura e persistência separada de `recording_mouse_button`/`recording_keyboard_shortcut` no schema v1, somente após ACK, com fail-soft de escrita;
 - framing parcial/múltiplo, limite de 128 bytes, handshake, captura one-shot, isolamento de cliente/tipo e ausência de vazamento de teclas não correspondentes;
+- botão de mouse rejeitado exibe explicação no diálogo de captura, com vocabulário de rejeição fechado e nenhum envio fora do modo de captura; captura sem entrada reconhecida orienta o remapeamento em vez de permanecer em espera;
 - autorização assíncrona sem shell/segredo, retomada da captura, socket `0600` por UID, daemon não-root/hardened e operação manual/`Space` preservadas em falha;
 - fechamento ordenado: cancelar instalador, fechar `InputShortcutBridge` e só então fechar `LocalStore`;
 - limite de payload inline e ausência de segredo em métricas, logs ou mensagens;
