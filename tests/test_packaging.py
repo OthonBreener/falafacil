@@ -828,6 +828,11 @@ def test_release_workflow_contract() -> None:
     assert "persist-credentials: false" in content
     assert "token: ${{ secrets.HOMEBREW_TAP_TOKEN }}" not in content, "Checkout do tap deve ser anônimo sem token em step"
 
+    # Dependências do sistema (PortAudio e EGL para PySide6 offscreen no runner Ubuntu 24.04)
+    assert "sudo apt-get update" in content
+    assert "sudo apt-get install -y libportaudio2 libegl1" in content
+    assert content.index("libegl1") < content.index("QT_QPA_PLATFORM=offscreen poetry run pytest -q")
+    assert content.index("libportaudio2") < content.index("QT_QPA_PLATFORM=offscreen poetry run pytest -q")
     # Validação da tag e versão antes de poetry install, com PYTHONPATH=src
     assert "^v[0-9]+\\.[0-9]+\\.[0-9]+$" in content
     assert "PYTHONPATH=src python3 -c \"import falafacil; print(falafacil.__version__)\"" in content
