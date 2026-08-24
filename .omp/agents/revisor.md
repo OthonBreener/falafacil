@@ -1,7 +1,7 @@
 ---
 name: revisor
 description: Audita implementação, documentação e evidência de validação do FalaFácil antes da entrega.
-model: openai-codex/gpt-5.6-terra:high
+model: openai-codex/gpt-5.6-sol:high
 tools:
   - read
   - grep
