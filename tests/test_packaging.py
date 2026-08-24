@@ -709,20 +709,21 @@ def test_homebrew_formula_template_structure_and_placeholders() -> None:
     assert 'desc "Transcrição de voz em português com Gemini"' in content
     assert 'homepage "https://github.com/OthonBreener/falafacil"' in content
     assert 'url "https://github.com/OthonBreener/falafacil/releases/download/v@VERSION@/falafacil-@VERSION@-linux-x86_64.tar.gz"' in content
-    assert 'version "@VERSION@"' in content
+    assert 'version "@VERSION@"' not in content
     assert 'sha256 "@SHA256@"' in content
-    assert 'depends_on :linux' in content
     assert 'depends_on arch: :x86_64' in content
+    assert 'depends_on :linux' in content
+    assert content.index('depends_on arch: :x86_64') < content.index('depends_on :linux')
     assert 'libexec.install "falafacil"' in content
     assert 'bin.install_symlink libexec/"falafacil"' in content
-    assert 'schema: 1' in content
-    assert 'channel: "homebrew"' in content
-    assert 'formula: "OthonBreener/falafacil/falafacil"' in content
-    assert 'version: version.to_s' in content
+    assert 'schema:          1' in content
+    assert 'channel:         "homebrew"' in content
+    assert 'formula:         "OthonBreener/falafacil/falafacil"' in content
+    assert 'version:         version.to_s' in content
     assert 'homebrew_prefix: HOMEBREW_PREFIX.to_s' in content
-    assert 'brew_path: (HOMEBREW_PREFIX/"bin/brew").to_s' in content
-    assert 'launch_path: (opt_bin/"falafacil").to_s' in content
-    assert 'marker_path: (opt_prefix/"libexec/falafacil-homebrew.json").to_s' in content
+    assert 'brew_path:       (HOMEBREW_PREFIX/"bin/brew").to_s' in content
+    assert 'launch_path:     (opt_bin/"falafacil").to_s' in content
+    assert 'marker_path:     (opt_prefix/"libexec/falafacil-homebrew.json").to_s' in content
     assert '(libexec/"falafacil-homebrew.json").write JSON.generate(marker_payload)' in content
     assert 'Execute falafacil uma vez após a instalação para registrá-lo no menu de aplicativos.' in content
     assert 'system "#{bin}/falafacil", "--update-probe", version.to_s' in content
@@ -776,7 +777,7 @@ def test_render_homebrew_formula_success_and_validations(tmp_path: Path) -> None
     assert "@SHA256@" not in rendered
     assert "@" not in re.findall(r"@[A-Z0-9_]+@", rendered)
     assert 'url "https://github.com/OthonBreener/falafacil/releases/download/v0.2.0/falafacil-0.2.0-linux-x86_64.tar.gz"' in rendered
-    assert 'version "0.2.0"' in rendered
+    assert 'version "0.2.0"' not in rendered
     assert f'sha256 "{dummy_sha}"' in rendered
 
     # Renderização via CLI
@@ -801,6 +802,7 @@ def test_render_homebrew_formula_success_and_validations(tmp_path: Path) -> None
 
     # Verificação de sintaxe Ruby se disponível
     ruby_bin = shutil.which("ruby")
+    brew_bin = shutil.which("brew")
     if ruby_bin is not None:
         syntax_check = subprocess.run(
             [ruby_bin, "-c", str(output_path)],
@@ -809,7 +811,14 @@ def test_render_homebrew_formula_success_and_validations(tmp_path: Path) -> None
             check=False,
         )
         assert syntax_check.returncode == 0, syntax_check.stderr
-
+    elif brew_bin is not None:
+        syntax_check = subprocess.run(
+            [brew_bin, "ruby", "-e", "RubyVM::InstructionSequence.compile_file(ARGV[0])", str(output_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert syntax_check.returncode == 0, syntax_check.stderr
 
 def test_release_workflow_contract() -> None:
     workflow_path = ROOT / ".github" / "workflows" / "release.yml"
