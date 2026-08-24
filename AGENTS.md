@@ -18,14 +18,14 @@ O ponto de entrada público é `falafacil`, definido em `pyproject.toml`; a mesm
 2. `Settings.from_env(fallback_api_key=...)` lê `GEMINI_MODEL` e escolhe a chave pela precedência `GEMINI_API_KEY`, depois `GOOGLE_API_KEY`, depois a chave persistida. A chave permanece fora de `repr` e comparações de `Settings`.
 3. Sem uma chave ativa, a janela abre normalmente, mostra a mensagem de configuração e mantém a gravação desabilitada. O botão `Configurar chave API` abre um diálogo com campo de senha; ao aceitar uma chave não vazia, a UI cria o novo transcritor antes de trocar o estado, tenta persistir no chaveiro e habilita a gravação. Se o backend não estiver disponível, a chave funciona somente nesta sessão e a UI informa que não houve persistência. A configuração não chama a API Gemini.
 4. Ao detectar microfones, a UI utiliza metadados locais do PortAudio e a função de prioridade `choose_input_device()`: headset sempre tem precedência; se não houver headset, tenta o dispositivo atual ou a memória do último microfone usado salva no `LocalStore`; em seguida, tenta dispositivo interno, padrão do sistema ou o primeiro disponível. Se nenhum dispositivo existir, a gravação é desabilitada com aviso recuperável. Ao clicar em `Gravar` ou acionar a gravação pelo atalho de mouse/teclado, `AudioRecorder` abre um `sounddevice.InputStream` no microfone selecionado, mono e `int16`. Após o início bem-sucedido da captura, a identidade normalizada do dispositivo é persistida no `LocalStore`. Tenta `16 kHz`; se o dispositivo só aceitar outra taxa nativa, usa uma taxa suportada e reamostra o PCM para `16 kHz` antes de gerar o WAV. O callback copia os blocos capturados sem analisar áudio. O botão passa a ser `Parar e revisar áudio`.
-5. O botão `Configurar atalho de gravação` permite definir um botão físico do mouse (ex.: botões laterais `x1`/`x2`, botão do meio, ou outro botão válido) para alternar a gravação globalmente em sessões X11. Um indicador ao lado exibe o botão ativo (`Atalho do mouse: ...`) ou `Desativado`. Ao clicar no botão, um diálogo modal inicia a captura temporária via `MouseShortcutBridge`: a primeira pressão física captura o identificador do botão e fecha o diálogo; a ação explícita `Desativar atalho` remove o atalho; `Cancelar` restaura o atalho anterior. O atalho é salvo de forma não secreta no `LocalStore` (`preferences.recording_mouse_button`). Se a persistência falhar ou o banco estiver ausente, o atalho funciona apenas na sessão com aviso informativo. A configuração é desabilitada durante gravação e transcrição. Em Wayland/Xwayland ou sem `DISPLAY`, a captura global fica indisponível com aviso fail-soft, mantendo o fallback do botão `Gravar` e da tecla `Space`.
+5. A engrenagem abre `Configurações` com chave API, atalho do mouse e atalho do teclado. Mouse aceita somente botões laterais/central seguros e teclado aceita combinação modificada ou tecla de função/mídia; ambos podem ficar ativos simultaneamente em X11 e Wayland. Sem handshake, a UI explica que a integração local só compara/captura triggers, não armazena texto nem envia dados, executa a autorização Ubuntu por `pkexec` sem shell e retoma automaticamente a captura após ativar a socket systemd por UID. Preferências são persistidas separadamente somente após ACK; falha preserva `Gravar` e `Space`.
 6. Ao parar, o stream é encerrado, os bytes PCM são serializados como WAV em memória e RMS/pico são validados. Captura vazia ou abaixo de `MIN_RMS_LEVEL` fica no diagnóstico e entra em erro sem chamada de rede. Uma captura válida entra em pré-visualização: `Reproduzir áudio` usa `QBuffer`/`QMediaPlayer` e `Enviar para Gemini` é a única ação que inicia a transcrição.
 7. O envio ao Gemini ocorre em um `QThread` por meio de `TranscriptionWorker`. A resposta da Interactions API fornece `interaction.usage`, que é encapsulado em `TokenUsage` dentro de `TranscriptionDebug`. Os sinais de sucesso ou falha retornam ao thread da interface com o `TranscriptionDebug`, sem acessar widgets ou banco de dados no worker. No thread principal, a UI registra o consumo no `LocalStore` (com outcome `success` ou `error`), atualiza os dados textuais de consumo da chamada e acumulado e atualiza o gráfico de consumo de tokens por chamada (`TokenUsageChart`).
-8. O texto recebido aparece em um `QPlainTextEdit`, pode ser corrigido e apagado com `Apagar texto` antes de usar `Copiar texto`. O botão `Mostrar debug` alterna um painel lateral com blocos de texto (métricas de áudio, payload limitado enviado, retorno e consumo da API Gemini) e um bloco gráfico dedicado (`Gráfico de consumo de tokens`, renderizado por `TokenUsageChart`). As barras do gráfico representam o `total_tokens` conhecido por chamada e diferenciam chamadas bem-sucedidas (verde) de erros (vermelho), mantendo totais indisponíveis como desconhecidos sem fabricar zeros. O gráfico e o histórico medem exclusivamente consumo de tokens, não precificação monetária da API, e nenhum preço é calculado. Em X11, `Enviar ao terminal` coloca o texto no clipboard e envia `Ctrl+Shift+V` à janela de terminal ativa, sem pressionar Enter. Em Wayland ou sem `xdotool`, `Copiar texto` continua sendo o fallback.
+8. O texto recebido aparece no editor de 120–190 px e pode ser corrigido, apagado e copiado. `Diagnóstico` permanece visível à direita desde a primeira pintura, com abas `Áudio`, `Payload`, `Retorno` e `Consumo` e gráfico abaixo; não existe botão de toggle/dock. O cabeçalho mostra contagem de atalhos, engrenagem e tela cheia. Em X11, `Enviar ao terminal` cola via `Ctrl+Shift+V` sem Enter; em Wayland ou sem `xdotool`, `Copiar texto` é o fallback.
 
-Nenhuma chave é mostrada em label, tooltip, status, exceção, log, arquivo de configuração, banco local ou argumento do launcher. A persistência da chave de API usa exclusivamente o Secret Service via `keyring`/`secretstorage`; `QSettings`, arquivos plaintext e o banco SQLite não são usados para segredos. O banco SQLite armazena estritamente a allowlist de metadados: preferências locais não secretas (`last_microphone_identity` e `recording_mouse_button`), timestamp `recorded_at`, identificador do modelo, contagens de tokens (entrada, saída, pensamento, cache, ferramentas e total, preservando valores ausentes/nulos) e outcome (`success` ou `error`), com retenção local e cumulativa sem rotinas de limpeza automática. O banco nunca armazena chaves de API, áudio PCM/WAV, base64, prompts, respostas transcritas, mensagens de exceção brutas ou outros payloads sensíveis, nem calcula preços.
+Nenhuma chave é mostrada em label, tooltip, status, exceção, log, arquivo, banco ou argumento. O SQLite armazena apenas `last_microphone_identity`, `recording_mouse_button`, `recording_keyboard_shortcut` e metadados allowlisted de tokens, preservando nulos; nunca armazena chave, áudio, base64, prompt, transcrição, resposta textual, exceção bruta ou preço.
 
-Erros de microfone, atalho global do mouse indisponível/falho, falha na leitura da preferência do mouse, falhas de escrita/persistência no banco local, erros da API, resposta vazia, áudio excedendo o limite ou terminal indisponível são apresentados no `QLabel` de status ou no bloco de consumo de debug de forma fail-soft (enquanto falhas de inicialização e de preferências não críticas mantêm a janela aberta sem travar, e falhas de leitura da preferência do mouse exibem diagnóstico recuperável sanitizado sem segredo ou exceção bruta). A janela permanece recuperável: o usuário pode corrigir a condição, gravar novamente ou usar o clipboard quando a integração de terminal não estiver disponível.
+Falhas de microfone, banco, API, terminal, autorização ou serviço global são fail-soft e sanitizadas. Falha da integração global não desabilita gravação manual, `Space`, reprodução, transcrição, editor ou clipboard.
 
 ### Estados `AppState`
 
@@ -40,7 +40,7 @@ Erros de microfone, atalho global do mouse indisponível/falho, falha na leitura
 | `READY` | Há uma transcrição no editor, pronta para revisão, cópia ou envio ao terminal. |
 | `ERROR` | Uma operação falhou; a mensagem fica no status e a janela pode ser usada novamente. |
 
-Uma transcrição concluída seleciona o texto no editor e informa que ele está pronto para revisão. `Copiar texto` também está disponível pelo atalho `Ctrl+Shift+C`; `Apagar texto` limpa o editor; a tecla `Space` alterna a gravação quando a janela está focada, e o botão do mouse configurado atua como atalho global press-only de gravação em sessões X11.
+Uma transcrição concluída seleciona o texto para revisão. `Ctrl+Shift+C` copia; `Space` alterna a gravação com foco. Os bindings globais configurados são press-only, independentes do compositor e reutilizam `_toggle_recording`.
 
 ## Stack
 
@@ -52,7 +52,7 @@ As restrições e dependências declaradas em `pyproject.toml` são:
 - `sounddevice>=0.5` para a captura, com PortAudio disponível no sistema.
 - NumPy `>=1.26` para os buffers entregues ao callback do `InputStream`.
 - `keyring>=25.0` e `secretstorage>=3.3` para acessar o Secret Service do desktop; não são usados como armazenamento em arquivo.
-- `pynput>=1.8.2` para escuta global de eventos de mouse sob sessões X11.
+- `evdev>=1.7` para leitura restrita de dispositivos de entrada pelo serviço local socket-activated; não usa `grab()`.
 - Pytest `>=8.0` na dependência opcional de desenvolvimento.
 - PyInstaller `>=6.11` na dependência opcional `build`, somente para gerar o executável distribuível.
 
@@ -67,15 +67,17 @@ As restrições e dependências declaradas em `pyproject.toml` são:
 | `docs/` | Índice, contrato dos agentes de desenvolvimento e gate de smoke. |
 | `.omp/agents/` | Definições dos papéis delegados de implementador, testador e revisor. |
 | `pyproject.toml` | Metadados, restrição de Python, dependências de runtime, extras `dev`/`build`, entry point e configuração do Pytest. |
-| `src/falafacil/__main__.py` | Encaminha `python -m falafacil` para `falafacil.app.main`. |
+| `src/falafacil/__main__.py` | Despacha os modos internos exatos de daemon/instalação antes da GUI; demais argumentos iniciam `falafacil.app.main`. |
 | `src/falafacil/app.py` | Define nomes Qt antes da configuração, inicializa o `LocalStore`, carrega a chave persistida, compõe `Settings`, `GeminiTranscriber` e `MainWindow`. |
 | `src/falafacil/config.py` | Define `Settings`, `DEFAULT_MODEL`, precedência entre ambiente e fallback persistido e mensagem de configuração. |
 | `src/falafacil/credentials.py` | Define o protocolo `ApiKeyStore`, os nomes fixos do serviço/conta e o adaptador `KeyringApiKeyStore` para o Secret Service, sem fallback em arquivo. |
-| `src/falafacil/storage.py` | Define `LocalStore`, `LocalStoreError`, `TokenTotals`, `TokenUsageRecord`, `resolve_storage_path`, schema versionado SQLite (`preferences` com `last_microphone_identity` e `recording_mouse_button`, e `token_usage`), consulta de histórico `get_token_usage_history` e persistência fail-soft. |
-| `src/falafacil/shortcuts.py` | Define `MouseShortcutBridge`, `MouseShortcutError`, `MouseListenerLike`, `MouseListenerFactory`, `normalize_button_name`, fábrica com lazy import de `pynput.mouse`, validação canônica de botões, checagem de ambiente X11/`DISPLAY` e despacho não-bloqueante de sinais Qt. |
+| `src/falafacil/storage.py` | SQLite schema v1 com preferências independentes de microfone, mouse e teclado e histórico allowlisted de tokens. |
+| `src/falafacil/shortcuts.py` | Normalizadores seguros e `InputShortcutBridge`, cliente generation-safe do protocolo ASCII sobre `QLocalSocket`. |
+| `src/falafacil/shortcut_service.py` | Daemon Qt socket-activated, monitores `evdev`, captura/watch independentes e hotplug sem persistir ou transmitir eventos não correspondentes. |
+| `src/falafacil/shortcut_install.py` | Autorização assíncrona `pkexec`, cópia atômica fixa e units systemd endurecidas por UID. |
 | `src/falafacil/audio.py` | Define `AudioDevice` (com `host_api`, `kind` e `identity` estável), `AudioCapture`, `AudioRecorder`, `MIN_RMS_LEVEL`, `AudioRecorderError`, classificação heurística local, seleção determinística por prioridade, callback de captura, listagem de entradas e serialização WAV. |
 | `src/falafacil/transcription.py` | Define `GeminiTranscriber`, `TranscriptionDebug` (com `TokenUsage`), `TokenUsage`, `TranscriptionWorker`, `TranscriptionError`, o prompt em pt-BR e `INLINE_LIMIT_BYTES`; aceita chave injetada na criação do cliente e extrai metadados de tokens de `interaction.usage`. |
-| `src/falafacil/ui.py` | Define `MainWindow`, `AppState`, `TokenUsageChart` (widget gráfico customizado de histórico de tokens), seletor e persistência de microfone, botão e diálogo de atalho de gravação de mouse, indicador textual de atalho, integração com `MouseShortcutBridge`, pré-visualização em memória, `QMediaPlayer`, painel lateral de debug com blocos de texto e gráfico dedicado de consumo Gemini, diálogo de chave, clipboard, atalhos, ciclo de `QThread` e fechamento ordenado. |
+| `src/falafacil/ui.py` | Janela em splitter com diagnóstico permanente, engrenagem/configurações, tela cheia, dois atalhos ACK-gated, áudio em memória, transcrição, clipboard e fechamento ordenado. |
 | `src/falafacil/terminal.py` | Define `TerminalBridge`, `TerminalTarget`, `TERMINAL_PROCESSES`, a detecção X11 e a colagem. |
 | `packaging/falafacil.spec` | Spec do PyInstaller para analisar `src/falafacil/__main__.py` e gerar o executável one-file `falafacil`, sem dados de configuração. |
 | `scripts/build_executable.sh` | Executa o PyInstaller pela raiz sem propagar chaves do ambiente e informa `dist/falafacil`. |
@@ -85,18 +87,13 @@ As restrições e dependências declaradas em `pyproject.toml` são:
 ### Fluxo de dependências
 
 ```text
-app
- ├─> storage ─────────────> sqlite3 / AppDataLocation
- └─> ui
-      ├─> credentials ────> keyring / Secret Service
-      ├─> storage ────────> sqlite3 / LocalStore
-      ├─> audio ──────────> sounddevice / PortAudio
-      ├─> shortcuts ──────> pynput / X11
-      ├─> transcription ──> google-genai
-      └─> terminal ───────> xdotool / X11
-packaging ──> __main__ ──> app
-tests ──────> módulos via dependências injetadas (store, factory, stream, cliente,
-              subprocesso e ambiente)
+app ──> ui ──> InputShortcutBridge ──AF_UNIX──> shortcut_service ──> evdev
+ │      ├─> credentials / Secret Service               ▲
+ │      ├─> storage / SQLite                            │ socket systemd por UID
+ │      ├─> audio / PortAudio                           │
+ │      ├─> transcription / google-genai                │
+ │      └─> terminal / xdotool X11          shortcut_install / pkexec
+ └─> __main__ despacha GUI, daemon ou instalação privilegiada
 ```
 
 A aplicação não possui camadas de servidor próprio, ORM ou API web do produto. O armazenamento local SQLite é restrito a preferências simples e histórico de consumo de tokens. A fronteira de rede fica no cliente `google-genai`; áudio, Secret Service, banco local SQLite e terminal são integrações locais.
@@ -105,17 +102,17 @@ A aplicação não possui camadas de servidor próprio, ORM ou API web do produt
 
 - A chave Gemini nunca deve ser gravada em código, testes, `pyproject.toml`, desktop entry, logs, arquivos gerados ou no banco SQLite local. A fonte ativa segue `GEMINI_API_KEY` > `GOOGLE_API_KEY` > valor do Secret Service; a UI também pode aceitar uma chave em memória nesta sessão.
 - `KeyringApiKeyStore` usa exatamente o serviço/conta definidos em `src/falafacil/credentials.py` e encapsula erros sem incluir a chave na mensagem. Não criar fallback em arquivo, `QSettings` ou argumento de processo.
-- O banco SQLite local (`LocalStore`) armazena estritamente a allowlist de metadados: preferências locais não secretas (`last_microphone_identity` e `recording_mouse_button`), timestamp `recorded_at`, identificador do modelo, contagens de tokens (entrada, saída, pensamento, cache, ferramentas e total, preservando campos nulos/desconhecidos) e outcome (`success` ou `error`), com retenção local e cumulativa sem limpeza automática. Nunca armazena chaves de API, áudios PCM/WAV, payloads/previews em base64, prompts, respostas transcritas, exceções brutas ou outros payloads sensíveis.
+- O SQLite armazena somente `last_microphone_identity`, `recording_mouse_button`, `recording_keyboard_shortcut` e metadados allowlisted de consumo; nunca armazena chave, áudio, base64, prompt, transcrição, resposta, exceção bruta ou preço.
 - A seleção de microfone segue a ordem: headset -> dispositivo atual da sessão -> identidade lembrada no SQLite -> interno -> padrão do sistema -> primeiro disponível; se não houver dispositivos, a gravação fica desabilitada de forma recuperável.
 - A classificação de microfone usa exclusivamente metadados fornecidos pelo `sounddevice`/PortAudio (nome e host API) e heurística local pura, sem invocar `pactl` ou consultas PipeWire.
 - A identidade do microfone só é persistida no `LocalStore` após `recorder.start()` aceitar o dispositivo e iniciar a captura com sucesso.
-- Falhas do `LocalStore` são tratadas de forma fail-soft: falhas na inicialização e na leitura de preferências não críticas mantêm a janela aberta (com `local_store=None` ou seleção padrão de microfone), enquanto falhas de leitura da preferência de mouse (`recording_mouse_button`), gravação de preferência e persistência/leitura de consumo renderizam diagnósticos recuperáveis sanitizados no status ou no bloco de consumo (sem segredo ou exceção bruta), mantendo o listener desativado e captura, reprodução, transcrição e clipboard operacionais.
-- O atalho global de mouse para gravação atua exclusivamente sob sessão X11 com `DISPLAY` e biblioteca `pynput`; em Wayland/Xwayland ou sem display, o bridge opera em modo indisponível com erro sanitizado e a aplicação preserva o acionamento manual do botão `Gravar` e o atalho de teclado `Space` local à janela.
-- O atalho físico do mouse é press-only (aciona na pressão `pressed=True`, ignora soltura `pressed=False`) e reutiliza estritamente `_toggle_recording`, sem criar segunda máquina de estados ou executar código bloqueante, I/O, widgets ou chamadas de banco no callback do listener.
-- O clique físico do mouse nunca é suprimido do sistema operacional (`suppress=False`).
-- A preferência `recording_mouse_button` é persistida no `LocalStore` (schema SQLite v1) apenas no thread principal; falhas de persistência operam em fail-soft mantendo o atalho ativo na sessão atual com diagnóstico sanitizado.
-- A configuração de atalho de gravação fica desabilitada durante gravação (`RECORDING`) e transcrição (`TRANSCRIBING`).
-- No fechamento da janela (`closeEvent`), `MouseShortcutBridge.stop()` é executado e callbacks tardios são ignorados por flag de ciclo de vida antes do fechamento do `LocalStore`.
+- Falhas do `LocalStore` são fail-soft; preferências de mouse/teclado permanecem independentes e o histórico não afeta captura, reprodução, transcrição ou clipboard.
+- O serviço global independe de X11/Wayland/`DISPLAY`, roda não-root com socket `0600` por UID, grupo suplementar `input`, `DevicePolicy=closed` e acesso somente leitura a `char-input`.
+- O protocolo transporta apenas handshake, ACK, captura canônica, ativação correspondente, stop e erro sanitizado; nunca coordenadas, eventos individuais, texto digitado, exceções ou segredos.
+- Mouse e teclado são press-only e generation-safe; soltura, repetição, trigger diferente, modificador extra e geração antiga não ativam. O serviço não usa `grab()`, não suprime eventos, não escreve e não abre rede.
+- `recording_mouse_button` e `recording_keyboard_shortcut` só mudam no thread principal após `WATCHING_*`; cancelamento restaura o binding anterior sem regravar e stop de um tipo não altera o outro.
+- A engrenagem permanece disponível em estados busy, mas ações de chave/atalho ficam desabilitadas durante `RECORDING`/`TRANSCRIBING`.
+- `closeEvent` cancela `ShortcutServiceInstaller`, fecha `InputShortcutBridge` e só depois fecha `LocalStore`; callbacks tardios são descartados.
 - Metadados de consumo da API Gemini são extraídos de `interaction.usage`; campos ausentes são mantidos como `indisponível` (não são convertidos em zero); o histórico acumulado exibe zero apenas para tabela vazia; o gráfico de consumo exibe barras por chamada distinguindo sucesso e erro sem inventar dados para totais desconhecidos; não há cálculo, conversão ou exibição de valor monetário ou preço da API.
 - Sem chave configurada, a inicialização não cria `GeminiTranscriber`, a gravação fica desabilitada e o fluxo não faz chamada de rede. Configurar pela UI cria o transcritor antes de substituir `Settings`; falha da factory não altera o estado anterior.
 - Widgets Qt, player multimídia, clipboard Qt e a conexão `LocalStore` só são acessados no thread principal. O worker comunica o resultado com os sinais `finished` e `failed`, conectados a slots da UI.
@@ -191,9 +188,9 @@ Sem `libportaudio2`, o aplicativo ainda pode abrir, mas a gravação não conseg
 ```bash
 poetry install
 QT_QPA_PLATFORM=offscreen poetry run pytest -q \
-  tests/test_shortcuts.py tests/test_storage.py tests/test_config.py \
-  tests/test_credentials.py tests/test_audio.py tests/test_transcription.py \
-  tests/test_ui.py tests/test_packaging.py
+  tests/test_shortcut_service.py tests/test_shortcut_install.py \
+  tests/test_shortcuts.py tests/test_storage.py tests/test_ui.py \
+  tests/test_packaging.py
 poetry run pytest -q
 poetry run python -m compileall -q src tests
 poetry run python -m falafacil
@@ -227,31 +224,29 @@ HOME="$tmp_home" ./scripts/install_desktop.sh "$PWD/dist/falafacil"
 
 A suíte cobre contratos locais e determinísticos:
 
-- `tests/test_storage.py`: criação e reabertura de schema com asserções explícitas de `PRAGMA user_version = 1`, permissões de arquivo/diretório, persistência de preferências (`last_microphone_identity` e `recording_mouse_button`), agregação de tokens com campos nulos e valores somados, consulta de histórico cronológico por `get_token_usage_history` com limites, validação de outcome (`success`/`error`), integridade em reabertura, rejeição de limites inválidos, encapsulamento de erros em `LocalStoreError` e fechamento de conexão.
-- `tests/test_shortcuts.py`: validação e normalização de identificadores de botões de mouse, fakes estruturais de `MouseListenerLike`, simulação de eventos press/release, captura única com parada de listener, lifecycle (`start`/`stop`/`join`), mensagens sanitizadas, rejeição em Wayland ou sem `DISPLAY` e despacho lock-free/não-bloqueante de sinais Qt.
-- `tests/test_audio.py`: formato WAV, dispositivo selecionado, propriedade `identity` estável por nome e host API, classificação pura de headset/interno/outro por metadados, seleção determinística `choose_input_device()` (headset > sessão > memória > interno > default), blocos copiados do callback, métricas RMS/pico, nível mínimo, captura vazia, fechamento do stream, listagem filtrada de microfones e estados inválidos.
-- `tests/test_config.py`: precedência `GEMINI_API_KEY` > `GOOGLE_API_KEY` > fallback persistido, ausência de chave, modelo padrão, propriedade `has_api_key` e mensagem/repr sem expor segredo.
-- `tests/test_credentials.py`: chamadas ao keyring com serviço/conta exatos, ausência de credencial, rejeição de valor vazio e encapsulamento seguro de falhas de get/set/delete sem incluir a chave nas mensagens.
-- `tests/test_transcription.py`: payload WAV inline em base64, MIME `audio/wav`, prompt em português do Brasil, modelo padrão, extração de contagem de tokens de `interaction.usage` (seis campos) para `TokenUsage`, preservação de campos ausentes como `None`, trace limitado, limite de tamanho, resposta vazia com ou sem tokens, worker com barreira genérica de exceções inesperadas sem vazamento de segredos, cliente fake e criação do cliente real com chave injetada sem rede.
-- `tests/test_ui.py`: diálogo offscreen, provider e seleção de microfone com prioridade determinística (headset > sessão > memória > interno > padrão), restauração de memória ao desconectar headset, persistência do microfone somente após início bem-sucedido de gravação (e ausência de persistência em falha no início), ausência de microfones desabilitando gravação, atalho global de gravação por mouse com fake bridge (restauração, diálogo de captura, desativação, cancelamento, fail-soft de persistência, alternância press-only `_toggle_recording`, descarte de release, guarda em `TRANSCRIBING` e parada no `closeEvent`), áudio pendente, métricas/forma de onda, reprodução fake, envio somente explícito, limpeza no fechamento (incluindo espera de thread, parada do bridge e `LocalStore.close()`), painel debug com blocos de texto e widget gráfico `TokenUsageChart` (`Gráfico de consumo de tokens`), recarregamento e atualização do gráfico após sucesso e erro, ausência de gravação quando `usage=None`, renderização segura de estados vazio/indisponível/campos nulos, renderização e grab offscreen de registros conhecidos, registro de consumo único por sinal (sucesso/erro), fail-soft do armazenamento local, apagar texto, fallback de persistência de credenciais e falhas recuperáveis.
-- `tests/test_terminal.py`: colagem X11 em processo reconhecido, rejeição de janela que não é terminal e ausência de chamadas ao `xdotool` em Wayland.
-- `tests/test_packaging.py`: instalador em `HOME` temporário, cópia executável, `.desktop` com `Exec`/`TryExec` absolutos e ausência de `$HOME`, `~`, `sh -c`, `Environment` ou chave.
+- `tests/test_storage.py`: schema v1, preferências independentes de microfone/mouse/teclado, rejeição de `left`/`right` e atalhos inseguros, erros sanitizados e histórico de tokens.
+- `tests/test_shortcuts.py`: normalização, framing parcial/múltiplo, limite de 128 bytes, handshake, gerações independentes, captura, stop, erros e descarte de respostas antigas.
+- `tests/test_shortcut_service.py`: classificação mouse/teclado, press/release/repeat, modificadores, captura one-shot, isolamento de clientes, hotplug e limpeza de estado.
+- `tests/test_shortcut_install.py`: `QProcess` sem shell/segredo, cancelamento, raiz temporária, destinos fixos, modos, UID e hardening sem polkit/systemd reais.
+- `tests/test_audio.py`, `tests/test_config.py`, `tests/test_credentials.py` e `tests/test_transcription.py`: contratos determinísticos existentes sem hardware/rede/segredo real.
+- `tests/test_ui.py`: dois bindings ACK-gated, autorização/retomada, persistência/falha isolada, busy/close, diagnóstico permanente, engrenagem, settings, fullscreen e grabs offscreen em ambos os tamanhos, além dos fluxos de áudio/transcrição/tokens.
+- `tests/test_terminal.py`: colagem X11 allowlisted e fallback Wayland.
+- `tests/test_packaging.py`: desktop installer seguro e dispatch interno exato.
 
 Execute primeiro os testes focados com `QT_QPA_PLATFORM=offscreen`, depois `poetry run pytest -q` e `poetry run python -m compileall -q src tests`. Para a entrega empacotada, use `poetry install --extras build`, `./scripts/build_executable.sh` e o instalador em um `HOME` temporário. O smoke do bundle deve iniciar `QT_QPA_PLATFORM=offscreen dist/falafacil`, confirmar a inicialização da janela sem rede e encerrar pelo controle do processo; não se deve exigir chave, microfone ou terminal para essa verificação.
 
-Smoke manual do produto: iniciar o app, clicar `Detectar microfones`, escolher ou confirmar uma entrada (observando a priorização automática de headset ou restauração da memória), configurar a chave sem deixá-la aparecer, falar uma frase curta, parar a gravação, clicar `Reproduzir áudio`, conferir a captura e só então `Enviar para Gemini`. Conferir os blocos de debug (áudio, payload, retorno, consumo textual Gemini e gráfico de consumo de tokens), editar o texto e copiá-lo para outro aplicativo. Em X11 com um terminal reconhecido, verificar que `Enviar ao terminal` cola o texto sem pressionar Enter. Esse smoke depende de credenciais, microfone, PortAudio, backend QtMultimedia e, para a última etapa, `xdotool`.
+Smoke manual: conferir diagnóstico permanente, editor limitado, duas linhas de ações, engrenagem com três seções e fullscreen. No app instalado, autorizar a integração uma vez, configurar `x1` e `Ctrl+Alt+R` e testar ambos fora de foco em X11 e Wayland quando disponíveis; release/repeat/texto não alternam, e desativar um tipo preserva o outro. O fluxo de áudio/Gemini e a colagem X11 continuam conforme os contratos anteriores.
 
 ## Limitações Conhecidas
 
 - PortAudio é uma dependência nativa fora do Poetry e requer `libportaudio2` (ou pacote equivalente) no sistema.
 - O Secret Service e um backend compatível do desktop são necessários para persistir a chave configurada na UI; se estiverem indisponíveis, ela funciona apenas na sessão atual. Não há fallback em plaintext, `QSettings` ou outro arquivo.
-- A memória do último microfone usado, o atalho de mouse de gravação e o histórico/gráfico de consumo de tokens (timestamp `recorded_at`, identificador do modelo, contagens de tokens com campos nulos preservados e outcome `success`/`error`) são locais ao dispositivo e persistidos em SQLite (`falafacil.sqlite3` em `AppDataLocation`), com retenção cumulativa sem limpeza automática, sem sincronização em nuvem, retenção de chaves/áudio/prompts/transcrições/exceções brutas ou cálculo de preço monetário da API.
-- Variáveis `GEMINI_API_KEY` e `GOOGLE_API_KEY` continuam sendo aceitas e têm precedência sobre a chave persistida; a aplicação não sincroniza nem gerencia credenciais fora dessas fontes e do diálogo da UI.
-- Wayland não recebe injeção automática de teclado pelo `TerminalBridge`; a alternativa é copiar o texto. Não há promessa de colagem Wayland.
-- O atalho global de mouse para gravação requer sessão X11 com `DISPLAY` e pacote `pynput`; em Wayland/Xwayland ou sem display, a escuta global não é suportada e o aplicativo preserva a operação manual pelo botão `Gravar` e pela tecla `Space` na janela.
-- O clique físico do mouse não é suprimido do restante do sistema operacional (`suppress=False`).
-- O atalho de mouse é restrito exclusivamente a alternar iniciar/parar a gravação; não há suporte a atalhos de mouse para envio, reprodução ou cópia.
-- O executável entregue é um bundle PyInstaller one-file para Linux com launcher sem console; não há AppImage, instalador de outros sistemas ou suporte implícito a execução pelo `.desktop` via shell.
+- Microfone, dois atalhos locais e histórico de tokens são persistidos apenas neste dispositivo; não há sincronização.
+- Variáveis Gemini mantêm precedência sobre Secret Service.
+- Wayland continua sem colagem automática do `TerminalBridge`; use clipboard.
+- Atalhos globais exigem Ubuntu com systemd, polkit, `/dev/input` e grupo `input`; o app instalado cuida da autorização/ativação sem terminal ou re-login.
+- Mouse aceita apenas lateral/central; teclado aceita combinações seguras ou funções/mídia. Ambos servem exclusivamente para iniciar/parar gravação e nunca suprimem o evento físico.
+- O bundle é Linux one-file; não há AppImage nem instalador de outros sistemas.
 - O áudio é enviado inline e aceita somente falas curtas até o limite de 20 MB; não há fluxo alternativo de upload.
 - A transcrição depende da rede e da disponibilidade do modelo Gemini configurado.
 - O terminal recebe texto pelo clipboard e pela combinação de colagem, mas o FalaFácil não executa comandos nem envia Enter.
@@ -262,5 +257,5 @@ Smoke manual do produto: iniciar o app, clicar `Detectar microfones`, escolher o
 Use os módulos e símbolos existentes como fonte de verdade antes de atualizar este documento. Ao alterar um contrato de áudio, transcrição, UI, credenciais, ambiente, empacotamento ou terminal, atualize a seção correspondente e os testes determinísticos que cobrem o comportamento observável.
 Após qualquer alteração no código, é obrigatório recriar o executável Linux one-file `dist/falafacil` com `poetry install --extras build` e `./scripts/build_executable.sh`, reinstalá-lo localmente com `./scripts/install_desktop.sh "$PWD/dist/falafacil"` (o que reinstala e atualiza `~/.local/bin/falafacil` e `~/.local/share/applications/falafacil.desktop`) e executar o smoke do bundle quando aplicável. Revise também este `AGENTS.md` e atualize a documentação sempre que o comportamento, os contratos, os comandos, as dependências, a estrutura ou as limitações do projeto forem afetados. Não deixe a documentação desatualizada em relação à implementação entregue.
 
-Antes de documentar um novo recurso, confirme que ele existe no código e no `pyproject.toml`; não introduza neste arquivo promessas de autenticação de usuário, banco, servidor web, TTS, Files API, Live API, hotkey global, AppImage, suporte Wayland para colagem, execução de comandos ou outras capacidades não implementadas. Preserve a separação entre UI, captura, cliente Gemini, credenciais e integração X11, mantendo chamadas bloqueantes fora do thread principal e as dependências externas injetáveis nos testes.
+Antes de documentar recurso, confirme código, testes e `pyproject.toml`; não prometa servidor, TTS, Files/Live API, AppImage, colagem Wayland ou execução de comandos. Preserve separação entre UI, áudio, transcrição, credenciais, serviço global local e terminal X11; chamadas bloqueantes não entram no thread principal.
 Confirme que todos os links relativos desta documentação resolvem e que cada promessa sobre o produto permanece sustentada pelo código, pelos testes ou pelo `pyproject.toml`; corrija links e promessas desatualizados no mesmo corte.

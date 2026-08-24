@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
+import sys
+import tomllib
 from pathlib import Path
+from types import ModuleType
 
 import pytest
-
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install_desktop.sh"
@@ -162,3 +165,48 @@ def test_installer_rejects_unsafe_existing_destination(tmp_path, destination_kin
     assert result.returncode != 0
     assert destination.exists() or destination.is_symlink()
     assert not (home / ".local" / "share" / "applications" / "falafacil.desktop").exists()
+
+
+def test_module_dispatches_only_exact_internal_shortcut_modes(monkeypatch) -> None:
+    from falafacil import __main__ as module_entry
+
+    daemon_module = ModuleType("falafacil.shortcut_service")
+    daemon_module.main = lambda: 21
+    installer_module = ModuleType("falafacil.shortcut_install")
+    installer_module.install_privileged_service = lambda: 22
+    app_module = ModuleType("falafacil.app")
+    app_module.main = lambda: 23
+    monkeypatch.setitem(sys.modules, "falafacil.shortcut_service", daemon_module)
+    monkeypatch.setitem(sys.modules, "falafacil.shortcut_install", installer_module)
+    monkeypatch.setitem(sys.modules, "falafacil.app", app_module)
+
+    monkeypatch.setattr(sys, "argv", ["falafacil", "--shortcut-daemon"])
+    assert module_entry.main() == 21
+    monkeypatch.setattr(sys, "argv", ["falafacil", "--install-shortcut-service"])
+    assert module_entry.main() == 22
+    monkeypatch.setattr(sys, "argv", ["falafacil", "--shortcut-daemon", "extra"])
+    assert module_entry.main() == 23
+    monkeypatch.setattr(sys, "argv", ["falafacil", "--unknown-internal-mode"])
+    assert module_entry.main() == 23
+
+
+def test_pyproject_requires_evdev_two_point_zero_floor() -> None:
+    pyproject_path = ROOT / "pyproject.toml"
+    with pyproject_path.open("rb") as fp:
+        data = tomllib.load(fp)
+
+    dependencies: list[str] = data.get("project", {}).get("dependencies", [])
+    evdev_spec = next((dep for dep in dependencies if dep.startswith("evdev")), None)
+    assert evdev_spec is not None, "evdev dependency not found in pyproject.toml"
+
+    match = re.match(r"^evdev\s*>=\s*([0-9]+(?:\.[0-9]+)*)", evdev_spec)
+    assert match is not None, f"Unexpected evdev spec format: {evdev_spec}"
+    floor_version_tuple = tuple(int(part) for part in match.group(1).split("."))
+    while len(floor_version_tuple) < 3:
+        floor_version_tuple = (*floor_version_tuple, 0)
+
+    assert floor_version_tuple >= (2, 0, 0), (
+        f"Declared evdev minimum floor '{evdev_spec}' is below 2.0.0; "
+        "InputDeviceMonitor requires evdev>=2.0.0 for list_devices(writable=False)."
+    )
+    assert evdev_spec == "evdev>=2.0.0"

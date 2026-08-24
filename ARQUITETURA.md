@@ -4,9 +4,9 @@ O FalaFácil é um aplicativo desktop local para Ubuntu. A composição abaixo d
 
 ## Composição da aplicação
 
-`falafacil.app:main` cria a única `QApplication`, define os nomes da aplicação (`FalaFácil`), inicializa de forma fail-soft o `LocalStore` no diretório de dados da aplicação (`AppDataLocation`), lê a credencial persistida e compõe `Settings`, `GeminiTranscriber` e `MainWindow` em `src/falafacil/app.py`. Se o banco local não puder ser inicializado, a aplicação prossegue com `local_store=None` sem interromper o fluxo do usuário. A janela é exibida somente depois dessa composição. O entry point `falafacil` e `python -m falafacil` chegam ao mesmo ponto; `src/falafacil/__main__.py` apenas encaminha a chamada de módulo.
+`falafacil.app:main` cria a única `QApplication`, define os nomes da aplicação (`FalaFácil`), inicializa de forma fail-soft o `LocalStore`, lê a credencial persistida e compõe `Settings`, `GeminiTranscriber` e `MainWindow`. `src/falafacil/__main__.py` despacha antes da GUI apenas os modos internos exatos `--shortcut-daemon` e `--install-shortcut-service`; qualquer outro argumento segue o aplicativo normal.
 
-`MainWindow` e `AppState` vivem em `src/falafacil/ui.py`. A UI coordena seleção e detecção de microfone, persistência do último dispositivo usado, configuração e persistência do atalho global de gravação por botão do mouse (`Configurar atalho de gravação`), indicador de status do atalho, gravação, pré-visualização, reprodução em memória, envio explícito, editor de texto, painel lateral de debug com blocos de texto (áudio, payload, retorno e métricas de consumo Gemini) e o bloco gráfico de histórico de consumo de tokens (`TokenUsageChart`), diálogo de chave, clipboard e o ciclo do `QThread`. Os estados observáveis são `IDLE`, `RECORDING`, `AUDIO_READY`, `TRANSCRIBING`, `READY` e `ERROR`; uma falha deixa a janela recuperável.
+`MainWindow` e `AppState` vivem em `src/falafacil/ui.py`. A janela usa cabeçalho e `QSplitter` horizontal: transcrição e ações em duas linhas à esquerda, `Diagnóstico` permanente com abas e gráfico à direita. A engrenagem abre um diálogo único para chave API e os dois atalhos; o controle adjacente alterna tela cheia. A UI mantém bindings ativos/pendentes separados e só persiste após o ACK assíncrono do serviço.
 
 ## Áudio
 
@@ -27,21 +27,17 @@ A identidade do microfone só é persistida no armazenamento local quando `Audio
 
 A captura é mono, `int16` e produz áudio em 16 kHz. Quando o dispositivo só aceita outra taxa nativa, a reamostragem para 16 kHz ocorre fora do callback, antes da serialização final. O callback do `InputStream` somente copia/enfileira os blocos recebidos e registra o status. RMS, pico, reamostragem, I/O e acesso à UI ocorrem fora dele. Captura vazia ou abaixo de `MIN_RMS_LEVEL` vira diagnóstico/erro e não é enviada ao Gemini. O áudio pendente e o buffer de reprodução permanecem em memória.
 
-## Atalhos e eventos globais do mouse
+## Atalhos globais e serviço local
 
-`src/falafacil/shortcuts.py` encapsula `MouseShortcutBridge`, `MouseShortcutError`, `MouseListenerLike`, `MouseListenerFactory` e `normalize_button_name`, isolando o acesso a variáveis de ambiente e à biblioteca `pynput`.
+`src/falafacil/shortcuts.py` define os normalizadores restritos e `InputShortcutBridge`, cliente assíncrono de `QLocalSocket`. O protocolo ASCII limita cada linha a 128 bytes, inicia com `HELLO 1`/`READY 1` e separa comandos, gerações e sinais de mouse e teclado. Respostas antigas são descartadas por tipo; framing, versão, trigger ou geração inválidos fecham a conexão sem transportar coordenadas, eventos individuais, texto digitado, exceções ou segredos.
 
-A escuta global do mouse exige sessão X11 (`XDG_SESSION_TYPE=x11`) e a presença da variável `DISPLAY`. Em Wayland/Xwayland ou sem `DISPLAY`, a captura global é considerada indisponível; `start()` e `begin_capture()` retornam `False` e emitem mensagens sanitizadas (`Atalho global do mouse indisponível nesta sessão.`), sem instanciar listeners funcionais. A operação manual e o atalho de teclado `Space` local à janela permanecem operacionais.
+Mouse aceita somente `middle`, `x1`, `x2`, `forward`, `back` e `task`; `left`/`right` são proibidos. Teclado aceita modificadores na ordem canônica `ctrl+alt+shift+meta` e uma tecla terminal; letras/dígitos exigem `ctrl`, `alt` ou `meta`, enquanto `F1`–`F24` e teclas de mídia permitidas podem atuar sozinhas. Soltura e repetição não ativam bindings; modificadores extras impedem correspondência.
 
-A normalização canônica aceita nomes de botões alfanuméricos seguros (`left`, `right`, `middle`, `x1`, `x2`, etc.) e rejeita tokens vazios, `unknown` ou com caracteres inválidos. A importação de `pynput.mouse` é feita de forma lazy na fábrica padrão de listeners.
+`src/falafacil/shortcut_service.py` é um daemon Qt socket-activated pelo systemd. Ele adota exclusivamente o descritor 3 validado por `LISTEN_PID`/`LISTEN_FDS`, monitora `/dev/input` com `evdev`/`QSocketNotifier`, classifica interfaces de movimento relativo como mouse e demais interfaces compatíveis como teclado e mantém bindings/capturas independentes por conexão. O serviço não chama `grab()`, não suprime eventos, não escreve arquivos, não abre rede e, fora de captura, nunca transmite teclas ou botões não correspondentes.
 
-O listener é criado com `pynput.mouse.Listener(on_click=..., suppress=False)` e executa em thread própria do backend. O clique físico nunca é suprimido do sistema operacional (`suppress=False`). O callback processa exclusivamente o evento de pressão (`pressed=True`), ignorando solturas (`pressed=False`), e despacha eventos para a UI de forma não-bloqueante e lock-free via sinais Qt atômicos internos privados (`_activated_event(gen, x, y)` e `_button_captured_event(gen, button_name, x, y)`), mantendo os sinais públicos contratuais (`activated`, `button_captured`, `failed`) para observabilidade externa. O callback não acessa widgets Qt, gravador, `LocalStore` ou operações bloqueantes.
+`src/falafacil/shortcut_install.py` separa o `QProcess` não bloqueante da UI do instalador privilegiado. A UI executa sem shell apenas `pkexec <bundle> --install-shortcut-service` com ambiente mínimo e sem variáveis Gemini. O instalador root deriva o usuário exclusivamente de `PKEXEC_UID`, copia atomicamente `/proc/self/exe`, grava units fixas e ativa `falafacil-shortcutd@<uid>.socket`. A socket é `0600` do UID; o serviço usa `DynamicUser`, grupo suplementar `input`, `DevicePolicy=closed`, `DeviceAllow=char-input r` e hardening systemd. O daemon não roda como root.
 
-No modo de captura (`begin_capture()`), o listener temporário captura a primeira pressão física válida via one-shot por closure local (sem mutar flags globais de modo no callback), emite `_button_captured_event` com a geração correspondente (além do sinal público `button_captured`) e agenda a limpeza assíncrona do listener no thread principal (`_cleanup_capture_requested`). O receptor `_ShortcutCaptureRelay` é instanciado e conectado ao sinal `_button_captured_event` antes da inicialização do listener (`begin_capture()`), garantindo que emissões síncronas ou enfileiradas sejam recebidas e filtradas contra a geração da captura ativa, ignorando sinais residuais de diálogos cancelados ou anteriores.
-
-No modo ativo (`start()`), a pressão do botão configurado emite o evento atômico `_activated_event` (além do sinal público `activated`), consumido diretamente por `MainWindow._on_mouse_shortcut_activated_event`. O slot valida a geração ativa (`gen == bridge.generation`), aplica supressão geométrica em coordenadas sobre controles interativos da janela (`QApplication.widgetAt` e fallback offscreen) para cliques com o botão esquerdo e invoca diretamente `_toggle_recording` uma única vez, sem filas FIFO globais.
-
-O ciclo de vida é serializado por `stop()`, que incrementa a geração do bridge, invalida o callback ativo e finaliza o listener com `join(timeout=0.5)`. No fechamento da aplicação (`MainWindow.closeEvent`), o bridge é parado e a flag `_is_closing` descarta eventos tardios antes de fechar o `LocalStore`.
+A integração independe de X11, Wayland, `DISPLAY` ou compositor. Mouse e teclado podem ficar ativos simultaneamente e ambos chamam estritamente `_toggle_recording`. Falha, cancelamento ou serviço ausente preserva `Gravar`, `Space`, reprodução, transcrição, editor e clipboard. No fechamento, a UI cancela autorização pendente, invalida gerações e fecha o socket antes do `LocalStore`.
 ## Transcrição Gemini
 
 `src/falafacil/transcription.py` contém `GeminiTranscriber`, `TranscriptionWorker`, `TranscriptionDebug`, `TokenUsage`, `TranscriptionError` e o prompt em português do Brasil. O envio usa `google-genai` (`from google import genai`) com áudio WAV inline em base64 e rejeita payloads acima de `INLINE_LIMIT_BYTES` (20 MiB); não existe fluxo alternativo de upload.
@@ -62,17 +58,17 @@ O schema é versionado via `PRAGMA user_version`:
 - Qualquer outra versão (ex.: versões futuras ou incompatíveis): a inicialização é recusada levantando `LocalStoreError` sanitizado (`Versão de schema incompatível: <versão>.`), operando em modo fail-soft (`local_store=None` na UI) e preservando o arquivo SQLite sem qualquer mutação de schema ou dados.
 
 O schema v1 é composto por:
-- Tabela `preferences(key TEXT PRIMARY KEY, value TEXT NOT NULL)`: armazena preferências locais não secretas: `last_microphone_identity` e `recording_mouse_button`.
+- Tabela `preferences(key TEXT PRIMARY KEY, value TEXT NOT NULL)`: armazena `last_microphone_identity`, `recording_mouse_button` e `recording_keyboard_shortcut`; o schema permanece v1.
 - Tabela `token_usage(id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER, thought_tokens INTEGER, cached_tokens INTEGER, tool_use_tokens INTEGER, total_tokens INTEGER, outcome TEXT NOT NULL CHECK(outcome IN ('success', 'error')))`: armazena o histórico de consumo de tokens por chamada.
 - Índice `idx_token_usage_recorded_at ON token_usage(recorded_at)` para ordenação cronológica.
 
 A conexão opera exclusivamente no thread principal com `check_same_thread=True` e `PRAGMA busy_timeout = 2000`. A retenção é local e cumulativa, sem rotinas de expiração automática. A consulta `get_token_totals()` realiza agregação com tratamento de nulos (retorna contagem zero apenas quando a tabela está vazia e preserva valores ausentes quando aplicável). A consulta `get_token_usage_history(limit=30)` retorna tuplas de `TokenUsageRecord` em ordem cronológica ascendente (mais antigas primeiro entre as últimas chamadas registradas), preservando campos nulos/indisponíveis e o desfecho (`success` ou `error`).
 
-Esse histórico persistido alimenta diretamente o widget customizado `TokenUsageChart` (`Gráfico de consumo de tokens`) no painel de debug da UI. As barras do gráfico representam o `total_tokens` conhecido de cada chamada, distinguindo visualmente sucessos (verde) e erros (vermelho), enquanto totais indisponíveis são identificados sem fabricação de valores ou quebra de renderização. O histórico e o gráfico medem estritamente consumo de tokens, não precificação monetária da API, e nenhum cálculo ou conversão monetária é realizado.
+Esse histórico alimenta diretamente `TokenUsageChart` no painel `Diagnóstico` permanente. As barras representam `total_tokens`, distinguem sucesso e erro e preservam totais indisponíveis sem fabricar valores ou calcular preços.
 
-O ciclo de vida do armazenamento é gerenciado pela UI com tratamento fail-soft: erros de escrita ou leitura nunca interrompem gravação, reprodução ou transcrição. A preferência `recording_mouse_button` é persistida e limpa exclusivamente no thread principal; falhas de escrita mantêm o atalho ativo apenas na sessão com mensagem de status informativa. No fechamento da janela (`MainWindow.closeEvent`), o gravador e o player são parados, o worker é finalizado, `MouseShortcutBridge.stop()` é executado e o `LocalStore.close()` é executado antes da aceitação do evento.
+O armazenamento opera no thread principal com tratamento fail-soft. As preferências de mouse e teclado são independentes e só são persistidas após `WATCHING_*`; falha de escrita mantém o binding apenas na sessão. `MainWindow.closeEvent` cancela o instalador, fecha `InputShortcutBridge`, encerra áudio/worker e então fecha o `LocalStore`.
 
-O banco de dados armazena estritamente a allowlist de metadados permitidos: preferências locais (`last_microphone_identity` e `recording_mouse_button`), timestamp de registro (`recorded_at`), identificador do modelo (`model`), contagens de tokens de entrada (`input_tokens`), saída (`output_tokens`), pensamento (`thought_tokens`), cache (`cached_tokens`), ferramentas (`tool_use_tokens`) e total (`total_tokens`) — preservando campos nulos/desconhecidos —, e desfecho da requisição (`outcome` como `'success'` ou `'error'`). A retenção é local e cumulativa, sem rotinas de limpeza ou expiração automática. O banco nunca armazena chaves de API, arquivos de áudio PCM/WAV, payloads ou previews em base64, texto do prompt, transcrições ou respostas textuais, mensagens de exceção brutas ou outros payloads sensíveis.
+O banco armazena somente as três preferências locais, timestamp, modelo, seis contagens de tokens anuláveis e outcome. Nunca armazena chaves, áudio, base64, prompt, transcrição, resposta textual, exceção bruta ou preço.
 
 ## Configuração e credenciais
 
@@ -88,35 +84,30 @@ Em Wayland, sem `xdotool`, sem PID ou sem terminal reconhecido, a ponte permanec
 
 ## Distribuição e validação
 
-- `packaging/falafacil.spec` descreve o PyInstaller one-file a partir de `src/falafacil/__main__.py`, sem dados de configuração.
-- `scripts/build_executable.sh` gera `dist/falafacil` pela raiz e não propaga as variáveis de chave para o processo de build.
-- `scripts/install_desktop.sh` instala uma cópia executável em `~/.local/bin/falafacil` e um desktop entry gerenciado, com caminhos absolutos e sem shell ou segredo.
-- `tests/` valida armazenamento local, configuração, credenciais, áudio, atalhos de mouse, transcrição, UI, terminal e empacotamento com dependências falsas/injetadas quando necessário; a suíte não depende de rede, microfone, Secret Service, X11, mouse ou terminal reais.
+- `packaging/falafacil.spec` gera o bundle one-file a partir de `__main__.py`, incluindo os modos internos do serviço.
+- `scripts/build_executable.sh` gera `dist/falafacil` sem propagar variáveis de chave.
+- `scripts/install_desktop.sh` instala o app de usuário e desktop entry sem shell ou segredo; a autorização do serviço acontece depois, dentro da UI.
+- `tests/` valida bridge/protocolo, daemon evdev injetado, instalador privilegiado em raiz temporária, armazenamento, UI, áudio, transcrição, terminal e empacotamento sem depender de rede, polkit, systemd, `/dev/input`, hardware ou display reais.
 
 ```text
-app
- ├─> storage ─────────────> sqlite3 / AppDataLocation
- └─> ui
-      ├─> credentials ────> keyring / Secret Service
-      ├─> storage ────────> sqlite3 / LocalStore
-      ├─> audio ──────────> sounddevice / PortAudio
-      ├─> shortcuts ──────> pynput / X11
-      ├─> transcription ──> google-genai
-      └─> terminal ───────> xdotool / X11
-
-packaging ──> __main__ ──> app
-tests ──────> módulos via dependências injetadas
+app ──> ui ──> InputShortcutBridge ──AF_UNIX──> shortcut_service ──> evdev
+ │      ├─> credentials / Secret Service               ▲
+ │      ├─> storage / SQLite                            │ socket systemd por UID
+ │      ├─> audio / PortAudio                           │
+ │      ├─> transcription / google-genai                │
+ │      └─> terminal / xdotool X11          shortcut_install / pkexec
+ └─> __main__ despacha GUI, daemon ou instalação privilegiada
 ```
 
 ## Invariantes
 1. Nenhuma chave Gemini é gravada em código, testes, `pyproject.toml`, desktop entry, logs, arquivos gerados, argumentos do launcher ou banco SQLite local. A fonte ativa segue a precedência definida em `config.py` e a credencial persistida fica exclusivamente no Secret Service.
-2. O banco de dados local SQLite (`LocalStore`) armazena estritamente a allowlist de metadados: preferências locais não secretas (`last_microphone_identity` e `recording_mouse_button`), timestamp `recorded_at`, identificador do modelo, contagens de tokens (entrada, saída, pensamento, cache, ferramentas e total, preservando valores ausentes/nulos) e outcome (`success` ou `error`). A retenção é local e cumulativa, sem rotinas de limpeza automática. O banco nunca armazena chaves de API, áudio PCM/WAV, previews/payloads em base64, texto do prompt, transcrições/respostas textuais, mensagens de exceção brutas ou outros payloads sensíveis.
+2. O SQLite armazena somente `last_microphone_identity`, `recording_mouse_button`, `recording_keyboard_shortcut` e os metadados de consumo allowlisted. Nunca armazena chave, áudio, base64, prompt, transcrição, resposta, exceção bruta ou preço.
 3. Campos de tokens não fornecidos pela API permanecem indisponíveis (`None`), sem conversão em zero artificial; o total agregado e o gráfico tratam valores ausentes com segurança e exibem zero somente quando não há registros no histórico. As barras do gráfico diferenciam visualmente sucesso e erro para valores conhecidos de `total_tokens`. A aplicação mede exclusivamente consumo de tokens, não precificação monetária da API, e não calcula nem estima preços.
 4. A conexão com o banco local pertence e é acessada exclusivamente no thread principal; a validação de schema via `PRAGMA user_version` aceita estritamente versão `0` para criação do schema v1 e `1` para reabertura, recusando qualquer outra versão com erro sanitizado e fail-soft sem mutar o arquivo SQLite; falhas no armazenamento local não impedem captura de áudio, transcrição ou uso do clipboard.
-5. Widgets Qt, `QMediaPlayer`, clipboard e demais objetos de UI só são acessados no thread principal. O worker de transcrição comunica resultados por sinais; os callbacks de áudio e de listener de mouse não tocam em widgets nem em banco de dados.
+5. Widgets, player, clipboard e banco pertencem ao thread principal. O worker de transcrição usa sinais; o daemon de atalhos é outro processo e transmite somente ACKs, capturas canônicas e ativações correspondentes.
 6. A captura fecha o stream em sucesso e em falha, conserva o formato mono/`int16`/16 kHz e não envia áudio vazio ou abaixo do nível mínimo. A prioridade de seleção automática segue headset -> sessão atual -> memória persistida -> interno -> padrão do sistema.
 7. O envio ao Gemini é explícito, acontece somente após a revisão da captura e respeita o limite inline de 20 MiB. Chamada bloqueante não ocupa o event loop.
 8. Estados de erro informam a condição no status e permitem nova tentativa, correção ou uso do clipboard; resposta Gemini vazia nunca é aceita como sucesso.
 9. A integração de terminal só cola em uma janela X11 ativa cujo processo foi reconhecido pela allowlist. Ela nunca executa comandos nem envia Enter; Wayland usa clipboard como fallback.
-10. A captura global de mouse para gravação atua exclusivamente sob sessão X11 com `DISPLAY` e biblioteca `pynput`. O canal interno de despacho utiliza eventos atômicos privados (`_activated_event`, `_button_captured_event`) consumidos pela UI com validação direta de geração do bridge, fences de interleavings e supressão de controles locais, mantendo os sinais públicos contratuais (`activated`, `button_captured`, `failed`) para observabilidade externa. O atalho físico é press-only, reutiliza estritamente `_toggle_recording`, não suprime o clique do sistema (`suppress=False`) e despacha sinais Qt sem executar código bloqueante, I/O, retenção de locks em threads de callback ou chamadas de banco no listener. Em Wayland/Xwayland ou sem display, o aplicativo opera em modo fail-soft, mantendo o botão manual e o atalho `Space` da janela operacionais.
+10. A integração global usa socket systemd `0600` por UID e daemon não-root com acesso de leitura a `input`. Mouse e teclado são independentes, press-only, generation-safe e válidos em X11/Wayland; repetição, soltura, modificadores extras, trigger diferente e geração antiga não ativam. O serviço nunca usa `grab()`, suprime eventos, persiste entrada ou transmite texto digitado.
 Os contratos completos de produto, comandos e limitações estão em [AGENTS.md](AGENTS.md). A navegação documental está em [docs/INDEX.md](docs/INDEX.md).

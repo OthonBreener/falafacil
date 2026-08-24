@@ -35,9 +35,9 @@ A ordem é compilação, testes focados e suíte completa. Se o escopo mudar áu
 
 ### Documentação e mudanças sem hardware
 
-Para uma alteração somente documental, verificar os links relativos novos e confirmar que cada promessa aponta para código, teste ou contrato existente; ainda assim, executar nesta ordem `compileall`, os testes focados em ambiente Qt sem janela real e a suíte determinística completa. Não é necessário executar smoke de microfone, rede, Secret Service ou X11.
+Para alteração documental, verificar links e confirmar cada promessa contra código/teste. Execute `compileall`, testes focados offscreen e suíte completa; hardware, polkit, systemd, `/dev/input`, rede e Secret Service só entram quando o escopo exige smoke físico.
 
-### UI, áudio, transcrição, atalhos de mouse ou terminal
+### UI, áudio, transcrição, atalhos globais ou terminal
 
 Além dos comandos gerais, validar o fluxo crítico afetado com os testes determinísticos e fakes disponíveis. A validação deve respeitar estes limites de `AGENTS.md`:
 
@@ -45,14 +45,15 @@ Além dos comandos gerais, validar o fluxo crítico afetado com os testes determ
 - envio ao Gemini somente depois da ação explícita de envio, sem bloquear a interface;
 - worker Qt sem acesso a widgets fora do thread principal;
 - chave ausente, erro de captura, resposta vazia e falha de integração deixam a janela recuperável;
-- atalho global de mouse press-only em X11 com `DISPLAY`, alternando gravação via `_toggle_recording` e ignorando solturas;
-- persistência e restauração do botão de mouse no `LocalStore` (schema v1), com fail-soft em falha de escrita;
-- fallback seguro em Wayland ou sem `DISPLAY`: listener global desativado, mensagem sanitizada e operação manual/tecla `Space` preservadas;
-- fechamento ordenado com parada do bridge de mouse antes do encerramento do `LocalStore`;
+- mouse e teclado independentes e simultâneos em ambientes declarados X11/Wayland; pressão correspondente alterna via `_toggle_recording`, enquanto soltura, repetição, trigger diferente, modificador extra e geração antiga não alternam;
+- normalização segura e persistência separada de `recording_mouse_button`/`recording_keyboard_shortcut` no schema v1, somente após ACK, com fail-soft de escrita;
+- framing parcial/múltiplo, limite de 128 bytes, handshake, captura one-shot, isolamento de cliente/tipo e ausência de vazamento de teclas não correspondentes;
+- autorização assíncrona sem shell/segredo, retomada da captura, socket `0600` por UID, daemon não-root/hardened e operação manual/`Space` preservadas em falha;
+- fechamento ordenado: cancelar instalador, fechar `InputShortcutBridge` e só então fechar `LocalStore`;
 - limite de payload inline e ausência de segredo em métricas, logs ou mensagens;
 - terminal somente em X11, com janela ativa e processo permitido.
 
-Smoke manual com recursos reais só é necessário quando o escopo ou a evidência pedirem essa confirmação e o ambiente fornecer microfone, backend QtMultimedia, credencial e, conforme a integração: `DISPLAY` e `xdotool` para terminal X11, ou `DISPLAY` e mouse com botões físicos compatíveis para atalho global de mouse X11. O smoke físico de atalho de mouse é opcional e só pode ser executado se o ambiente fornecer X11, `DISPLAY` e mouse real; na ausência desses requisitos, o testador registra a indisponibilidade e baseia a aprovação exclusivamente nas provas determinísticas com fakes, sem declarar falsamente smoke físico como `PASS`.
+Smoke físico só é exigível quando o ambiente fornece Ubuntu/systemd/polkit, `/dev/input` legível pelo serviço e mouse/teclado auxiliares. Repetir em X11 e Wayland quando ambos estiverem disponíveis: configurar `x1` e `Ctrl+Alt+R`, testar fora de foco, desconectar/reconectar dispositivos e confirmar isolamento ao desativar cada binding. Sem esses recursos, registrar exatamente o não observado e usar as provas determinísticas; nunca declarar smoke físico como executado.
 
 A regra de terminal é obrigatória: em Wayland ou sem `xdotool`, `Copiar texto` continua sendo o fallback. `TerminalBridge` não executa comando, não envia Enter e não promete colagem automática Wayland. Em X11, qualquer teste de `Enviar ao terminal` deve confirmar apenas clipboard e `Ctrl+Shift+V` na janela reconhecida, sem pressionar Enter.
 ### `packaging/` ou scripts de instalação
@@ -67,7 +68,7 @@ HOME="$tmp_home" ./scripts/install_desktop.sh "$PWD/dist/falafacil"
 QT_QPA_PLATFORM=offscreen HOME="$tmp_home" dist/falafacil
 ```
 
-O último comando deve iniciar o bundle sem exigir rede, chave, microfone ou terminal; confirmar a inicialização da janela e encerrá-lo pelo controle do processo. O teste deve usar um `HOME` temporário e verificar que o executável e o desktop entry não carregam segredo, shell, caminho relativo ou dependência de uma configuração do usuário. Não executar esse bloco para alterações que não afetam empacotamento ou instalação.
+O bundle deve abrir offscreen sem rede, chave, microfone ou terminal. Quando atalhos globais mudarem, o smoke instalado também abre `Configurações`, solicita `Autorizar integração global`, confirma retomada automática e verifica `falafacil-shortcutd@<uid>.socket` ativo, socket `/run/falafacil-shortcutd-<uid>.sock` `0600` do usuário e serviço com usuário dinâmico/grupo `input`. Polkit/systemd reais nunca são acionados pela suíte determinística.
 
 ## Critério de aprovação
 
@@ -77,7 +78,7 @@ O gate passa somente quando todos os critérios aplicáveis forem observáveis:
 - `compileall`, testes focados e `pytest` completo passam;
 - o fluxo crítico afetado foi coberto por teste/fake ou smoke manual autorizado;
 - o bundle foi construído e iniciado quando `packaging/` ou scripts foram afetados;
-- fallback Wayland/ausência de `xdotool`/ausência de `DISPLAY` preserva cópia para clipboard, operação manual e atalho `Space`, sem Enter, sem execução de comandos e sem quebra da janela;
+- ausência/falha do serviço global preserva `Gravar`, `Space`, editor e clipboard em X11/Wayland; ausência de `xdotool` afeta somente colagem no terminal;
 - nenhum segredo aparece em código, testes, saída, relatório, desktop entry ou artefato;
 - o resultado do `testador` contém somente `PASS` ou `FAIL` no formato obrigatório;
 - o `revisor` recebe evidência suficiente e responde `APROVADO` somente após eliminar achados e validações ausentes.

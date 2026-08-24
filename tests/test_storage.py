@@ -71,34 +71,38 @@ def test_invalid_microphone_identity_raises_error(tmp_path: Path) -> None:
         with pytest.raises(LocalStoreError, match="inválida"):
             store.save_last_microphone_identity("   ")
 
-def test_recording_mouse_button_persistence_and_reopen(tmp_path: Path) -> None:
+def test_recording_shortcuts_persist_reopen_and_clear_independently(tmp_path: Path) -> None:
     db_path = tmp_path / "falafacil.sqlite3"
     with LocalStore(db_path) as store:
         assert store.get_recording_mouse_button() is None
-        store.save_recording_mouse_button("x1")
+        assert store.get_recording_keyboard_shortcut() is None
+        store.save_recording_mouse_button("Button.button8")
+        store.save_recording_keyboard_shortcut("ALT+CTRL+R")
         assert store.get_recording_mouse_button() == "x1"
+        assert store.get_recording_keyboard_shortcut() == "ctrl+alt+r"
 
-        # Overwrite with normalized variant
-        store.save_recording_mouse_button("Button.right")
-        assert store.get_recording_mouse_button() == "right"
+    with LocalStore(db_path) as reopened:
+        assert reopened.get_recording_mouse_button() == "x1"
+        assert reopened.get_recording_keyboard_shortcut() == "ctrl+alt+r"
+        reopened.clear_recording_keyboard_shortcut()
+        assert reopened.get_recording_mouse_button() == "x1"
+        assert reopened.get_recording_keyboard_shortcut() is None
+        reopened.clear_recording_mouse_button()
 
-    # Reopen and check persisted button
-    with LocalStore(db_path) as store2:
-        assert store2.get_recording_mouse_button() == "right"
-        store2.clear_recording_mouse_button()
-        assert store2.get_recording_mouse_button() is None
-
-    # Reopen and check that clear persisted
-    with LocalStore(db_path) as store3:
-        assert store3.get_recording_mouse_button() is None
+    with LocalStore(db_path) as final:
+        assert final.get_recording_mouse_button() is None
+        assert final.get_recording_keyboard_shortcut() is None
 
 
-def test_invalid_recording_mouse_button_raises_error(tmp_path: Path) -> None:
+def test_invalid_recording_shortcuts_raise_error(tmp_path: Path) -> None:
     db_path = tmp_path / "falafacil.sqlite3"
     with LocalStore(db_path) as store:
-        for invalid in ("", "   ", "unknown", "button.unknown", "left right", "@invalid", "a" * 65):
+        for invalid in ("", "left", "right", "unknown", "button.unknown", "@invalid"):
             with pytest.raises(LocalStoreError, match="inválido"):
                 store.save_recording_mouse_button(invalid)
+        for invalid in ("", "r", "shift+r", "ctrl", "f25", "ctrl+r+s"):
+            with pytest.raises(LocalStoreError, match="inválido"):
+                store.save_recording_keyboard_shortcut(invalid)
 
 
 
@@ -167,12 +171,42 @@ def test_recording_mouse_button_storage_errors_sanitize_raw_exception(
         assert exc_info.value.__suppress_context__ is True
         monkeypatch.undo()
 
+def test_recording_keyboard_shortcut_storage_errors_are_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    leak_marker = "SYNTHETIC_KEYBOARD_SQLITE_SECRET"
+    with LocalStore(db_path) as store:
+        failing_conn = _FailingConnection(sqlite3.OperationalError(leak_marker))
+        for operation, expected in (
+            (
+                lambda: store.get_recording_keyboard_shortcut(),
+                "Erro ao ler preferência de atalho do teclado.",
+            ),
+            (
+                lambda: store.save_recording_keyboard_shortcut("f12"),
+                "Erro ao salvar preferência de atalho do teclado.",
+            ),
+            (
+                lambda: store.clear_recording_keyboard_shortcut(),
+                "Erro ao remover preferência de atalho do teclado.",
+            ),
+        ):
+            monkeypatch.setattr(store, "_conn", failing_conn)
+            with pytest.raises(LocalStoreError) as exc_info:
+                operation()
+            assert str(exc_info.value) == expected
+            assert leak_marker not in str(exc_info.value)
+            assert exc_info.value.__cause__ is None
+            monkeypatch.undo()
+
 
 def test_mouse_button_coexists_with_microphone_and_token_history(tmp_path: Path) -> None:
     db_path = tmp_path / "falafacil.sqlite3"
     with LocalStore(db_path) as store:
         store.save_last_microphone_identity("mic-primary")
         store.save_recording_mouse_button("x2")
+        store.save_recording_keyboard_shortcut("f12")
         store.record_token_usage(
             "model",
             TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15),
@@ -182,6 +216,7 @@ def test_mouse_button_coexists_with_microphone_and_token_history(tmp_path: Path)
         # Clear only mouse button
         store.clear_recording_mouse_button()
         assert store.get_recording_mouse_button() is None
+        assert store.get_recording_keyboard_shortcut() == "f12"
         assert store.get_last_microphone_identity() == "mic-primary"
         assert len(store.get_token_usage_history()) == 1
 
@@ -324,6 +359,15 @@ def test_closed_store_raises_error(tmp_path: Path) -> None:
 
     with pytest.raises(LocalStoreError, match="fechado"):
         store.clear_recording_mouse_button()
+
+    with pytest.raises(LocalStoreError, match="fechado"):
+        store.get_recording_keyboard_shortcut()
+
+    with pytest.raises(LocalStoreError, match="fechado"):
+        store.save_recording_keyboard_shortcut("f12")
+
+    with pytest.raises(LocalStoreError, match="fechado"):
+        store.clear_recording_keyboard_shortcut()
 
 
 def test_token_usage_history_empty(tmp_path: Path) -> None:

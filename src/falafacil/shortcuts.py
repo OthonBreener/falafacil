@@ -2,327 +2,358 @@ from __future__ import annotations
 
 import os
 import re
-import threading
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Signal
+from PySide6.QtNetwork import QLocalSocket
 
-SESSION_UNAVAILABLE_MESSAGE = "Atalho global do mouse indisponível nesta sessão."
-BACKEND_FAILURE_MESSAGE = "Não foi possível ativar o atalho global do mouse."
+PROTOCOL_VERSION = 1
+MAX_PROTOCOL_LINE_BYTES = 128
 
-_BUTTON_NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
-_CANONICAL_BUTTON_ALIASES = {
-    "button8": "x1",
-    "button9": "x2",
+INTEGRATION_NOT_INSTALLED_MESSAGE = "Integração global não instalada."
+AUTHORIZATION_CANCELLED_MESSAGE = "A autorização foi cancelada."
+INPUT_ACCESS_MESSAGE = "O serviço global não conseguiu acessar os dispositivos de entrada."
+NO_COMPATIBLE_DEVICE_MESSAGE = "Nenhum dispositivo compatível foi detectado."
+BACKEND_FAILURE_MESSAGE = "Não foi possível ativar o atalho global."
+SOURCE_INSTALL_UNAVAILABLE_MESSAGE = (
+    "A autorização automática está disponível no aplicativo instalado."
+)
+
+_ALLOWED_MOUSE_BUTTONS = frozenset({"middle", "x1", "x2", "forward", "back", "task"})
+_MOUSE_ALIASES = {"button8": "x1", "button9": "x2"}
+_MODIFIER_ORDER = ("ctrl", "alt", "shift", "meta")
+_MODIFIERS = frozenset(_MODIFIER_ORDER)
+_MEDIA_KEYS = frozenset({"play_pause", "next", "previous", "mute"})
+_FUNCTION_KEY_RE = re.compile(r"f(?:[1-9]|1[0-9]|2[0-4])\Z")
+_ERROR_MESSAGES = {
+    "not_installed": INTEGRATION_NOT_INSTALLED_MESSAGE,
+    "input_access": INPUT_ACCESS_MESSAGE,
+    "no_devices": NO_COMPATIBLE_DEVICE_MESSAGE,
+    "unsafe_key": BACKEND_FAILURE_MESSAGE,
 }
-_CANONICAL_TO_BACKEND_ALIASES: dict[str, tuple[str, ...]] = {
-    "x1": ("x1", "button8"),
-    "x2": ("x2", "button9"),
-}
 
-class MouseShortcutError(RuntimeError):
-    """Erro recuperável ao interagir com o backend de atalho de mouse."""
+SocketFactory = Callable[[], QLocalSocket]
 
 
-class MouseListenerLike(Protocol):
-    """Protocolo estrutural para listeners de eventos de mouse."""
-
-    def start(self) -> None:
-        ...
-
-    def stop(self) -> None:
-        ...
-
-    def join(self, timeout: float | None = None) -> None:
-        ...
-
-    def is_alive(self) -> bool:
-        ...
-
-
-MouseListenerFactory = Callable[..., MouseListenerLike]
+def normalize_mouse_button_name(value: Any) -> str | None:
+    """Return a safe canonical global mouse trigger, or ``None``."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = getattr(value, "name", None)
+        if not isinstance(value, str):
+            return None
+    raw = value.strip().lower()
+    while raw.startswith("button."):
+        raw = raw[7:]
+    raw = _MOUSE_ALIASES.get(raw, raw)
+    return raw if raw in _ALLOWED_MOUSE_BUTTONS else None
 
 
-def normalize_button_name(button: Any) -> str | None:
-    """Normaliza e valida o nome de um botão do mouse para o identificador canônico."""
-    if button is None:
+def normalize_keyboard_shortcut(value: str) -> str | None:
+    """Normalize the restricted global keyboard shortcut grammar."""
+    if not isinstance(value, str):
+        return None
+    parts = [part.strip().lower() for part in value.split("+")]
+    if not parts or any(not part for part in parts):
         return None
 
-    if hasattr(button, "name") and isinstance(button.name, str):
-        raw = button.name
-    elif isinstance(button, str):
-        raw = button
-    else:
-        raw = str(button)
-
-    if raw.startswith("Button."):
-        raw = raw[len("Button."):]
-    elif raw.startswith("button."):
-        raw = raw[len("button."):]
-    raw = raw.lower()
-    if not raw or raw == "unknown" or len(raw) > 64:
+    modifiers: set[str] = set()
+    terminals: list[str] = []
+    for part in parts:
+        if part in _MODIFIERS:
+            if part in modifiers:
+                return None
+            modifiers.add(part)
+        else:
+            terminals.append(part)
+    if len(terminals) != 1:
         return None
-    if not _BUTTON_NAME_PATTERN.fullmatch(raw):
+
+    terminal = terminals[0]
+    is_alnum = len(terminal) == 1 and terminal.isascii() and terminal.isalnum()
+    is_function = _FUNCTION_KEY_RE.fullmatch(terminal) is not None
+    if not (is_alnum or is_function or terminal in _MEDIA_KEYS):
         return None
-    return _CANONICAL_BUTTON_ALIASES.get(raw, raw)
+    if is_alnum and not modifiers.intersection({"ctrl", "alt", "meta"}):
+        return None
+
+    ordered = [modifier for modifier in _MODIFIER_ORDER if modifier in modifiers]
+    return "+".join((*ordered, terminal))
 
 
-def _default_listener_factory(*args: Any, **kwargs: Any) -> MouseListenerLike:
-    """Fábrica padrão com importação tardia de pynput.mouse."""
-    from pynput import mouse
+class InputShortcutBridge(QObject):
+    """Asynchronous, generation-safe client for the local shortcut service."""
 
-    kwargs.setdefault("suppress", False)
-    return mouse.Listener(*args, **kwargs)
-
-
-class MouseShortcutBridge(QObject):
-    """Ponte de integração entre cliques globais do mouse e a UI Qt."""
-
-    _activated_event = Signal(int, int, int)
-    _button_captured_event = Signal(int, str, int, int)
-    activated = Signal()
-    button_captured = Signal(str)
-    failed = Signal(str)
-    _cleanup_capture_requested = Signal(int)
+    mouse_binding_ready = Signal(int, str)
+    mouse_activated = Signal(int, str)
+    mouse_captured = Signal(int, str)
+    keyboard_binding_ready = Signal(int, str)
+    keyboard_activated = Signal(int, str)
+    keyboard_captured = Signal(int, str)
+    stopped = Signal(str, int)
+    failed = Signal(str, int, str)
+    ready_changed = Signal(bool)
 
     def __init__(
         self,
         *,
-        env: Mapping[str, str] | None = None,
-        listener_factory: MouseListenerFactory | None = None,
+        server_name: str | None = None,
+        socket_factory: SocketFactory | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        self._env = dict(env if env is not None else os.environ)
-        self._listener_factory = listener_factory
-        self._listener: MouseListenerLike | None = None
-        self._lock = threading.RLock()
-        self._generation = 0
-        self._capturing = False
-        self._active_button: str | None = None
-        self._last_error: str | None = None
-        self._cleanup_capture_requested.connect(
-            self._on_cleanup_capture,
-            Qt.ConnectionType.QueuedConnection,
-        )
-    @property
-    def generation(self) -> int:
-        """Geração atual do ciclo de vida do bridge."""
-        return self._generation
+        self.server_name = server_name or f"/run/falafacil-shortcutd-{os.getuid()}.sock"
+        self._socket_factory = socket_factory or QLocalSocket
+        self._socket: QLocalSocket | None = None
+        self._buffer = bytearray()
+        self._ready = False
+        self._version_incompatible = False
+        self._closed = False
+        self._mouse_generation = 0
+        self._keyboard_generation = 0
+        self._connect_socket()
 
     @property
-    def available(self) -> bool:
-        """Indica se o ambiente de sessão suporta atalhos globais de mouse (X11 com DISPLAY)."""
-        return (
-            self._env.get("XDG_SESSION_TYPE", "").strip().lower() == "x11"
-            and bool(self._env.get("DISPLAY", "").strip())
-        )
+    def mouse_generation(self) -> int:
+        return self._mouse_generation
 
     @property
-    def last_error(self) -> str | None:
-        """Último erro sanitizado registrado pelo bridge."""
-        return self._last_error
+    def keyboard_generation(self) -> int:
+        return self._keyboard_generation
 
-    def _cleanup_listener(self, listener: MouseListenerLike) -> bool:
-        """Encerra e junta o listener fornecido de forma segura. Retorna True se houve erro."""
-        has_error = False
-        try:
-            listener.stop()
-        except Exception:
-            has_error = True
+    @property
+    def ready(self) -> bool:
+        return self._ready
 
-        if threading.current_thread() is not listener:
+    @property
+    def version_incompatible(self) -> bool:
+        return self._version_incompatible
+
+    def reconnect(self) -> None:
+        self._closed = False
+        self._disconnect_socket()
+        self._connect_socket()
+
+    def start_mouse(self, button: str) -> int:
+        self._mouse_generation += 1
+        generation = self._mouse_generation
+        canonical = normalize_mouse_button_name(button)
+        if canonical is None or not self._send_command(
+            "mouse", generation, f"WATCH_MOUSE {generation} {canonical}"
+        ):
+            self.failed.emit("mouse", generation, BACKEND_FAILURE_MESSAGE)
+        return generation
+
+    def begin_mouse_capture(self) -> int:
+        self._mouse_generation += 1
+        generation = self._mouse_generation
+        if not self._send_command("mouse", generation, f"CAPTURE_MOUSE {generation}"):
+            self.failed.emit("mouse", generation, INTEGRATION_NOT_INSTALLED_MESSAGE)
+        return generation
+
+    def stop_mouse(self) -> int:
+        self._mouse_generation += 1
+        generation = self._mouse_generation
+        if not self._send_command("mouse", generation, f"STOP_MOUSE {generation}"):
+            self.failed.emit("mouse", generation, INTEGRATION_NOT_INSTALLED_MESSAGE)
+        return generation
+
+    def start_keyboard(self, shortcut: str) -> int:
+        self._keyboard_generation += 1
+        generation = self._keyboard_generation
+        canonical = normalize_keyboard_shortcut(shortcut)
+        if canonical is None or not self._send_command(
+            "keyboard", generation, f"WATCH_KEYBOARD {generation} {canonical}"
+        ):
+            self.failed.emit("keyboard", generation, BACKEND_FAILURE_MESSAGE)
+        return generation
+
+    def begin_keyboard_capture(self) -> int:
+        self._keyboard_generation += 1
+        generation = self._keyboard_generation
+        if not self._send_command(
+            "keyboard", generation, f"CAPTURE_KEYBOARD {generation}"
+        ):
+            self.failed.emit("keyboard", generation, INTEGRATION_NOT_INSTALLED_MESSAGE)
+        return generation
+
+    def stop_keyboard(self) -> int:
+        self._keyboard_generation += 1
+        generation = self._keyboard_generation
+        if not self._send_command("keyboard", generation, f"STOP_KEYBOARD {generation}"):
+            self.failed.emit("keyboard", generation, INTEGRATION_NOT_INSTALLED_MESSAGE)
+        return generation
+
+    def close(self) -> None:
+        self._closed = True
+        self._mouse_generation += 1
+        self._keyboard_generation += 1
+        self._disconnect_socket()
+
+    def _connect_socket(self) -> None:
+        if self._closed:
+            return
+        socket = self._socket_factory()
+        self._socket = socket
+        socket.connected.connect(self._on_connected)
+        socket.readyRead.connect(self._on_ready_read)
+        socket.disconnected.connect(self._on_disconnected)
+        socket.errorOccurred.connect(self._on_socket_error)
+        socket.connectToServer(self.server_name)
+
+    def _disconnect_socket(self) -> None:
+        socket, self._socket = self._socket, None
+        was_ready = self._ready
+        self._ready = False
+        self._buffer.clear()
+        if socket is not None:
             try:
-                listener.join(timeout=0.5)
-            except Exception:
-                has_error = True
+                socket.abort()
+            except RuntimeError:
+                pass
+            socket.deleteLater()
+        if was_ready:
+            self.ready_changed.emit(False)
 
-        return has_error
+    def _on_connected(self) -> None:
+        self._write_line(f"HELLO {PROTOCOL_VERSION}")
 
-    def _on_cleanup_capture(self, gen: int) -> None:
-        """Processa a limpeza assíncrona do listener de captura fora do callback."""
-        target: MouseListenerLike | None = None
-        with self._lock:
-            if self._generation == gen:
-                target = self._listener
-                self._listener = None
-                self._generation += 1
-                self._capturing = False
-                self._active_button = None
-        if target is not None:
-            if self._cleanup_listener(target):
-                self._last_error = BACKEND_FAILURE_MESSAGE
-                self.failed.emit(self._last_error)
+    def _on_disconnected(self) -> None:
+        if self.sender() is not self._socket:
+            return
+        if self._ready:
+            self._ready = False
+            self.ready_changed.emit(False)
 
-    def _validate_button_backend(self, canonical: str) -> bool:
-        """Valida se o botão canônico é reconhecido pelo backend pynput quando usando a fábrica padrão."""
-        if self._listener_factory is not None:
+    def _on_socket_error(self, _error: object) -> None:
+        if self.sender() is not self._socket or self._closed:
+            return
+        if self._ready:
+            self._ready = False
+            self.ready_changed.emit(False)
+
+    def _on_ready_read(self) -> None:
+        socket = self._socket
+        if socket is None or self.sender() is not socket:
+            return
+        self._consume_data(bytes(socket.readAll()))
+
+    def _consume_data(self, data: bytes) -> None:
+        self._buffer.extend(data)
+        while True:
+            newline = self._buffer.find(b"\n")
+            if newline < 0:
+                if len(self._buffer) > MAX_PROTOCOL_LINE_BYTES:
+                    self._protocol_failure()
+                return
+            if newline > MAX_PROTOCOL_LINE_BYTES:
+                self._protocol_failure()
+                return
+            raw = bytes(self._buffer[:newline])
+            del self._buffer[: newline + 1]
+            if raw.endswith(b"\r"):
+                raw = raw[:-1]
+            try:
+                line = raw.decode("ascii")
+            except UnicodeDecodeError:
+                self._protocol_failure()
+                return
+            if not line or not self._handle_line(line):
+                self._protocol_failure()
+                return
+
+    def _handle_line(self, line: str) -> bool:
+        parts = line.split(" ")
+        if not self._ready:
+            if parts == ["READY", str(PROTOCOL_VERSION)]:
+                self._ready = True
+                self._version_incompatible = False
+                self.ready_changed.emit(True)
+                return True
+            if len(parts) == 2 and parts[0] == "READY":
+                self._version_incompatible = True
+            return False
+
+        command = parts[0]
+        if command == "STOPPED" and len(parts) == 3:
+            kind, generation = parts[1], self._parse_generation(parts[2])
+            if kind not in {"mouse", "keyboard"} or generation is None:
+                return False
+            if generation == self._current_generation(kind):
+                self.stopped.emit(kind, generation)
             return True
 
+        if command == "ERROR" and len(parts) == 4:
+            kind, generation = parts[1], self._parse_generation(parts[2])
+            if kind not in {"mouse", "keyboard", "service"} or generation is None:
+                return False
+            if kind == "service" or generation == self._current_generation(kind):
+                message = _ERROR_MESSAGES.get(parts[3], BACKEND_FAILURE_MESSAGE)
+                self.failed.emit(kind, generation, message)
+            return True
+
+        response_map = {
+            "WATCHING_MOUSE": ("mouse", normalize_mouse_button_name, self.mouse_binding_ready),
+            "ACTIVATED_MOUSE": ("mouse", normalize_mouse_button_name, self.mouse_activated),
+            "CAPTURED_MOUSE": ("mouse", normalize_mouse_button_name, self.mouse_captured),
+            "WATCHING_KEYBOARD": (
+                "keyboard",
+                normalize_keyboard_shortcut,
+                self.keyboard_binding_ready,
+            ),
+            "ACTIVATED_KEYBOARD": (
+                "keyboard",
+                normalize_keyboard_shortcut,
+                self.keyboard_activated,
+            ),
+            "CAPTURED_KEYBOARD": (
+                "keyboard",
+                normalize_keyboard_shortcut,
+                self.keyboard_captured,
+            ),
+        }
+        entry = response_map.get(command)
+        if entry is None or len(parts) != 3:
+            return False
+        kind, normalizer, signal = entry
+        generation = self._parse_generation(parts[1])
+        trigger = normalizer(parts[2])
+        if generation is None or trigger is None:
+            return False
+        if generation == self._current_generation(kind):
+            signal.emit(generation, trigger)
+        return True
+
+    @staticmethod
+    def _parse_generation(value: str) -> int | None:
+        if not value.isascii() or not value.isdigit():
+            return None
+        generation = int(value)
+        return generation if generation > 0 else None
+
+    def _current_generation(self, kind: str) -> int:
+        return self._mouse_generation if kind == "mouse" else self._keyboard_generation
+
+    def _send_command(self, kind: str, generation: int, line: str) -> bool:
+        del kind, generation
+        return self._ready and self._write_line(line)
+
+    def _write_line(self, line: str) -> bool:
+        socket = self._socket
+        if socket is None:
+            return False
         try:
-            from pynput import mouse
-        except Exception:
+            payload = line.encode("ascii") + b"\n"
+        except UnicodeEncodeError:
+            return False
+        if len(payload) - 1 > MAX_PROTOCOL_LINE_BYTES:
+            return False
+        try:
+            return socket.write(payload) == len(payload)
+        except (RuntimeError, TypeError):
             return False
 
-        candidates = _CANONICAL_TO_BACKEND_ALIASES.get(canonical, (canonical,))
-        for candidate in candidates:
-            btn = getattr(mouse.Button, candidate, None)
-            if btn is not None and getattr(btn, "name", None) != "unknown":
-                return True
-        return False
-    def start(self, button_name: str) -> bool:
-        """Inicia a escuta ativa para um botão de mouse configurado."""
-        if not self.available:
-            self._last_error = SESSION_UNAVAILABLE_MESSAGE
-            self.failed.emit(self._last_error)
-            return False
-
-        canonical = normalize_button_name(button_name)
-        if canonical is None:
-            self._last_error = BACKEND_FAILURE_MESSAGE
-            self.failed.emit(self._last_error)
-            return False
-
-        if not self._validate_button_backend(canonical):
-            self.stop()
-            self._last_error = BACKEND_FAILURE_MESSAGE
-            self.failed.emit(self._last_error)
-            return False
-
-        factory = self._listener_factory or _default_listener_factory
-        listener: MouseListenerLike | None = None
-        gen = 0
-
-        with self._lock:
-            self.stop()
-
-            self._generation += 1
-            gen = self._generation
-            self._active_button = canonical
-            self._capturing = False
-
-            def _on_click(x: Any, y: Any, button: Any, pressed: bool) -> None:
-                if not pressed:
-                    return
-                name = normalize_button_name(button)
-                if name is None:
-                    return
-                if self._generation != gen or self._active_button != name:
-                    return
-                try:
-                    px = int(x)
-                    py = int(y)
-                except (TypeError, ValueError):
-                    px = 0
-                    py = 0
-                self._activated_event.emit(gen, px, py)
-                self.activated.emit()
-            try:
-                listener = factory(on_click=_on_click, suppress=False)
-                self._listener = listener
-                listener.start()
-
-                if self._generation == gen and self._listener is listener:
-                    self._last_error = None
-                    return True
-                else:
-                    if self._listener is listener:
-                        self._listener = None
-                    if listener is not None:
-                        if self._cleanup_listener(listener):
-                            self._last_error = BACKEND_FAILURE_MESSAGE
-                            self.failed.emit(self._last_error)
-                    return False
-            except Exception:
-                if self._listener is listener:
-                    self._listener = None
-                if self._generation == gen:
-                    self._generation += 1
-                    self._active_button = None
-                if listener is not None:
-                    self._cleanup_listener(listener)
-                self._last_error = BACKEND_FAILURE_MESSAGE
-                self.failed.emit(self._last_error)
-                return False
-
-    def begin_capture(self) -> bool:
-        """Inicia a escuta temporária para capturar um único clique de mouse."""
-        if not self.available:
-            self._last_error = SESSION_UNAVAILABLE_MESSAGE
-            self.failed.emit(self._last_error)
-            return False
-
-        factory = self._listener_factory or _default_listener_factory
-        listener: MouseListenerLike | None = None
-        gen = 0
-
-        with self._lock:
-            self.stop()
-
-            self._generation += 1
-            gen = self._generation
-            self._capturing = True
-            self._active_button = None
-            captured = False
-
-            def _on_click(x: Any, y: Any, button: Any, pressed: bool) -> None:
-                nonlocal captured
-                if not pressed:
-                    return
-                name = normalize_button_name(button)
-                if name is None:
-                    return
-                if self._generation != gen or not self._capturing or captured:
-                    return
-                captured = True
-
-                try:
-                    px = int(x)
-                    py = int(y)
-                except (TypeError, ValueError):
-                    px = 0
-                    py = 0
-                self._button_captured_event.emit(gen, name, px, py)
-                self.button_captured.emit(name)
-                self._cleanup_capture_requested.emit(gen)
-            try:
-                listener = factory(on_click=_on_click, suppress=False)
-                self._listener = listener
-                listener.start()
-
-                if self._generation == gen and self._listener is listener:
-                    self._last_error = None
-                    return True
-                else:
-                    if self._listener is listener:
-                        self._listener = None
-                    if listener is not None:
-                        if self._cleanup_listener(listener):
-                            self._last_error = BACKEND_FAILURE_MESSAGE
-                            self.failed.emit(self._last_error)
-                    return False
-            except Exception:
-                if self._listener is listener:
-                    self._listener = None
-                if self._generation == gen:
-                    self._generation += 1
-                    self._capturing = False
-                if listener is not None:
-                    self._cleanup_listener(listener)
-                self._last_error = BACKEND_FAILURE_MESSAGE
-                self.failed.emit(self._last_error)
-                return False
-
-    def stop(self) -> None:
-        """Interrompe qualquer listener ativo ou em modo de captura de forma idempotente."""
-        with self._lock:
-            self._generation += 1
-            self._capturing = False
-            self._active_button = None
-            listener = self._listener
-            self._listener = None
-
-            if listener is not None:
-                if self._cleanup_listener(listener):
-                    self._last_error = BACKEND_FAILURE_MESSAGE
-                    self.failed.emit(self._last_error)
+    def _protocol_failure(self) -> None:
+        self.failed.emit("service", 0, BACKEND_FAILURE_MESSAGE)
+        self._disconnect_socket()
