@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from PySide6.QtCore import QStandardPaths
 
+from .config import MODEL_CHOICES
 from .shortcuts import normalize_keyboard_shortcut, normalize_mouse_button_name
 
 class LocalStoreError(RuntimeError):
@@ -289,6 +290,46 @@ class LocalStore:
         except sqlite3.Error:
             raise LocalStoreError(
                 "Erro ao remover preferência de atalho do teclado."
+            ) from None
+
+    def get_gemini_model(self) -> str | None:
+        conn = self._ensure_open()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT value FROM preferences WHERE key = 'gemini_model';"
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            value = str(row[0])
+            valid_choices = {choice[0] for choice in MODEL_CHOICES}
+            if value not in valid_choices:
+                return None
+            return value
+        except sqlite3.Error:
+            raise LocalStoreError(
+                "Erro ao ler preferência de modelo Gemini."
+            ) from None
+
+    def save_gemini_model(self, model: str) -> None:
+        conn = self._ensure_open()
+        valid_choices = {choice[0] for choice in MODEL_CHOICES}
+        if not isinstance(model, str) or model not in valid_choices:
+            raise LocalStoreError("Modelo Gemini inválido.")
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO preferences (key, value)
+                    VALUES ('gemini_model', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                    """,
+                    (model,),
+                )
+        except sqlite3.Error:
+            raise LocalStoreError(
+                "Erro ao salvar preferência de modelo Gemini."
             ) from None
     def record_token_usage(
         self,

@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, Test, Package, Release & Sync Tap
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry 2.1.3
+        run: |
+          pip install --no-cache-dir poetry==2.1.3
+
+      - name: Install system PortAudio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libportaudio2
+
+      - name: Validate tag format and package version equality
+        id: version_check
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Tag '$TAG' não é um SemVer válido no formato vX.Y.Z"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          PACKAGE_VERSION=$(PYTHONPATH=src python3 -c "import falafacil; print(falafacil.__version__)")
+          if [ "$VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "::error::Versão da tag '$VERSION' diverge de falafacil.__version__ '$PACKAGE_VERSION'"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: |
+          poetry install --extras dev --extras build
+          poetry run pip install --no-deps -e .
+
+      - name: Run test suite and bytecode compilation
+        run: |
+          QT_QPA_PLATFORM=offscreen poetry run pytest -q
+          poetry run python -m compileall -q src tests
+
+      - name: Build executable
+        run: |
+          ./scripts/build_executable.sh
+      - name: Probe executable version
+        run: |
+          ./dist/falafacil --update-probe "${{ steps.version_check.outputs.version }}"
+
+      - name: Package release assets
+        id: package_assets
+        run: |
+          VERSION="${{ steps.version_check.outputs.version }}"
+          ASSET_RAW="falafacil-linux-x86_64"
+          ASSET_TAR="falafacil-${VERSION}-linux-x86_64.tar.gz"
+
+          cp dist/falafacil "$ASSET_RAW"
+          chmod 0755 "$ASSET_RAW"
+
+          rm -rf tar_root
+          mkdir -p tar_root
+          cp dist/falafacil tar_root/falafacil
+          chmod 0755 tar_root/falafacil
+
+          tar --owner=0 --group=0 --numeric-owner -czf "$ASSET_TAR" -C tar_root falafacil
+
+
+          echo "asset_raw=$ASSET_RAW" >> "$GITHUB_OUTPUT"
+          echo "asset_tar=$ASSET_TAR" >> "$GITHUB_OUTPUT"
+
+      - name: Publish or verify GitHub Release
+        id: release_assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/publish_release.py \
+            --tag "${{ steps.version_check.outputs.tag }}" \
+            --version "${{ steps.version_check.outputs.version }}" \
+            --asset-raw "${{ steps.package_assets.outputs.asset_raw }}" \
+            --asset-tar "${{ steps.package_assets.outputs.asset_tar }}" \
+            --verify-dir "verify_download" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Checkout Homebrew Tap
+        uses: actions/checkout@v4
+        with:
+          repository: 'OthonBreener/homebrew-falafacil'
+          path: 'homebrew-tap'
+          persist-credentials: false
+
+      - name: Render Homebrew Formula
+        run: |
+          python scripts/render_homebrew_formula.py \
+            --version "${{ steps.version_check.outputs.version }}" \
+            --sha256 "${{ steps.release_assets.outputs.sha256 }}" \
+            --output "homebrew-tap/Formula/falafacil.rb"
+
+      - name: Setup Homebrew
+        uses: Homebrew/actions/setup-homebrew@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4
+
+      - name: Audit, install and test Formula
+        run: |
+          brew audit --formula homebrew-tap/Formula/falafacil.rb
+          brew install --build-from-source homebrew-tap/Formula/falafacil.rb
+          brew test homebrew-tap/Formula/falafacil.rb
+
+      - name: Commit and push Formula update to Tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/falafacil.rb
+          if git diff --staged --quiet; then
+            echo "Fórmula já está atualizada no tap."
+          else
+            git commit -m "falafacil ${{ steps.version_check.outputs.version }}"
+            ASKPASS_SH=$(mktemp)
+            printf '#!/bin/sh\nexec printf "%%s\\n" "$HOMEBREW_TAP_TOKEN"\n' > "$ASKPASS_SH"
+            chmod 700 "$ASKPASS_SH"
+            GIT_ASKPASS="$ASKPASS_SH" git push "https://x-access-token@github.com/OthonBreener/homebrew-falafacil.git" HEAD:main
+            rm -f "$ASKPASS_SH"
+          fi

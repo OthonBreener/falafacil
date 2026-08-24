@@ -20,8 +20,8 @@ O `testador` executa, na raiz do repositório, os comandos abaixo e retorna some
    QT_QPA_PLATFORM=offscreen poetry run pytest -q \
      tests/test_shortcuts.py tests/test_storage.py tests/test_config.py \
      tests/test_credentials.py tests/test_transcription.py \
+     tests/test_app.py tests/test_homebrew_update.py \
      tests/test_ui.py tests/test_packaging.py
-   ```
 
 3. Suíte determinística completa:
 
@@ -51,6 +51,10 @@ Além dos comandos gerais, validar o fluxo crítico afetado com os testes determ
 - botão de mouse rejeitado exibe explicação no diálogo de captura, com vocabulário de rejeição fechado e nenhum envio fora do modo de captura; captura sem entrada reconhecida orienta o remapeamento em vez de permanecer em espera;
 - autorização assíncrona sem shell/segredo, retomada da captura, socket `0600` por UID, daemon não-root/hardened e operação manual/`Space` preservadas em falha;
 - fechamento ordenado: cancelar instalador, fechar `InputShortcutBridge` e só então fechar `LocalStore`;
+- configurações com cinco grupos ordenados (`Chave API`, `Modelo Gemini`, `Atalho do mouse`, `Atalho do teclado`, `Atualizações`); grupo `Atualizações` com versão instalada, status, barra de progresso indeterminada durante execução e botão literal `Instalar atualizações`;
+- atualização Homebrew protegida contra cliques duplicados e estados busy (`RECORDING`/`TRANSCRIBING`), orientando instalação via brew em ambiente sem marker e oferecendo diálogo de reinício com opções literais `Reiniciar agora` e `Mais tarde`;
+- `closeEvent` bloqueia na primeira linha enquanto uma atualização Homebrew estiver em andamento, emitindo aviso sem mutar `_is_closing` e executando o encerramento ordenado somente após a finalização;
+- separação explícita entre a atualização do aplicativo via Homebrew e a atualização privilegiada do serviço de atalhos globais (gerenciada por `PROTOCOL_VERSION`/pkexec);
 - limite de payload inline e ausência de segredo em métricas, logs ou mensagens;
 - terminal somente em X11, com janela ativa e processo permitido.
 
@@ -63,14 +67,15 @@ Quando a alteração tocar `packaging/` ou `scripts/`, executar também o gate d
 
 ```bash
 poetry install --extras build
+poetry run pip install --no-deps -e .
 ./scripts/build_executable.sh
+./dist/falafacil --update-probe 0.2.0
 tmp_home=$(mktemp -d)
 HOME="$tmp_home" ./scripts/install_desktop.sh "$PWD/dist/falafacil"
 QT_QPA_PLATFORM=offscreen HOME="$tmp_home" dist/falafacil
 ```
 
-O bundle deve abrir offscreen sem rede, chave, microfone ou terminal. Quando atalhos globais mudarem, o smoke instalado também abre `Configurações`, solicita `Autorizar integração global`, confirma retomada automática e verifica `falafacil-shortcutd@<uid>.socket` ativo, socket `/run/falafacil-shortcutd-<uid>.sock` `0600` do usuário e serviço com usuário dinâmico/grupo `input`. Polkit/systemd reais nunca são acionados pela suíte determinística.
-
+O bundle compilado deve responder `--update-probe 0.2.0` com código de saída 0, instalar o desktop entry em `$tmp_home/.local/share/applications/falafacil.desktop` modo `0644` apontando para o executável instalado via dispatch `--install-user-desktop` e abrir offscreen sem exigir rede, chave, microfone, terminal ou pacote `libportaudio2` do host (PortAudio é embutido no executável one-file). O primeiro startup sob Homebrew registra o desktop entry automaticamente antes de exibir a janela, enquanto execuções a partir do código-fonte ou modo developer não realizam escritas automáticas (coberto deterministicamente em `tests/test_homebrew_update.py`, `tests/test_desktop_install.py` e `tests/test_app.py`; o smoke do Homebrew real permanece no gate de ambiente/release). Quando atalhos globais mudarem, o smoke instalado também abre `Configurações`, solicita `Autorizar integração global`, confirma retomada automática e verifica `falafacil-shortcutd@<uid>.socket` ativo, socket `/run/falafacil-shortcutd-<uid>.sock` `0600` do usuário e serviço com usuário dinâmico/grupo `input`. Polkit/systemd reais nunca são acionados pela suíte determinística.
 ## Critério de aprovação
 
 O gate passa somente quando todos os critérios aplicáveis forem observáveis:

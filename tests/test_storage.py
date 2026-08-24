@@ -106,6 +106,65 @@ def test_invalid_recording_shortcuts_raise_error(tmp_path: Path) -> None:
 
 
 
+def test_gemini_model_persistence_reopen_and_overwrite(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    with LocalStore(db_path) as store:
+        assert store.get_gemini_model() is None
+        store.save_gemini_model("gemini-3.5-flash-lite")
+        assert store.get_gemini_model() == "gemini-3.5-flash-lite"
+
+        # Overwrite
+        store.save_gemini_model("gemini-3.7-flash")
+        assert store.get_gemini_model() == "gemini-3.7-flash"
+
+    with LocalStore(db_path) as reopened:
+        assert reopened.get_gemini_model() == "gemini-3.7-flash"
+
+
+def test_invalid_gemini_model_raises_error(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    with LocalStore(db_path) as store:
+        for invalid in ("", "   ", "unknown", "gemini-1.5-flash", "gemini-test"):
+            with pytest.raises(LocalStoreError, match="inválido"):
+                store.save_gemini_model(invalid)
+
+
+def test_unrecognized_stored_gemini_model_returns_none(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    with LocalStore(db_path) as store:
+        with store._conn:
+            store._conn.execute(
+                "INSERT INTO preferences (key, value) VALUES ('gemini_model', 'obsolete-model');"
+            )
+        assert store.get_gemini_model() is None
+
+
+def test_gemini_model_storage_errors_are_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    leak_marker = "SYNTHETIC_MODEL_SQLITE_SECRET_98765"
+    with LocalStore(db_path) as store:
+        failing_conn = _FailingConnection(sqlite3.OperationalError(leak_marker))
+        for operation, expected in (
+            (
+                lambda: store.get_gemini_model(),
+                "Erro ao ler preferência de modelo Gemini.",
+            ),
+            (
+                lambda: store.save_gemini_model("gemini-2.5-flash-lite"),
+                "Erro ao salvar preferência de modelo Gemini.",
+            ),
+        ):
+            monkeypatch.setattr(store, "_conn", failing_conn)
+            with pytest.raises(LocalStoreError) as exc_info:
+                operation()
+            assert str(exc_info.value) == expected
+            assert leak_marker not in str(exc_info.value)
+            assert exc_info.value.__cause__ is None
+            monkeypatch.undo()
+
+
 class _FailingConnection:
     def __init__(self, error: Exception) -> None:
         self._error = error

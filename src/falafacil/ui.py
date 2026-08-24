@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QStyle,
@@ -50,6 +51,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from . import __version__
 from .audio import (
     AudioCapture,
     AudioDevice,
@@ -58,9 +60,10 @@ from .audio import (
     choose_input_device,
     list_input_devices,
 )
-from .config import Settings
+from .config import MODEL_CHOICES, Settings
 from .credentials import ApiKeyStore, CredentialStoreError
 from .storage import LocalStore, LocalStoreError, TokenTotals, TokenUsageRecord
+from .homebrew_update import HomebrewUpdateController
 from .shortcut_install import ShortcutServiceInstaller
 from .shortcuts import (
     BACKEND_FAILURE_MESSAGE,
@@ -466,14 +469,21 @@ class MainWindow(QMainWindow):
         transcriber: GeminiTranscriber | None = None,
         terminal_bridge: TerminalBridge | None = None,
         api_key_store: ApiKeyStore | None = None,
-        transcriber_factory: Callable[[str], GeminiTranscriber] | None = None,
+        transcriber_factory: Callable[[str, str], GeminiTranscriber] | None = None,
         microphone_provider: Callable[[], tuple[AudioDevice, ...]] | None = None,
         media_player_factory: MediaPlayerFactory | None = None,
         local_store: LocalStore | None = None,
         input_shortcut_bridge: InputShortcutBridge | None = None,
         shortcut_service_installer: ShortcutServiceInstaller | None = None,
+        homebrew_update_controller: HomebrewUpdateController | None = None,
     ) -> None:
         super().__init__()
+        self.homebrew_update_controller = homebrew_update_controller
+        self._update_status: str = (
+            ""
+            if self.homebrew_update_controller is not None
+            else "Instale o FalaFácil com: brew install OthonBreener/falafacil/falafacil"
+        )
         self.settings = settings
         self.local_store = local_store
         self.recorder = recorder or AudioRecorder()
@@ -481,7 +491,7 @@ class MainWindow(QMainWindow):
         self.terminal_bridge = terminal_bridge or TerminalBridge()
         self.api_key_store = api_key_store
         self.transcriber_factory = transcriber_factory or (
-            lambda api_key: GeminiTranscriber(api_key=api_key, model=self.settings.model)
+            lambda api_key, model: GeminiTranscriber(api_key=api_key, model=model)
         )
         self._microphone_provider = microphone_provider or list_input_devices
         self._media_player_factory = media_player_factory or _default_media_player_factory
@@ -538,6 +548,19 @@ class MainWindow(QMainWindow):
         self.shortcut_service_installer.finished.connect(
             self._on_shortcut_install_finished
         )
+        if self.homebrew_update_controller is not None:
+            self.homebrew_update_controller.status_changed.connect(
+                self._on_homebrew_status_changed
+            )
+            self.homebrew_update_controller.up_to_date.connect(
+                self._on_homebrew_up_to_date
+            )
+            self.homebrew_update_controller.ready_to_restart.connect(
+                self._on_homebrew_ready_to_restart
+            )
+            self.homebrew_update_controller.failed.connect(
+                self._on_homebrew_failed
+            )
 
         self.setWindowTitle("FalaFácil")
         self.resize(1120, 700)
@@ -742,6 +765,19 @@ class MainWindow(QMainWindow):
         api_layout.addWidget(self.configure_key_button)
         layout.addWidget(api_group)
 
+        model_group = QGroupBox("Modelo Gemini", dialog)
+        model_layout = QVBoxLayout(model_group)
+        self.model_combo = QComboBox(model_group)
+        for model_id, label in MODEL_CHOICES:
+            self.model_combo.addItem(label, model_id)
+        current_model_idx = self.model_combo.findData(self.settings.model)
+        self.model_combo.setCurrentIndex(current_model_idx)
+        model_layout.addWidget(self.model_combo)
+        self.apply_model_button = QPushButton("Aplicar modelo", model_group)
+        self.apply_model_button.clicked.connect(self._apply_model_preference)
+        model_layout.addWidget(self.apply_model_button)
+        layout.addWidget(model_group)
+
         mouse_group = QGroupBox("Atalho do mouse", dialog)
         mouse_layout = QVBoxLayout(mouse_group)
         self.mouse_settings_status = QLabel(mouse_group)
@@ -775,6 +811,23 @@ class MainWindow(QMainWindow):
         keyboard_actions.addWidget(self.disable_keyboard_button)
         keyboard_layout.addLayout(keyboard_actions)
         layout.addWidget(keyboard_group)
+
+        update_group = QGroupBox("Atualizações", dialog)
+        update_layout = QVBoxLayout(update_group)
+        self.installed_version_label = QLabel(
+            f"Versão instalada: {__version__}", update_group
+        )
+        update_layout.addWidget(self.installed_version_label)
+        self.update_status_label = QLabel(update_group)
+        self.update_status_label.setWordWrap(True)
+        update_layout.addWidget(self.update_status_label)
+        self.update_progress_bar = QProgressBar(update_group)
+        self.update_progress_bar.setRange(0, 0)
+        update_layout.addWidget(self.update_progress_bar)
+        self.install_update_button = QPushButton("Instalar atualizações", update_group)
+        self.install_update_button.clicked.connect(self._on_install_updates_clicked)
+        update_layout.addWidget(self.install_update_button)
+        layout.addWidget(update_group)
 
         close_buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Close, parent=dialog
@@ -815,6 +868,107 @@ class MainWindow(QMainWindow):
         self.disable_keyboard_button.setEnabled(
             not busy and self._active_keyboard_shortcut is not None
         )
+        model_combo = getattr(self, "model_combo", None)
+        apply_model_button = getattr(self, "apply_model_button", None)
+        if model_combo is not None:
+            model_combo.setEnabled(not busy and not self.settings.model_from_environment)
+        if apply_model_button is not None:
+            apply_model_button.setEnabled(
+                not busy and not self.settings.model_from_environment
+            )
+        update_status_label = getattr(self, "update_status_label", None)
+        update_progress_bar = getattr(self, "update_progress_bar", None)
+        install_update_button = getattr(self, "install_update_button", None)
+        if self.homebrew_update_controller is None:
+            if update_status_label is not None:
+                update_status_label.setText(
+                    "Instale o FalaFácil com: brew install OthonBreener/falafacil/falafacil"
+                )
+            if update_progress_bar is not None:
+                update_progress_bar.setVisible(False)
+            if install_update_button is not None:
+                install_update_button.setEnabled(False)
+        else:
+            is_running = self.homebrew_update_controller.running
+            if update_status_label is not None:
+                update_status_label.setText(self._update_status)
+            if update_progress_bar is not None:
+                update_progress_bar.setVisible(is_running)
+            if install_update_button is not None:
+                install_update_button.setEnabled(not busy and not is_running)
+
+    @Slot()
+    def _on_install_updates_clicked(self) -> None:
+        if self._is_closing or self.state in (AppState.RECORDING, AppState.TRANSCRIBING):
+            return
+        if self.homebrew_update_controller is None:
+            return
+        if self.homebrew_update_controller.running:
+            return
+        self.homebrew_update_controller.install_latest()
+        self._update_actions()
+
+    @Slot(str)
+    def _on_homebrew_status_changed(self, message: str) -> None:
+        if self._is_closing:
+            return
+        self._update_status = message
+        self._update_settings_dialog()
+
+    @Slot(str)
+    def _on_homebrew_up_to_date(self, message: str) -> None:
+        if self._is_closing:
+            return
+        self._update_status = message
+        self._update_actions()
+
+    @Slot(str)
+    def _on_homebrew_failed(self, message: str) -> None:
+        if self._is_closing:
+            return
+        self._update_status = message
+        self._update_actions()
+
+    @Slot(str)
+    def _on_homebrew_ready_to_restart(self, message: str) -> None:
+        if self._is_closing:
+            return
+        self._update_status = message
+        self._update_actions()
+        self._show_restart_dialog(message)
+
+    def _show_restart_dialog(self, message: str) -> None:
+        parent = self._settings_dialog if self._settings_dialog is not None else self
+        dialog = QDialog(parent)
+        dialog.setWindowTitle("Atualização concluída")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        label = QLabel(message, dialog)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        buttons = QDialogButtonBox(dialog)
+        restart_btn = buttons.addButton(
+            "Reiniciar agora", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        later_btn = buttons.addButton(
+            "Mais tarde", QDialogButtonBox.ButtonRole.RejectRole
+        )
+        restart_btn.clicked.connect(dialog.accept)
+        later_btn.clicked.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        result = dialog.exec()
+        if result == QDialog.DialogCode.Accepted:
+            if self.homebrew_update_controller is not None:
+                started = self.homebrew_update_controller.restart()
+                if started:
+                    self.close()
+                else:
+                    self._update_status = (
+                        "O Homebrew não conseguiu concluir a atualização. Tente novamente."
+                    )
+                    self._update_actions()
 
     @Slot()
     def _toggle_fullscreen(self) -> None:
@@ -956,7 +1110,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            new_transcriber = self.transcriber_factory(api_key)
+            new_transcriber = self.transcriber_factory(api_key, self.settings.model)
         except Exception:
             self.status_label.setText("Não foi possível configurar a chave API.")
             return
@@ -979,6 +1133,51 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText("Chave API configurada com sucesso.")
 
+
+    @Slot()
+    def _apply_model_preference(self) -> None:
+        if self.state in (AppState.RECORDING, AppState.TRANSCRIBING):
+            return
+        if self.settings.model_from_environment:
+            return
+        selected_model = self.model_combo.currentData()
+        if not isinstance(selected_model, str) or not selected_model:
+            return
+        valid_choices = {choice[0] for choice in MODEL_CHOICES}
+        if selected_model not in valid_choices:
+            return
+
+        new_transcriber = None
+        if self.settings.has_api_key and self.settings.api_key is not None:
+            try:
+                new_transcriber = self.transcriber_factory(
+                    self.settings.api_key, selected_model
+                )
+            except Exception:
+                current_model_idx = self.model_combo.findData(self.settings.model)
+                if current_model_idx >= 0:
+                    self.model_combo.setCurrentIndex(current_model_idx)
+                self.status_label.setText("Não foi possível configurar o modelo Gemini.")
+                return
+
+        persistence_unavailable = self.local_store is None
+        if self.local_store is not None:
+            try:
+                self.local_store.save_gemini_model(selected_model)
+            except Exception:
+                persistence_unavailable = True
+
+        self.settings = replace(self.settings, model=selected_model)
+        if new_transcriber is not None:
+            self.transcriber = new_transcriber
+        self._update_actions()
+        if persistence_unavailable:
+            self.status_label.setText(
+                "Modelo Gemini configurado apenas nesta sessão; "
+                "não foi possível persistir no banco local."
+            )
+        else:
+            self.status_label.setText("Modelo Gemini configurado com sucesso.")
     def _update_shortcut_indicator(self) -> None:
         count = int(self._active_mouse_button is not None) + int(
             self._active_keyboard_shortcut is not None
@@ -1762,6 +1961,15 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if (
+            self.homebrew_update_controller is not None
+            and self.homebrew_update_controller.running
+        ):
+            self.status_label.setText(
+                "A atualização pelo Homebrew está em andamento. Aguarde a conclusão."
+            )
+            event.ignore()
+            return
         self._is_closing = True
         if self._capture_dialog is not None:
             self._capture_dialog.reject()

@@ -5,29 +5,53 @@ from dataclasses import dataclass, field
 
 
 
-DEFAULT_MODEL = "gemini-3.7-flash"
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
+
+MODEL_CHOICES: tuple[tuple[str, str], ...] = (
+    ("gemini-2.5-flash-lite", "Mais econômico — Gemini 2.5 Flash-Lite"),
+    ("gemini-3.5-flash-lite", "Flash-Lite mais recente — Gemini 3.5 Flash-Lite"),
+    ("gemini-3.7-flash", "Flash mais capaz — Gemini 3.7 Flash"),
+)
 
 
 @dataclass(frozen=True, slots=True)
 class Settings:
     model: str = DEFAULT_MODEL
     api_key: str | None = field(default=None, repr=False, compare=False)
+    model_from_environment: bool = False
 
     @property
     def has_api_key(self) -> bool:
         return bool(self.api_key)
 
     @classmethod
-    def from_env(cls, fallback_api_key: str | None = None) -> "Settings":
+    def from_env(
+        cls,
+        *,
+        fallback_api_key: str | None = None,
+        fallback_model: str | None = None,
+    ) -> "Settings":
         api_key = (
             os.getenv("GEMINI_API_KEY")
             or os.getenv("GOOGLE_API_KEY")
             or fallback_api_key
             or None
         )
+        env_model = os.getenv("GEMINI_MODEL")
+        if env_model is not None and env_model != "":
+            model = env_model
+            model_from_environment = True
+        elif fallback_model is not None and fallback_model != "":
+            model = fallback_model
+            model_from_environment = False
+        else:
+            model = DEFAULT_MODEL
+            model_from_environment = False
+
         return cls(
-            model=os.getenv("GEMINI_MODEL", DEFAULT_MODEL),
+            model=model,
             api_key=api_key,
+            model_from_environment=model_from_environment,
         )
 
     @property

@@ -2,9 +2,12 @@
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.poetry]
+package-mode = false
+
 [project]
 name = "falafacil"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Transcrição de voz em português para Ubuntu com Gemini"
 requires-python = ">=3.11,<3.15"
 dependencies = [
@@ -22,10 +25,13 @@ dev = ["pytest>=8.0"]
 build = ["pyinstaller>=6.11"]
 
 [project.scripts]
-falafacil = "falafacil.app:main"
+falafacil = "falafacil.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "falafacil.__version__"}
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

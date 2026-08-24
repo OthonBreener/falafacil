@@ -13,13 +13,16 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QGroupBox,
+    QLabel,
     QLineEdit,
+    QProgressBar,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 from falafacil.audio import AudioCapture, AudioDevice, AudioRecorderError
-from falafacil.config import Settings
+from falafacil import __version__
+from falafacil.config import DEFAULT_MODEL, Settings
 from falafacil.credentials import CredentialStoreError
 from falafacil.storage import LocalStore, LocalStoreError, TokenTotals, TokenUsageRecord
 from falafacil.shortcuts import (
@@ -89,10 +92,12 @@ class FakeTranscriber:
         text: str = "synthetic transcript",
         usage: TokenUsage | None = None,
         error: str | None = None,
+        model: str = DEFAULT_MODEL,
     ) -> None:
         self.text = text
         self.usage = usage
         self.error = error
+        self.model = model
         self.calls: list[bytes] = []
         self._debug: TranscriptionDebug | None = None
 
@@ -238,6 +243,8 @@ class FakeLocalStore:
         fail_keyboard_save: bool = False,
         fail_keyboard_get: bool = False,
         fail_keyboard_clear: bool = False,
+        fail_model_save: bool = False,
+        fail_model_get: bool = False,
         order_log: list[str] | None = None,
     ) -> None:
         self.fail_record = fail_record
@@ -251,10 +258,13 @@ class FakeLocalStore:
         self.fail_keyboard_save = fail_keyboard_save
         self.fail_keyboard_get = fail_keyboard_get
         self.fail_keyboard_clear = fail_keyboard_clear
+        self.fail_model_save = fail_model_save
+        self.fail_model_get = fail_model_get
         self.records: list[tuple[str, Any, str]] = []
         self.mic_identity: str | None = None
         self.mouse_button: str | None = None
         self.keyboard_shortcut: str | None = None
+        self.gemini_model: str | None = None
         self.closed = False
         self.close_order_log = order_log if order_log is not None else []
     def get_last_microphone_identity(self) -> str | None:
@@ -296,6 +306,16 @@ class FakeLocalStore:
         if self.fail_keyboard_clear:
             raise LocalStoreError("erro ao limpar atalho do teclado")
         self.keyboard_shortcut = None
+
+    def get_gemini_model(self) -> str | None:
+        if self.fail_model_get:
+            raise LocalStoreError("erro ao ler modelo Gemini")
+        return self.gemini_model
+
+    def save_gemini_model(self, model: str) -> None:
+        if self.fail_model_save:
+            raise LocalStoreError("erro ao salvar modelo Gemini")
+        self.gemini_model = model
 
     def record_token_usage(self, model: str, usage: Any, outcome: str) -> None:
         if self.fail_record:
@@ -450,6 +470,42 @@ def make_debug(
     )
 
 
+class FakeHomebrewUpdateController(QObject):
+    status_changed = Signal(str)
+    up_to_date = Signal(str)
+    ready_to_restart = Signal(str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        running: bool = False,
+        restart_result: bool = True,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._running = running
+        self.restart_result = restart_result
+        self.install_calls = 0
+        self.restart_calls = 0
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    @running.setter
+    def running(self, value: bool) -> None:
+        self._running = value
+
+    def install_latest(self) -> bool:
+        self.install_calls += 1
+        self._running = True
+        return True
+
+    def restart(self) -> bool:
+        self.restart_calls += 1
+        return self.restart_result
+
 def make_window(
     qapp,
     *,
@@ -465,6 +521,7 @@ def make_window(
     terminal_bridge=None,
     input_shortcut_bridge=None,
     shortcut_service_installer=None,
+    homebrew_update_controller=None,
 ):
     media_player = media_player or FakeMediaPlayer()
     resolved_terminal = (
@@ -487,6 +544,7 @@ def make_window(
         shortcut_service_installer=(
             shortcut_service_installer or FakeShortcutInstaller()
         ),
+        homebrew_update_controller=homebrew_update_controller,
     )
     window.show()
     qapp.processEvents()
@@ -503,10 +561,10 @@ def wait_for_worker(qapp, window) -> None:
 
 def test_configure_api_key_accepts_key_and_enables_recording(qapp, monkeypatch) -> None:
     store = FakeStore()
-    factory_keys: list[str] = []
+    factory_calls: list[tuple[str, str]] = []
 
-    def factory(api_key: str):
-        factory_keys.append(api_key)
+    def factory(api_key: str, model: str):
+        factory_calls.append((api_key, model))
         return FakeTranscriber()
 
     window, _ = make_window(qapp, store=store, factory=factory)
@@ -514,7 +572,7 @@ def test_configure_api_key_accepts_key_and_enables_recording(qapp, monkeypatch) 
 
     window._configure_api_key()
 
-    assert factory_keys == ["ui-session-token"]
+    assert factory_calls == [("ui-session-token", "gemini-2.5-flash-lite")]
     assert store.saved == ["ui-session-token"]
     assert window.settings.api_key == "ui-session-token"
     assert window.transcriber is not None
@@ -526,11 +584,11 @@ def test_configure_api_key_accepts_key_and_enables_recording(qapp, monkeypatch) 
 
 def test_configure_api_key_cancel_or_empty_preserves_state(qapp, monkeypatch) -> None:
     store = FakeStore()
-    factory_keys: list[str] = []
+    factory_calls: list[tuple[str, str]] = []
     window, _ = make_window(
         qapp,
         store=store,
-        factory=lambda api_key: factory_keys.append(api_key) or FakeTranscriber(),
+        factory=lambda api_key, model: factory_calls.append((api_key, model)) or FakeTranscriber(),
     )
     original_status = window.status_label.text()
 
@@ -545,7 +603,7 @@ def test_configure_api_key_cancel_or_empty_preserves_state(qapp, monkeypatch) ->
     window._configure_api_key()
     assert window.settings.api_key is None
     assert window.transcriber is None
-    assert factory_keys == []
+    assert factory_calls == []
     assert store.saved == []
     assert window.status_label.text() == original_status
     window.close()
@@ -556,7 +614,7 @@ def test_configure_api_key_store_failure_keeps_session_key_only(qapp, monkeypatc
     window, _ = make_window(
         qapp,
         store=store,
-        factory=lambda api_key: FakeTranscriber(),
+        factory=lambda api_key, model: FakeTranscriber(),
     )
     monkeypatch.setattr(window, "_acquire_api_key", lambda: ("session-only-token", True))
 
@@ -574,7 +632,7 @@ def test_configure_api_key_factory_failure_rolls_back(qapp, monkeypatch) -> None
     store = FakeStore()
     original = FakeTranscriber()
 
-    def broken_factory(api_key: str):
+    def broken_factory(api_key: str, model: str):
         raise RuntimeError("construction failed")
 
     window, _ = make_window(qapp, store=store, factory=broken_factory, transcriber=original)
@@ -590,6 +648,272 @@ def test_configure_api_key_factory_failure_rolls_back(qapp, monkeypatch) -> None
     assert "Não foi possível configurar" in window.status_label.text()
     window.close()
 
+
+def test_settings_dialog_model_choices_populated_and_selected(qapp) -> None:
+    window, _ = make_window(
+        qapp,
+        settings=Settings(model="gemini-3.5-flash-lite"),
+    )
+
+    def inspect() -> None:
+        dialog = window._settings_dialog
+        assert dialog is not None
+        assert window.model_combo.count() == 3
+        labels = [window.model_combo.itemText(i) for i in range(3)]
+        data = [window.model_combo.itemData(i) for i in range(3)]
+        assert data == [
+            "gemini-2.5-flash-lite",
+            "gemini-3.5-flash-lite",
+            "gemini-3.7-flash",
+        ]
+        assert labels == [
+            "Mais econômico — Gemini 2.5 Flash-Lite",
+            "Flash-Lite mais recente — Gemini 3.5 Flash-Lite",
+            "Flash mais capaz — Gemini 3.7 Flash",
+        ]
+        assert window.model_combo.currentData() == "gemini-3.5-flash-lite"
+        dialog.reject()
+
+    QTimer.singleShot(0, inspect)
+    window._open_settings_dialog()
+    window.close()
+
+
+def test_apply_model_preference_with_active_key(qapp) -> None:
+    local_store = FakeLocalStore()
+    factory_calls: list[tuple[str, str]] = []
+
+    def factory(api_key: str, model: str):
+        factory_calls.append((api_key, model))
+        return FakeTranscriber()
+
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key", model="gemini-2.5-flash-lite"),
+        local_store=local_store,
+        factory=factory,
+    )
+
+    def apply_choice() -> None:
+        idx = window.model_combo.findData("gemini-3.5-flash-lite")
+        assert idx >= 0
+        window.model_combo.setCurrentIndex(idx)
+        window.apply_model_button.click()
+        window._settings_dialog.accept()
+
+    QTimer.singleShot(0, apply_choice)
+    window._open_settings_dialog()
+
+    assert factory_calls == [("active-key", "gemini-3.5-flash-lite")]
+    assert window.settings.model == "gemini-3.5-flash-lite"
+    assert local_store.get_gemini_model() == "gemini-3.5-flash-lite"
+    assert window.transcriber is not None
+    assert "Modelo Gemini configurado com sucesso." in window.status_label.text()
+    window.close()
+
+
+def test_apply_model_preference_without_key(qapp) -> None:
+    local_store = FakeLocalStore()
+    factory_calls: list[tuple[str, str]] = []
+
+    window, _ = make_window(
+        qapp,
+        settings=Settings(model="gemini-2.5-flash-lite"),
+        local_store=local_store,
+        factory=lambda k, m: factory_calls.append((k, m)) or FakeTranscriber(),
+    )
+
+    def apply_choice() -> None:
+        idx = window.model_combo.findData("gemini-3.7-flash")
+        assert idx >= 0
+        window.model_combo.setCurrentIndex(idx)
+        window.apply_model_button.click()
+        window._settings_dialog.accept()
+
+    QTimer.singleShot(0, apply_choice)
+    window._open_settings_dialog()
+
+    assert factory_calls == []
+    assert window.settings.model == "gemini-3.7-flash"
+    assert local_store.get_gemini_model() == "gemini-3.7-flash"
+    assert window.transcriber is None
+    assert "Modelo Gemini configurado com sucesso." in window.status_label.text()
+    window.close()
+
+
+def test_apply_model_preference_factory_failure_rolls_back(qapp) -> None:
+    local_store = FakeLocalStore()
+    original_transcriber = FakeTranscriber(model="gemini-2.5-flash-lite")
+
+    def failing_factory(api_key: str, model: str):
+        raise RuntimeError("factory construction failed")
+
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key", model="gemini-2.5-flash-lite"),
+        transcriber=original_transcriber,
+        local_store=local_store,
+        factory=failing_factory,
+    )
+
+    def apply_choice() -> None:
+        idx = window.model_combo.findData("gemini-3.5-flash-lite")
+        window.model_combo.setCurrentIndex(idx)
+        window.apply_model_button.click()
+        # Verify visual rollback while dialog is still open
+        assert window.model_combo.currentData() == "gemini-2.5-flash-lite"
+        assert window.model_combo.currentIndex() == window.model_combo.findData(
+            "gemini-2.5-flash-lite"
+        )
+        window._settings_dialog.reject()
+
+    QTimer.singleShot(0, apply_choice)
+    window._open_settings_dialog()
+
+    assert window.settings.model == "gemini-2.5-flash-lite"
+    assert window.transcriber is original_transcriber
+    assert local_store.get_gemini_model() is None
+    assert "Não foi possível configurar o modelo Gemini." in window.status_label.text()
+    window.close()
+
+
+def test_apply_model_preference_store_failure_keeps_session_model_only(qapp) -> None:
+    local_store = FakeLocalStore(fail_model_save=True)
+
+    window, _ = make_window(
+        qapp,
+        settings=Settings(model="gemini-2.5-flash-lite"),
+        local_store=local_store,
+    )
+
+    def apply_choice() -> None:
+        idx = window.model_combo.findData("gemini-3.5-flash-lite")
+        window.model_combo.setCurrentIndex(idx)
+        window.apply_model_button.click()
+        window._settings_dialog.accept()
+
+    QTimer.singleShot(0, apply_choice)
+    window._open_settings_dialog()
+
+    assert window.settings.model == "gemini-3.5-flash-lite"
+    assert "apenas nesta sessão" in window.status_label.text()
+    window.close()
+
+
+def test_apply_model_preference_store_failure_with_active_key_keeps_session_model_only(
+    qapp,
+) -> None:
+    local_store = FakeLocalStore(fail_model_save=True)
+    original_transcriber = FakeTranscriber(model="gemini-2.5-flash-lite")
+    factory_calls: list[tuple[str, str]] = []
+
+    def tracking_factory(api_key: str, model: str):
+        factory_calls.append((api_key, model))
+        return FakeTranscriber(model=model)
+
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key", model="gemini-2.5-flash-lite"),
+        transcriber=original_transcriber,
+        local_store=local_store,
+        factory=tracking_factory,
+    )
+
+    def apply_choice() -> None:
+        idx = window.model_combo.findData("gemini-3.5-flash-lite")
+        window.model_combo.setCurrentIndex(idx)
+        window.apply_model_button.click()
+        window._settings_dialog.accept()
+
+    QTimer.singleShot(0, apply_choice)
+    window._open_settings_dialog()
+
+    assert factory_calls == [("active-key", "gemini-3.5-flash-lite")]
+    assert window.settings.model == "gemini-3.5-flash-lite"
+    assert window.transcriber is not original_transcriber
+    assert window.transcriber.model == "gemini-3.5-flash-lite"
+    assert local_store.gemini_model is None
+    assert "apenas nesta sessão" in window.status_label.text()
+    window.close()
+
+
+def test_apply_model_preference_locked_when_model_from_environment(qapp) -> None:
+    local_store = FakeLocalStore()
+    original_transcriber = FakeTranscriber(model="gemini-opaque-custom")
+    factory_calls: list[tuple[str, str]] = []
+
+    def tracking_factory(api_key: str, model: str):
+        factory_calls.append((api_key, model))
+        return FakeTranscriber(model=model)
+
+    window, _ = make_window(
+        qapp,
+        settings=Settings(
+            api_key="active-key",
+            model="gemini-opaque-custom",
+            model_from_environment=True,
+        ),
+        transcriber=original_transcriber,
+        local_store=local_store,
+        factory=tracking_factory,
+    )
+
+    def inspect() -> None:
+        assert window.model_combo.isEnabled() is False
+        assert window.apply_model_button.isEnabled() is False
+        assert window.model_combo.currentIndex() == -1
+        window._apply_model_preference()
+        assert window.settings.model == "gemini-opaque-custom"
+        assert window.transcriber is original_transcriber
+        assert len(factory_calls) == 0
+        assert local_store.gemini_model is None
+        assert local_store.records == []
+        window._settings_dialog.reject()
+
+    QTimer.singleShot(0, inspect)
+    window._open_settings_dialog()
+
+    assert window.settings.model == "gemini-opaque-custom"
+    assert window.transcriber is original_transcriber
+    assert len(factory_calls) == 0
+    assert local_store.gemini_model is None
+    window.close()
+
+def test_apply_model_preference_locked_when_busy(qapp) -> None:
+    window, _ = make_window(qapp, settings=Settings(api_key="active-key"))
+
+    def inspect() -> None:
+        assert window.model_combo.isEnabled() is True
+        assert window.apply_model_button.isEnabled() is True
+
+        window.state = AppState.RECORDING
+        window._update_actions()
+        assert window.model_combo.isEnabled() is False
+        assert window.apply_model_button.isEnabled() is False
+
+        window.state = AppState.TRANSCRIBING
+        window._update_actions()
+        assert window.model_combo.isEnabled() is False
+        assert window.apply_model_button.isEnabled() is False
+
+        window.state = AppState.IDLE
+        window._update_actions()
+        assert window.model_combo.isEnabled() is True
+        assert window.apply_model_button.isEnabled() is True
+        window._settings_dialog.reject()
+
+    QTimer.singleShot(0, inspect)
+    window._open_settings_dialog()
+    window.close()
+
+
+def test_main_window_default_factory_creates_transcriber_with_model(qapp) -> None:
+    settings = Settings(model="gemini-3.5-flash-lite")
+    window, _ = make_window(qapp, settings=settings)
+    transcriber = window.transcriber_factory("test-key", settings.model)
+    assert transcriber.model == "gemini-3.5-flash-lite"
+    assert transcriber._api_key == "test-key"
+    window.close()
 
 def test_update_actions_tracks_key_text_and_busy_state(qapp) -> None:
     window, _ = make_window(
@@ -1850,8 +2174,11 @@ def test_main_window_layout_settings_fullscreen_and_grabs(qapp) -> None:
         ]
         observed["parents"] = [
             window.configure_key_button.parent(),
+            window.model_combo.parent(),
+            window.apply_model_button.parent(),
             window.configure_mouse_button.parent(),
             window.configure_keyboard_button.parent(),
+            window.install_update_button.parent(),
         ]
         dialog.reject()
 
@@ -1859,8 +2186,10 @@ def test_main_window_layout_settings_fullscreen_and_grabs(qapp) -> None:
     window._open_settings_dialog()
     assert observed["titles"] == [
         "Chave API",
+        "Modelo Gemini",
         "Atalho do mouse",
         "Atalho do teclado",
+        "Atualizações",
     ]
     assert all(isinstance(parent, QGroupBox) for parent in observed["parents"])
 
@@ -1968,4 +2297,318 @@ def test_raise_to_front_preserves_fullscreen_and_shows_hidden_window(qapp) -> No
     window._raise_to_front()
     assert window.isVisible() is True
     assert window.isMinimized() is False
+    window.close()
+
+
+def test_settings_dialog_five_groups_order_and_widgets(qapp) -> None:
+    window, _ = make_window(qapp)
+    observed: dict[str, object] = {}
+
+    def inspect() -> None:
+        dialog = window._settings_dialog
+        assert dialog is not None
+        observed["titles"] = [
+            group.title() for group in dialog.findChildren(QGroupBox)
+        ]
+        dialog.reject()
+
+    QTimer.singleShot(0, inspect)
+    window._open_settings_dialog()
+    assert observed["titles"] == [
+        "Chave API",
+        "Modelo Gemini",
+        "Atalho do mouse",
+        "Atalho do teclado",
+        "Atualizações",
+    ]
+    window.close()
+
+
+def test_settings_without_controller_shows_brew_instruction_and_disabled_button(
+    qapp,
+) -> None:
+    window, _ = make_window(qapp, homebrew_update_controller=None)
+
+    def inspect() -> None:
+        dialog = window._settings_dialog
+        assert dialog is not None
+        assert (
+            window.installed_version_label.text()
+            == f"Versão instalada: {__version__}"
+        )
+        assert (
+            window.update_status_label.text()
+            == "Instale o FalaFácil com: brew install OthonBreener/falafacil/falafacil"
+        )
+        assert not window.update_progress_bar.isVisible()
+        assert not window.install_update_button.isEnabled()
+        window._on_install_updates_clicked()
+        assert not window.install_update_button.isEnabled()
+        dialog.reject()
+
+    QTimer.singleShot(0, inspect)
+    window._open_settings_dialog()
+    window.close()
+
+
+def test_install_updates_button_triggers_controller_and_disables_duplicate_clicks(
+    qapp,
+) -> None:
+    fake_controller = FakeHomebrewUpdateController()
+    window, _ = make_window(qapp, homebrew_update_controller=fake_controller)
+
+    def inspect() -> None:
+        dialog = window._settings_dialog
+        assert dialog is not None
+        assert window.install_update_button.isEnabled()
+        assert not window.update_progress_bar.isVisible()
+        window.install_update_button.click()
+        assert fake_controller.install_calls == 1
+        assert fake_controller.running is True
+        assert not window.install_update_button.isEnabled()
+        assert window.update_progress_bar.isVisible()
+        assert window.update_progress_bar.minimum() == 0
+        assert window.update_progress_bar.maximum() == 0
+
+        # Duplicate click or direct invocation while running does nothing
+        window.install_update_button.click()
+        window._on_install_updates_clicked()
+        assert fake_controller.install_calls == 1
+
+        fake_controller.running = False
+        fake_controller.up_to_date.emit("Você já usa a versão mais recente.")
+        dialog.reject()
+
+    QTimer.singleShot(0, inspect)
+    window._open_settings_dialog()
+    window.close()
+
+
+def test_update_button_disabled_during_recording_and_transcribing(qapp) -> None:
+    fake_controller = FakeHomebrewUpdateController()
+    window, _ = make_window(qapp, homebrew_update_controller=fake_controller)
+
+    def inspect() -> None:
+        dialog = window._settings_dialog
+        assert dialog is not None
+        for busy_state in (AppState.RECORDING, AppState.TRANSCRIBING):
+            window.state = busy_state
+            window._update_actions()
+            assert not window.install_update_button.isEnabled()
+            assert window.settings_button.isEnabled()
+            assert window.installed_version_label.isVisible()
+            assert window.update_status_label.isVisible()
+
+        window.state = AppState.IDLE
+        window._update_actions()
+        assert window.install_update_button.isEnabled()
+        dialog.reject()
+
+    QTimer.singleShot(0, inspect)
+    window._open_settings_dialog()
+    window.close()
+
+
+def test_update_status_and_progress_updates_on_signals(qapp) -> None:
+    fake_controller = FakeHomebrewUpdateController()
+    window, _ = make_window(qapp, homebrew_update_controller=fake_controller)
+
+    def inspect() -> None:
+        dialog = window._settings_dialog
+        assert dialog is not None
+
+        fake_controller.status_changed.emit("Atualizando catálogo do Homebrew…")
+        assert window.update_status_label.text() == "Atualizando catálogo do Homebrew…"
+
+        fake_controller.running = False
+        fake_controller.up_to_date.emit("Você já usa a versão mais recente.")
+        assert window.update_status_label.text() == "Você já usa a versão mais recente."
+        assert not window.update_progress_bar.isVisible()
+        assert window.install_update_button.isEnabled()
+
+        fake_controller.running = True
+        fake_controller.status_changed.emit("Instalando atualização pelo Homebrew…")
+        assert (
+            window.update_status_label.text()
+            == "Instalando atualização pelo Homebrew…"
+        )
+
+        fake_controller.running = False
+        fake_controller.failed.emit(
+            "O Homebrew não conseguiu concluir a atualização. Tente novamente."
+        )
+        assert (
+            window.update_status_label.text()
+            == "O Homebrew não conseguiu concluir a atualização. Tente novamente."
+        )
+        assert not window.update_progress_bar.isVisible()
+        assert window.install_update_button.isEnabled()
+
+        dialog.reject()
+
+    QTimer.singleShot(0, inspect)
+    window._open_settings_dialog()
+    window.close()
+
+
+def test_ready_to_restart_dialog_later_choice_keeps_window_open(qapp) -> None:
+    fake_controller = FakeHomebrewUpdateController()
+    window, _ = make_window(qapp, homebrew_update_controller=fake_controller)
+
+    def handle_restart_dialog() -> None:
+        for widget in QApplication.topLevelWidgets():
+            if (
+                isinstance(widget, QDialog)
+                and widget.windowTitle() == "Atualização concluída"
+            ):
+                button_texts = [
+                    btn.text() for btn in widget.findChildren(QPushButton)
+                ]
+                assert "Reiniciar agora" in button_texts
+                assert "Mais tarde" in button_texts
+                widget.reject()
+                return
+        QTimer.singleShot(10, handle_restart_dialog)
+
+    QTimer.singleShot(0, handle_restart_dialog)
+    fake_controller.running = False
+    fake_controller.ready_to_restart.emit(
+        "Atualização instalada. Reinicie o FalaFácil para usar a nova versão."
+    )
+    qapp.processEvents()
+
+    assert fake_controller.restart_calls == 0
+    assert window.isVisible() is True
+    window.close()
+
+
+def test_ready_to_restart_dialog_restart_success_closes_window(qapp) -> None:
+    fake_controller = FakeHomebrewUpdateController(restart_result=True)
+    window, _ = make_window(qapp, homebrew_update_controller=fake_controller)
+
+    def handle_restart_dialog() -> None:
+        for widget in QApplication.topLevelWidgets():
+            if (
+                isinstance(widget, QDialog)
+                and widget.windowTitle() == "Atualização concluída"
+            ):
+                widget.accept()
+                return
+        QTimer.singleShot(10, handle_restart_dialog)
+
+    QTimer.singleShot(0, handle_restart_dialog)
+    fake_controller.running = False
+    fake_controller.ready_to_restart.emit(
+        "Atualização instalada. Reinicie o FalaFácil para usar a nova versão."
+    )
+    qapp.processEvents()
+
+    assert fake_controller.restart_calls == 1
+    assert window.isVisible() is False
+
+
+def test_ready_to_restart_dialog_restart_failure_keeps_window_open_with_error(
+    qapp,
+) -> None:
+    fake_controller = FakeHomebrewUpdateController(restart_result=False)
+    window, _ = make_window(qapp, homebrew_update_controller=fake_controller)
+
+    def handle_restart_dialog() -> None:
+        for widget in QApplication.topLevelWidgets():
+            if (
+                isinstance(widget, QDialog)
+                and widget.windowTitle() == "Atualização concluída"
+            ):
+                widget.accept()
+                return
+        QTimer.singleShot(10, handle_restart_dialog)
+
+    QTimer.singleShot(0, handle_restart_dialog)
+    fake_controller.running = False
+    fake_controller.ready_to_restart.emit(
+        "Atualização instalada. Reinicie o FalaFácil para usar a nova versão."
+    )
+    qapp.processEvents()
+
+    assert fake_controller.restart_calls == 1
+    assert window.isVisible() is True
+    assert (
+        window._update_status
+        == "O Homebrew não conseguiu concluir a atualização. Tente novamente."
+    )
+    window.close()
+
+
+def test_close_event_blocked_while_update_controller_is_running(qapp) -> None:
+    order: list[str] = []
+    store = FakeLocalStore(order_log=order)
+    bridge = FakeInputShortcutBridge(order_log=order)
+    installer = FakeShortcutInstaller(order_log=order)
+    fake_controller = FakeHomebrewUpdateController(running=True)
+    window, _ = make_window(
+        qapp,
+        local_store=store,
+        input_shortcut_bridge=bridge,
+        shortcut_service_installer=installer,
+        homebrew_update_controller=fake_controller,
+    )
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+    assert not close_event.isAccepted()
+    assert window._is_closing is False
+    assert (
+        window.status_label.text()
+        == "A atualização pelo Homebrew está em andamento. Aguarde a conclusão."
+    )
+    assert order == []
+
+    fake_controller.running = False
+    fake_controller.up_to_date.emit("Você já usa a versão mais recente.")
+    window.close()
+    assert order == ["installer", "bridge", "store"]
+
+
+def test_settings_dialog_closed_during_running_receives_signals_and_reopening_reflects_state(
+    qapp,
+) -> None:
+    fake_controller = FakeHomebrewUpdateController()
+    window, _ = make_window(qapp, homebrew_update_controller=fake_controller)
+
+    def start_and_close_dialog() -> None:
+        dialog = window._settings_dialog
+        assert dialog is not None
+        window.install_update_button.click()
+        dialog.reject()
+
+    QTimer.singleShot(0, start_and_close_dialog)
+    window._open_settings_dialog()
+    assert fake_controller.running is True
+    assert window._settings_dialog is None
+
+    # Signals arrive while settings dialog is closed - must not crash
+    fake_controller.status_changed.emit("Verificando versão disponível…")
+    fake_controller.running = False
+    fake_controller.failed.emit(
+        "O Homebrew não conseguiu concluir a atualização. Tente novamente."
+    )
+
+    observed: dict[str, object] = {}
+
+    def inspect_reopened() -> None:
+        dialog = window._settings_dialog
+        assert dialog is not None
+        observed["status"] = window.update_status_label.text()
+        observed["progress_visible"] = window.update_progress_bar.isVisible()
+        observed["button_enabled"] = window.install_update_button.isEnabled()
+        dialog.reject()
+
+    QTimer.singleShot(0, inspect_reopened)
+    window._open_settings_dialog()
+    assert (
+        observed["status"]
+        == "O Homebrew não conseguiu concluir a atualização. Tente novamente."
+    )
+    assert observed["progress_visible"] is False
+    assert observed["button_enabled"] is True
     window.close()

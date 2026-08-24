@@ -58,10 +58,20 @@ def test_transcriber_sends_inline_wav_and_returns_trimmed_text() -> None:
     result = transcriber.transcribe(audio)
 
     assert result == "Olá, terminal!"
+    assert len(client.interactions.calls) == 1
     call = client.interactions.calls[0]
+    assert set(call.keys()) == {"model", "input"}
+    assert "cached_content" not in call
+    assert "previous_interaction_id" not in call
+    assert "file" not in call
+    assert "files" not in call
+    assert "batch" not in call
     assert call["model"] == DEFAULT_MODEL
+    assert len(call["input"]) == 2
+    assert call["input"][0] == {"type": "text", "text": PROMPT}
     assert "português do Brasil" in call["input"][0]["text"]
     audio_part = call["input"][1]
+    assert audio_part["type"] == "audio"
     assert audio_part["mime_type"] == "audio/wav"
     assert base64.b64decode(audio_part["data"]) == audio
     debug = transcriber.last_debug()
