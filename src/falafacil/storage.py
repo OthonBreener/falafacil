@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from PySide6.QtCore import QStandardPaths
 
+from .shortcuts import normalize_button_name
 
 class LocalStoreError(RuntimeError):
     """Erro em operações do armazenamento local SQLite."""
@@ -151,6 +152,10 @@ class LocalStore:
             )
             cursor.execute("PRAGMA user_version = 1;")
             self._conn.commit()
+        elif version == 1:
+            pass
+        else:
+            raise LocalStoreError(f"Versão de schema incompatível: {version}.")
 
     def _ensure_open(self) -> sqlite3.Connection:
         if self._closed or self._conn is None:
@@ -192,6 +197,53 @@ class LocalStore:
                 f"Erro ao salvar preferência de microfone: {exc}"
             ) from exc
 
+    def get_recording_mouse_button(self) -> str | None:
+        conn = self._ensure_open()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT value FROM preferences WHERE key = 'recording_mouse_button';"
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return str(row[0])
+        except sqlite3.Error:
+            raise LocalStoreError(
+                "Erro ao ler preferência de atalho do mouse."
+            ) from None
+
+    def save_recording_mouse_button(self, button_name: str) -> None:
+        conn = self._ensure_open()
+        canonical = normalize_button_name(button_name)
+        if canonical is None:
+            raise LocalStoreError("Identificador de botão do mouse inválido.")
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO preferences (key, value)
+                    VALUES ('recording_mouse_button', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                    """,
+                    (canonical,),
+                )
+        except sqlite3.Error:
+            raise LocalStoreError(
+                "Erro ao salvar preferência de atalho do mouse."
+            ) from None
+
+    def clear_recording_mouse_button(self) -> None:
+        conn = self._ensure_open()
+        try:
+            with conn:
+                conn.execute(
+                    "DELETE FROM preferences WHERE key = 'recording_mouse_button';"
+                )
+        except sqlite3.Error:
+            raise LocalStoreError(
+                "Erro ao remover preferência de atalho do mouse."
+            ) from None
     def record_token_usage(
         self,
         model: str,

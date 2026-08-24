@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sqlite3
-
+from typing import Any
 import pytest
 
 from falafacil.storage import LocalStore, LocalStoreError, TokenTotals, TokenUsageRecord
@@ -70,6 +70,120 @@ def test_invalid_microphone_identity_raises_error(tmp_path: Path) -> None:
             store.save_last_microphone_identity("")
         with pytest.raises(LocalStoreError, match="inválida"):
             store.save_last_microphone_identity("   ")
+
+def test_recording_mouse_button_persistence_and_reopen(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    with LocalStore(db_path) as store:
+        assert store.get_recording_mouse_button() is None
+        store.save_recording_mouse_button("x1")
+        assert store.get_recording_mouse_button() == "x1"
+
+        # Overwrite with normalized variant
+        store.save_recording_mouse_button("Button.right")
+        assert store.get_recording_mouse_button() == "right"
+
+    # Reopen and check persisted button
+    with LocalStore(db_path) as store2:
+        assert store2.get_recording_mouse_button() == "right"
+        store2.clear_recording_mouse_button()
+        assert store2.get_recording_mouse_button() is None
+
+    # Reopen and check that clear persisted
+    with LocalStore(db_path) as store3:
+        assert store3.get_recording_mouse_button() is None
+
+
+def test_invalid_recording_mouse_button_raises_error(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    with LocalStore(db_path) as store:
+        for invalid in ("", "   ", "unknown", "button.unknown", "left right", "@invalid", "a" * 65):
+            with pytest.raises(LocalStoreError, match="inválido"):
+                store.save_recording_mouse_button(invalid)
+
+
+
+class _FailingConnection:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def cursor(self) -> Any:
+        error = self._error
+
+        class FailingCursor:
+            def execute(self, *args: Any, **kwargs: Any) -> Any:
+                raise error
+
+        return FailingCursor()
+
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        raise self._error
+
+    def __enter__(self) -> _FailingConnection:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        return None
+
+    def close(self) -> None:
+        pass
+
+
+def test_recording_mouse_button_storage_errors_sanitize_raw_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    leak_marker = "SYNTHETIC_SQLITE_ERROR_LEAK_SECRET_12345"
+
+    with LocalStore(db_path) as store:
+        failing_conn = _FailingConnection(sqlite3.OperationalError(leak_marker))
+
+        # 1. Erro ao ler preferência de atalho do mouse
+        monkeypatch.setattr(store, "_conn", failing_conn)
+        with pytest.raises(LocalStoreError) as exc_info:
+            store.get_recording_mouse_button()
+        assert str(exc_info.value) == "Erro ao ler preferência de atalho do mouse."
+        assert leak_marker not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+        monkeypatch.undo()
+
+        # 2. Erro ao salvar preferência de atalho do mouse
+        monkeypatch.setattr(store, "_conn", failing_conn)
+        with pytest.raises(LocalStoreError) as exc_info:
+            store.save_recording_mouse_button("x1")
+        assert str(exc_info.value) == "Erro ao salvar preferência de atalho do mouse."
+        assert leak_marker not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+        monkeypatch.undo()
+
+        # 3. Erro ao remover preferência de atalho do mouse
+        monkeypatch.setattr(store, "_conn", failing_conn)
+        with pytest.raises(LocalStoreError) as exc_info:
+            store.clear_recording_mouse_button()
+        assert str(exc_info.value) == "Erro ao remover preferência de atalho do mouse."
+        assert leak_marker not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+        monkeypatch.undo()
+
+
+def test_mouse_button_coexists_with_microphone_and_token_history(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    with LocalStore(db_path) as store:
+        store.save_last_microphone_identity("mic-primary")
+        store.save_recording_mouse_button("x2")
+        store.record_token_usage(
+            "model",
+            TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+            "success",
+        )
+
+        # Clear only mouse button
+        store.clear_recording_mouse_button()
+        assert store.get_recording_mouse_button() is None
+        assert store.get_last_microphone_identity() == "mic-primary"
+        assert len(store.get_token_usage_history()) == 1
 
 
 def test_token_totals_empty_history_returns_zeros(tmp_path: Path) -> None:
@@ -201,6 +315,15 @@ def test_closed_store_raises_error(tmp_path: Path) -> None:
 
     with pytest.raises(LocalStoreError, match="fechado"):
         store.get_token_usage_history()
+
+    with pytest.raises(LocalStoreError, match="fechado"):
+        store.get_recording_mouse_button()
+
+    with pytest.raises(LocalStoreError, match="fechado"):
+        store.save_recording_mouse_button("x1")
+
+    with pytest.raises(LocalStoreError, match="fechado"):
+        store.clear_recording_mouse_button()
 
 
 def test_token_usage_history_empty(tmp_path: Path) -> None:
@@ -357,3 +480,33 @@ def test_token_usage_history_boundary_limit_100_and_101(tmp_path: Path) -> None:
 
         with pytest.raises(LocalStoreError, match="Limite inválido"):
             store.get_token_usage_history(limit=101)
+
+def test_incompatible_schema_version_raises_error_without_file_mutation(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    # Criar banco pré-existente com versão futura (ex.: 2) e tabela customizada
+    raw_conn = sqlite3.connect(str(db_path))
+    raw_conn.execute("PRAGMA user_version = 2;")
+    raw_conn.execute("CREATE TABLE future_schema (data TEXT);")
+    raw_conn.execute("INSERT INTO future_schema VALUES ('dados_preservados');")
+    raw_conn.commit()
+    raw_conn.close()
+
+    # LocalStore deve recusar versão futura com LocalStoreError sanitizado
+    with pytest.raises(LocalStoreError, match="Versão de schema incompatível: 2"):
+        LocalStore(db_path)
+
+    # Confirmar ausência de mutação no arquivo SQLite
+    verify_conn = sqlite3.connect(str(db_path))
+    version = verify_conn.execute("PRAGMA user_version;").fetchone()[0]
+    assert version == 2
+
+    tables = [
+        row[0]
+        for row in verify_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+        ).fetchall()
+    ]
+    assert tables == ["future_schema"]
+    data = verify_conn.execute("SELECT data FROM future_schema;").fetchall()
+    assert data == [("dados_preservados",)]
+    verify_conn.close()

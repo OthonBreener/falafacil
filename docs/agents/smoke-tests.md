@@ -18,7 +18,8 @@ O `testador` executa, na raiz do repositório, os comandos abaixo e retorna some
 
    ```bash
    QT_QPA_PLATFORM=offscreen poetry run pytest -q \
-     tests/test_config.py tests/test_credentials.py tests/test_transcription.py \
+     tests/test_shortcuts.py tests/test_storage.py tests/test_config.py \
+     tests/test_credentials.py tests/test_transcription.py \
      tests/test_ui.py tests/test_packaging.py
    ```
 
@@ -36,7 +37,7 @@ A ordem é compilação, testes focados e suíte completa. Se o escopo mudar áu
 
 Para uma alteração somente documental, verificar os links relativos novos e confirmar que cada promessa aponta para código, teste ou contrato existente; ainda assim, executar nesta ordem `compileall`, os testes focados em ambiente Qt sem janela real e a suíte determinística completa. Não é necessário executar smoke de microfone, rede, Secret Service ou X11.
 
-### UI, áudio, transcrição ou terminal
+### UI, áudio, transcrição, atalhos de mouse ou terminal
 
 Além dos comandos gerais, validar o fluxo crítico afetado com os testes determinísticos e fakes disponíveis. A validação deve respeitar estes limites de `AGENTS.md`:
 
@@ -44,13 +45,16 @@ Além dos comandos gerais, validar o fluxo crítico afetado com os testes determ
 - envio ao Gemini somente depois da ação explícita de envio, sem bloquear a interface;
 - worker Qt sem acesso a widgets fora do thread principal;
 - chave ausente, erro de captura, resposta vazia e falha de integração deixam a janela recuperável;
+- atalho global de mouse press-only em X11 com `DISPLAY`, alternando gravação via `_toggle_recording` e ignorando solturas;
+- persistência e restauração do botão de mouse no `LocalStore` (schema v1), com fail-soft em falha de escrita;
+- fallback seguro em Wayland ou sem `DISPLAY`: listener global desativado, mensagem sanitizada e operação manual/tecla `Space` preservadas;
+- fechamento ordenado com parada do bridge de mouse antes do encerramento do `LocalStore`;
 - limite de payload inline e ausência de segredo em métricas, logs ou mensagens;
 - terminal somente em X11, com janela ativa e processo permitido.
 
-Smoke manual com recursos reais só é necessário quando o escopo ou a evidência pedirem essa confirmação e o ambiente fornecer microfone, backend QtMultimedia, credencial e, para terminal X11, `xdotool`. Não inventar validação de rede ou hardware ausente.
+Smoke manual com recursos reais só é necessário quando o escopo ou a evidência pedirem essa confirmação e o ambiente fornecer microfone, backend QtMultimedia, credencial e, conforme a integração: `DISPLAY` e `xdotool` para terminal X11, ou `DISPLAY` e mouse com botões físicos compatíveis para atalho global de mouse X11. O smoke físico de atalho de mouse é opcional e só pode ser executado se o ambiente fornecer X11, `DISPLAY` e mouse real; na ausência desses requisitos, o testador registra a indisponibilidade e baseia a aprovação exclusivamente nas provas determinísticas com fakes, sem declarar falsamente smoke físico como `PASS`.
 
 A regra de terminal é obrigatória: em Wayland ou sem `xdotool`, `Copiar texto` continua sendo o fallback. `TerminalBridge` não executa comando, não envia Enter e não promete colagem automática Wayland. Em X11, qualquer teste de `Enviar ao terminal` deve confirmar apenas clipboard e `Ctrl+Shift+V` na janela reconhecida, sem pressionar Enter.
-
 ### `packaging/` ou scripts de instalação
 
 Quando a alteração tocar `packaging/` ou `scripts/`, executar também o gate do bundle:
@@ -73,7 +77,7 @@ O gate passa somente quando todos os critérios aplicáveis forem observáveis:
 - `compileall`, testes focados e `pytest` completo passam;
 - o fluxo crítico afetado foi coberto por teste/fake ou smoke manual autorizado;
 - o bundle foi construído e iniciado quando `packaging/` ou scripts foram afetados;
-- fallback Wayland/ausência de `xdotool` preserva cópia para clipboard, sem Enter e sem execução de comandos;
+- fallback Wayland/ausência de `xdotool`/ausência de `DISPLAY` preserva cópia para clipboard, operação manual e atalho `Space`, sem Enter, sem execução de comandos e sem quebra da janela;
 - nenhum segredo aparece em código, testes, saída, relatório, desktop entry ou artefato;
 - o resultado do `testador` contém somente `PASS` ou `FAIL` no formato obrigatório;
 - o `revisor` recebe evidência suficiente e responde `APROVADO` somente após eliminar achados e validações ausentes.

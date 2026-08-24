@@ -8,10 +8,15 @@ import numpy as np
 from PySide6.QtCore import (
     QByteArray,
     QBuffer,
+    QEvent,
     QIODevice,
+    QObject,
+    QPoint,
+    QRect,
     QRectF,
     QSize,
     QThread,
+    QTimer,
     QUrl,
     Qt,
     Slot,
@@ -21,6 +26,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QKeySequence,
+    QMouseEvent,
     QPainter,
     QPaintEvent,
     QPen,
@@ -28,6 +34,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
+    QAbstractButton,
+    QAbstractScrollArea,
     QApplication,
     QComboBox,
     QDialog,
@@ -42,7 +50,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
 from .audio import (
     AudioCapture,
     AudioDevice,
@@ -54,6 +61,12 @@ from .audio import (
 from .config import Settings
 from .credentials import ApiKeyStore, CredentialStoreError
 from .storage import LocalStore, LocalStoreError, TokenTotals, TokenUsageRecord
+from .shortcuts import (
+    BACKEND_FAILURE_MESSAGE,
+    MouseShortcutBridge,
+    SESSION_UNAVAILABLE_MESSAGE,
+    normalize_button_name,
+)
 from .terminal import TerminalBridge, TerminalBridgeError
 from .transcription import GeminiTranscriber, TranscriptionDebug, TranscriptionWorker
 
@@ -75,6 +88,25 @@ def _default_media_player_factory(parent: QWidget) -> tuple[QMediaPlayer, QAudio
     audio_output = QAudioOutput(parent)
     player.setAudioOutput(audio_output)
     return player, audio_output
+
+def _format_mouse_button_label(button_name: str | None) -> str:
+    if not button_name:
+        return "Desativado"
+    canonical = button_name.lower().strip()
+    labels = {
+        "left": "Botão esquerdo",
+        "right": "Botão direito",
+        "middle": "Botão do meio",
+        "x1": "Botão 4 (x1)",
+        "x2": "Botão 5 (x2)",
+    }
+    return labels.get(canonical, f"Botão {canonical}")
+
+def _sanitize_mouse_shortcut_error(message: str | None) -> str:
+    if message == SESSION_UNAVAILABLE_MESSAGE:
+        return SESSION_UNAVAILABLE_MESSAGE
+    return BACKEND_FAILURE_MESSAGE
+
 
 
 class TokenUsageChart(QWidget):
@@ -419,6 +451,142 @@ class TokenUsageChart(QWidget):
                 )
 
         self.last_rendered_bar_rects = tuple(rendered_bars)
+class _ShortcutCaptureRelay(QObject):
+    """Receptor seguro de eventos de captura no thread principal da UI."""
+
+    def __init__(
+        self,
+        dialog: QDialog,
+        bridge: MouseShortcutBridge | None = None,
+        capture_generation: int | None = None,
+        disable_button: QPushButton | None = None,
+        cancel_button: QPushButton | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._dialog = dialog
+        self._bridge = bridge
+        self._capture_generation = capture_generation
+        self._disable_button = disable_button
+        self._cancel_button = cancel_button
+        self._is_terminal = False
+        self._pressed_control: str | None = None
+        self.captured_button: str | None = None
+        self.confirmed = False
+        self.is_disable = False
+        self.handled_thread: QThread | None = None
+
+    def _is_control_at_pos(self, button: QPushButton | None, pos: QPoint) -> bool:
+        if button is None or not button.isVisible() or not button.isEnabled():
+            return False
+        global_origin = button.mapToGlobal(QPoint(0, 0))
+        rect = QRect(global_origin, button.size())
+        if not rect.contains(pos):
+            return False
+        widget_at_pos = QApplication.widgetAt(pos)
+        if widget_at_pos is not None:
+            w: QWidget | None = widget_at_pos
+            while w is not None:
+                if w is button:
+                    return True
+                w = w.parentWidget()
+            return False
+        return QApplication.platformName() == "offscreen"
+
+    @Slot(int, str, int, int)
+    def on_button_captured_event(self, gen: int, button_name: str, x: int, y: int) -> None:
+        if self._is_terminal:
+            return
+        if self._capture_generation is not None and gen != self._capture_generation:
+            return
+        if self._bridge is not None and getattr(self._bridge, "generation", None) != gen:
+            return
+        canonical = normalize_button_name(button_name)
+        if canonical is None:
+            return
+        if canonical == "left":
+            pos = QPoint(x, y)
+            if self._is_control_at_pos(self._cancel_button, pos) or self._is_control_at_pos(self._disable_button, pos):
+                return
+            if self._pressed_control is not None:
+                return
+        if self._capture_generation is None:
+            self._capture_generation = gen
+        self._is_terminal = True
+        self.handled_thread = QThread.currentThread()
+        self.captured_button = canonical
+        self.confirmed = True
+        self._dialog.accept()
+    def on_disable_pressed(self) -> None:
+        if self._is_terminal:
+            return
+        self._pressed_control = "disable"
+        if self._bridge is not None:
+            self._bridge.stop()
+
+    @Slot()
+    def on_disable_released(self) -> None:
+        if self._is_terminal:
+            return
+        QTimer.singleShot(0, self._cleanup_unclicked_control)
+
+    @Slot()
+    def on_disable_clicked(self) -> None:
+        if self._is_terminal:
+            return
+        self._is_terminal = True
+        self._pressed_control = None
+        if self._bridge is not None:
+            self._bridge.stop()
+        self.handled_thread = QThread.currentThread()
+        self.is_disable = True
+        self.confirmed = True
+        self._dialog.accept()
+
+    @Slot()
+    def on_disable(self) -> None:
+        self.on_disable_clicked()
+
+    @Slot()
+    def on_cancel_pressed(self) -> None:
+        if self._is_terminal:
+            return
+        self._pressed_control = "cancel"
+        if self._bridge is not None:
+            self._bridge.stop()
+
+    @Slot()
+    def on_cancel_released(self) -> None:
+        if self._is_terminal:
+            return
+        QTimer.singleShot(0, self._cleanup_unclicked_control)
+
+    @Slot()
+    def on_cancel_clicked(self) -> None:
+        if self._is_terminal:
+            return
+        self._is_terminal = True
+        self._pressed_control = None
+        if self._bridge is not None:
+            self._bridge.stop()
+        self.handled_thread = QThread.currentThread()
+        self.confirmed = False
+        self._dialog.reject()
+
+    @Slot()
+    def on_cancel(self) -> None:
+        self.on_cancel_clicked()
+
+    @Slot()
+    def _cleanup_unclicked_control(self) -> None:
+        if self._is_terminal:
+            return
+        if self._pressed_control is not None:
+            self._pressed_control = None
+            if self._bridge is not None and not self._is_terminal:
+                started = self._bridge.begin_capture()
+                if started:
+                    self._capture_generation = getattr(self._bridge, "generation", None)
 
 class MainWindow(QMainWindow):
     def __init__(
@@ -432,6 +600,7 @@ class MainWindow(QMainWindow):
         microphone_provider: Callable[[], tuple[AudioDevice, ...]] | None = None,
         media_player_factory: MediaPlayerFactory | None = None,
         local_store: LocalStore | None = None,
+        mouse_shortcut_bridge: MouseShortcutBridge | None = None,
     ) -> None:
         super().__init__()
         self.settings = settings
@@ -454,15 +623,31 @@ class MainWindow(QMainWindow):
         self._microphone_refreshing = False
         self._microphone_available = False
 
+        self.mouse_shortcut_bridge = mouse_shortcut_bridge or MouseShortcutBridge(parent=self)
+        self._active_mouse_button: str | None = None
+        self._is_configuring_shortcut = False
+        self._dialog_open = False
+        self._is_closing = False
+        self._local_press_record: tuple[int, QRect | None, QWidget | None] | None = None
+        self._startup_mouse_diagnostic: str | None = None
+        self.mouse_shortcut_bridge._activated_event.connect(
+            self._on_mouse_shortcut_activated_event
+        )
+        self.mouse_shortcut_bridge.failed.connect(self._on_mouse_shortcut_failed)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self.setWindowTitle("FalaFácil")
         self.resize(760, 520)
         self._media_player, self._audio_output = self._media_player_factory(self)
         self._connect_media_signals()
         self._build_ui()
+        self._restore_mouse_shortcut()
         self._refresh_microphones()
         self._refresh_token_usage_chart()
         self._update_actions()
-
+        if self._startup_mouse_diagnostic is not None:
+            self.status_label.setText(self._startup_mouse_diagnostic)
     def _connect_media_signals(self) -> None:
         for signal_name, slot in (
             ("mediaStatusChanged", self._on_media_status_changed),
@@ -533,6 +718,18 @@ class MainWindow(QMainWindow):
         self.configure_key_button.clicked.connect(self._configure_api_key)
         buttons.addWidget(self.configure_key_button)
 
+        self.configure_shortcut_button = QPushButton("Configurar atalho de gravação", self)
+        self.configure_shortcut_button.setToolTip(
+            "Configura um botão do mouse como atalho global de gravação"
+        )
+        self.configure_shortcut_button.pressed.connect(self._on_configure_shortcut_pressed)
+        self.configure_shortcut_button.released.connect(self._on_configure_shortcut_released)
+        self.configure_shortcut_button.clicked.connect(self._configure_recording_shortcut)
+        buttons.addWidget(self.configure_shortcut_button)
+
+        self.shortcut_indicator_label = QLabel(self)
+        buttons.addWidget(self.shortcut_indicator_label)
+
         self.debug_button = QPushButton("Mostrar debug", self)
         self.debug_button.setCheckable(True)
         self.debug_button.clicked.connect(self._toggle_debug_panel)
@@ -548,6 +745,7 @@ class MainWindow(QMainWindow):
         self.copy_shortcut = QShortcut(QKeySequence("Ctrl+Shift+C"), self)
         self.copy_shortcut.activated.connect(self.copy_text)
         self.record_button.setFocus()
+        self._install_interactive_event_filters()
 
     def _build_debug_dock(self) -> None:
         self.debug_dock = QDockWidget("Debug da captura e transcrição", self)
@@ -563,7 +761,127 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.debug_dock)
         self.debug_dock.visibilityChanged.connect(self._sync_debug_button)
         self.debug_dock.setVisible(False)
+    def _install_interactive_event_filters(self) -> None:
+        candidate_widgets: list[QWidget] = []
+        for attr_name in (
+            "configure_shortcut_button",
+            "record_button",
+            "play_audio_button",
+            "send_to_gemini_button",
+            "send_button",
+            "copy_button",
+            "clear_text_button",
+            "clear_button",
+            "terminal_button",
+            "configure_key_button",
+            "api_key_button",
+            "refresh_microphones_button",
+            "detect_button",
+            "debug_button",
+            "microphone_combo",
+            "editor",
+        ):
+            widget = getattr(self, attr_name, None)
+            if isinstance(widget, QWidget) and widget not in candidate_widgets:
+                candidate_widgets.append(widget)
 
+        for widget_type in (QAbstractButton, QComboBox, QLineEdit, QPlainTextEdit, QAbstractScrollArea):
+            for child in self.findChildren(widget_type):
+                if isinstance(child, QWidget) and child not in candidate_widgets:
+                    candidate_widgets.append(child)
+
+        for widget in candidate_widgets:
+            widget.installEventFilter(self)
+            if isinstance(widget, QAbstractScrollArea):
+                viewport = widget.viewport()
+                if viewport is not None:
+                    viewport.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if getattr(self, "_is_closing", False):
+            return super().eventFilter(watched, event)
+        if event is None:
+            return super().eventFilter(watched, event)
+        try:
+            event_type = event.type()
+        except Exception:
+            return super().eventFilter(watched, event)
+
+        if event_type in (QEvent.Type.Close, QEvent.Close):
+            self._local_press_record = None
+        elif event_type in (QEvent.Type.MouseButtonPress, QEvent.MouseButtonPress):
+            if isinstance(event, QMouseEvent) and event.button() == Qt.MouseButton.LeftButton:
+                active_button = getattr(self, "_active_mouse_button", None)
+                if normalize_button_name(active_button) == "left":
+                    if isinstance(watched, QWidget):
+                        w: QWidget | None = watched
+                        belongs_to_window = False
+                        while w is not None:
+                            if w is self:
+                                belongs_to_window = True
+                                break
+                            parent_widget = getattr(w, "parentWidget", None)
+                            next_w = parent_widget() if callable(parent_widget) else None
+                            if next_w is None:
+                                parent_obj = getattr(w, "parent", None)
+                                parent_val = parent_obj() if callable(parent_obj) else None
+                                if isinstance(parent_val, QWidget):
+                                    next_w = parent_val
+                                elif parent_val is self:
+                                    belongs_to_window = True
+                                    break
+                            w = next_w
+
+                        if belongs_to_window:
+                            control: QWidget | None = watched
+                            if not isinstance(
+                                control,
+                                (
+                                    QAbstractButton,
+                                    QComboBox,
+                                    QLineEdit,
+                                    QPlainTextEdit,
+                                    QDialogButtonBox,
+                                    QAbstractScrollArea,
+                                ),
+                            ):
+                                parent_fn = getattr(watched, "parentWidget", None)
+                                parent = parent_fn() if callable(parent_fn) else None
+                                if isinstance(
+                                    parent,
+                                    (
+                                        QAbstractButton,
+                                        QComboBox,
+                                        QLineEdit,
+                                        QPlainTextEdit,
+                                        QDialogButtonBox,
+                                        QAbstractScrollArea,
+                                    ),
+                                ):
+                                    control = parent
+                            if isinstance(
+                                control,
+                                (
+                                    QAbstractButton,
+                                    QComboBox,
+                                    QLineEdit,
+                                    QPlainTextEdit,
+                                    QDialogButtonBox,
+                                    QAbstractScrollArea,
+                                ),
+                            ):
+                                is_enabled = getattr(control, "isEnabled", None)
+                                enabled = is_enabled() if callable(is_enabled) else True
+                                is_visible = getattr(control, "isVisible", None)
+                                visible = is_visible() if callable(is_visible) else True
+                                if enabled and visible:
+                                    current_gen = getattr(self.mouse_shortcut_bridge, "generation", 0)
+                                    origin = control.mapToGlobal(QPoint(0, 0))
+                                    rect = QRect(origin, control.size())
+                                    self._local_press_record = (current_gen, rect, control)
+                        else:
+                            self._local_press_record = None
+        return super().eventFilter(watched, event)
     def _debug_text_block(self, layout: QVBoxLayout, title: str) -> QPlainTextEdit:
         layout.addWidget(QLabel(title, self))
         editor = QPlainTextEdit(self)
@@ -727,6 +1045,357 @@ class MainWindow(QMainWindow):
             )
         else:
             self.status_label.setText("Chave API configurada com sucesso.")
+
+    def _update_shortcut_indicator(self) -> None:
+        button_text = _format_mouse_button_label(self._active_mouse_button)
+        self.shortcut_indicator_label.setText(f"Atalho do mouse: {button_text}")
+        self.configure_shortcut_button.setToolTip(
+            f"Configura um botão do mouse como atalho global de gravação (atual: {button_text})"
+        )
+
+    def _restore_or_clear_mouse_button(self, button_name: str | None) -> bool:
+        """Tenta ativar um botão de atalho ou limpa o estado ativo em caso de falha.
+
+        Retorna True se o botão foi ativado com sucesso ou se button_name é None.
+        Em caso de falha de inicialização, limpa _active_mouse_button e o indicador,
+        mantendo a preferência persistida inalterada e exibindo status sanitizado.
+        """
+        if button_name is None:
+            self.mouse_shortcut_bridge.stop()
+            self._active_mouse_button = None
+            self._update_shortcut_indicator()
+            return True
+
+        canonical = normalize_button_name(button_name)
+        if canonical is None:
+            self._active_mouse_button = None
+            self._update_shortcut_indicator()
+            error_msg = _sanitize_mouse_shortcut_error(
+                self.mouse_shortcut_bridge.last_error
+            )
+            self.status_label.setText(error_msg)
+            return False
+
+        success = self.mouse_shortcut_bridge.start(canonical)
+        if success:
+            self._active_mouse_button = canonical
+            self._update_shortcut_indicator()
+            return True
+
+        self._active_mouse_button = None
+        self._update_shortcut_indicator()
+        error_msg = _sanitize_mouse_shortcut_error(
+            self.mouse_shortcut_bridge.last_error
+        )
+        self.status_label.setText(error_msg)
+        return False
+
+    def _restore_mouse_shortcut(self) -> None:
+        if self.local_store is None:
+            self._update_shortcut_indicator()
+            return
+        saved_button: str | None = None
+        try:
+            saved_button = self.local_store.get_recording_mouse_button()
+        except Exception:
+            self._active_mouse_button = None
+            self._update_shortcut_indicator()
+            self._startup_mouse_diagnostic = (
+                "Não foi possível ler preferência de atalho do mouse."
+            )
+            self.status_label.setText(self._startup_mouse_diagnostic)
+            return
+
+        if saved_button:
+            if not self._restore_or_clear_mouse_button(saved_button):
+                self._startup_mouse_diagnostic = self.status_label.text()
+        else:
+            self._active_mouse_button = None
+            self._update_shortcut_indicator()
+    def _acquire_recording_mouse_button(self) -> tuple[str | None, bool]:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Configurar atalho de gravação")
+        layout = QVBoxLayout(dialog)
+
+        explanation = QLabel(
+            "Pressione o botão do mouse que deseja usar como atalho global de gravação.",
+            dialog,
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        status_prompt = QLabel("Aguardando clique do mouse…", dialog)
+        layout.addWidget(status_prompt)
+
+        button_row = QHBoxLayout()
+        disable_button = QPushButton("Desativar atalho", dialog)
+        cancel_button = QPushButton("Cancelar", dialog)
+        button_row.addWidget(disable_button)
+        button_row.addWidget(cancel_button)
+        layout.addLayout(button_row)
+
+        relay = _ShortcutCaptureRelay(
+            dialog,
+            bridge=self.mouse_shortcut_bridge,
+            capture_generation=None,
+            disable_button=disable_button,
+            cancel_button=cancel_button,
+            parent=dialog,
+        )
+        disable_button.pressed.connect(relay.on_disable_pressed)
+        disable_button.released.connect(relay.on_disable_released)
+        disable_button.clicked.connect(relay.on_disable)
+        cancel_button.pressed.connect(relay.on_cancel_pressed)
+        cancel_button.released.connect(relay.on_cancel_released)
+        cancel_button.clicked.connect(relay.on_cancel)
+        self.mouse_shortcut_bridge._button_captured_event.connect(
+            relay.on_button_captured_event, Qt.ConnectionType.QueuedConnection
+        )
+
+        self.mouse_shortcut_bridge.stop()
+        started = self.mouse_shortcut_bridge.begin_capture()
+        if not started:
+            try:
+                self.mouse_shortcut_bridge._button_captured_event.disconnect(
+                    relay.on_button_captured_event
+                )
+            except Exception:
+                pass
+            return None, False
+        capture_gen = getattr(self.mouse_shortcut_bridge, "generation", None)
+        if relay._capture_generation is None:
+            relay._capture_generation = capture_gen
+
+        try:
+            dialog.exec()
+        finally:
+            try:
+                self.mouse_shortcut_bridge._button_captured_event.disconnect(
+                    relay.on_button_captured_event
+                )
+            except Exception:
+                pass
+            self.mouse_shortcut_bridge.stop()
+        if relay.is_disable:
+            return None, True
+        if relay.confirmed and relay.captured_button is not None:
+            return relay.captured_button, True
+        return None, False
+
+    @Slot()
+    def _on_configure_shortcut_pressed(self) -> None:
+        if getattr(self, "_is_closing", False) or getattr(self, "state", None) in (AppState.RECORDING, AppState.TRANSCRIBING):
+            return
+        self._is_configuring_shortcut = True
+        self._local_press_record = None
+        self.mouse_shortcut_bridge.stop()
+    @Slot()
+    def _on_configure_shortcut_released(self) -> None:
+        if getattr(self, "_is_closing", False) or getattr(self, "_dialog_open", False):
+            return
+        QTimer.singleShot(0, self._cleanup_unclicked_configure_shortcut)
+
+    @Slot()
+    def _cleanup_unclicked_configure_shortcut(self) -> None:
+        if getattr(self, "_is_closing", False) or getattr(self, "_dialog_open", False):
+            return
+        if self._is_configuring_shortcut:
+            self._is_configuring_shortcut = False
+            if self._active_mouse_button is not None:
+                self._restore_or_clear_mouse_button(self._active_mouse_button)
+
+    @Slot()
+    def _configure_recording_shortcut(self) -> None:
+        if getattr(self, "_is_closing", False) or getattr(self, "state", None) in (AppState.RECORDING, AppState.TRANSCRIBING):
+            return
+
+        self._is_configuring_shortcut = True
+        self._dialog_open = True
+        self.mouse_shortcut_bridge.stop()
+        try:
+            previous_button = self._active_mouse_button
+            button_name, accepted = self._acquire_recording_mouse_button()
+            if not accepted:
+                if previous_button is not None:
+                    self._restore_or_clear_mouse_button(previous_button)
+                return
+
+            if button_name is None:
+                self.mouse_shortcut_bridge.stop()
+                self._active_mouse_button = None
+                self._update_shortcut_indicator()
+
+                persistence_failed = False
+                if self.local_store is not None:
+                    try:
+                        self.local_store.clear_recording_mouse_button()
+                    except Exception:
+                        persistence_failed = True
+
+                if persistence_failed:
+                    self.status_label.setText(
+                        "Atalho desativado nesta sessão; não foi possível persistir."
+                    )
+                else:
+                    self.status_label.setText("Atalho de gravação desativado.")
+                return
+
+            started = self.mouse_shortcut_bridge.start(button_name)
+            if not started:
+                if previous_button is not None:
+                    if self._restore_or_clear_mouse_button(previous_button):
+                        error_msg = _sanitize_mouse_shortcut_error(
+                            self.mouse_shortcut_bridge.last_error
+                        )
+                        self.status_label.setText(error_msg)
+                else:
+                    self._active_mouse_button = None
+                    self._update_shortcut_indicator()
+                    error_msg = _sanitize_mouse_shortcut_error(
+                        self.mouse_shortcut_bridge.last_error
+                    )
+                    self.status_label.setText(error_msg)
+                return
+
+            self._active_mouse_button = button_name
+            self._update_shortcut_indicator()
+
+            persistence_unavailable = self.local_store is None
+            persistence_failed = False
+            if self.local_store is not None:
+                try:
+                    self.local_store.save_recording_mouse_button(button_name)
+                except Exception:
+                    persistence_failed = True
+
+            if persistence_unavailable or persistence_failed:
+                self.status_label.setText(
+                    "Atalho configurado nesta sessão; não foi possível persistir."
+                )
+            else:
+                self.status_label.setText(
+                    f"Atalho de gravação configurado para {_format_mouse_button_label(button_name)}."
+                )
+        finally:
+            self._dialog_open = False
+            self._is_configuring_shortcut = False
+            self._local_press_record = None
+    @Slot(int, int, int)
+    def _on_mouse_shortcut_activated_event(self, gen: int, x: int, y: int) -> None:
+        if getattr(self, "_is_closing", False) or getattr(self, "_is_configuring_shortcut", False) or getattr(self, "_dialog_open", False):
+            return
+
+        current_gen = getattr(self.mouse_shortcut_bridge, "generation", None)
+        if current_gen is None or gen != current_gen:
+            return
+
+        if normalize_button_name(self._active_mouse_button) == "left":
+            pos = QPoint(x, y)
+            if self._local_press_record is not None:
+                rec_gen, rec_rect, rec_control = self._local_press_record
+                self._local_press_record = None
+                if rec_gen == gen:
+                    if rec_rect is not None and rec_rect.contains(pos):
+                        return
+                    if rec_control is not None:
+                        is_enabled = getattr(rec_control, "isEnabled", None)
+                        enabled = is_enabled() if callable(is_enabled) else True
+                        is_visible = getattr(rec_control, "isVisible", None)
+                        visible = is_visible() if callable(is_visible) else True
+                        if enabled and visible:
+                            widget_at_pos = QApplication.widgetAt(pos)
+                            if widget_at_pos is not None:
+                                w: QWidget | None = widget_at_pos
+                                while w is not None:
+                                    if w is rec_control:
+                                        return
+                                    w = w.parentWidget()
+
+            widget_at_pos = QApplication.widgetAt(pos)
+            if widget_at_pos is not None:
+                w = widget_at_pos
+                belongs_to_window = False
+                while w is not None:
+                    if w is self or (isinstance(w, QDialog) and w.parent() is self):
+                        belongs_to_window = True
+                        break
+                    w = w.parentWidget()
+                if belongs_to_window:
+                    w = widget_at_pos
+                    while w is not None and w is not self:
+                        if isinstance(
+                            w,
+                            (
+                                QAbstractButton,
+                                QComboBox,
+                                QLineEdit,
+                                QPlainTextEdit,
+                                QDialogButtonBox,
+                                QAbstractScrollArea,
+                            ),
+                        ):
+                            if w.isEnabled() and w.isVisible():
+                                return
+                            break
+                        w = w.parentWidget()
+
+            if QApplication.platformName() == "offscreen":
+                candidate_widgets: list[QWidget] = []
+                for attr_name in (
+                    "configure_shortcut_button",
+                    "record_button",
+                    "play_audio_button",
+                    "send_to_gemini_button",
+                    "send_button",
+                    "copy_button",
+                    "clear_text_button",
+                    "clear_button",
+                    "terminal_button",
+                    "configure_key_button",
+                    "api_key_button",
+                    "refresh_microphones_button",
+                    "detect_button",
+                    "debug_button",
+                    "microphone_combo",
+                    "editor",
+                ):
+                    widget = getattr(self, attr_name, None)
+                    if isinstance(widget, QWidget) and widget not in candidate_widgets:
+                        candidate_widgets.append(widget)
+
+                for widget_type in (
+                    QAbstractButton,
+                    QComboBox,
+                    QLineEdit,
+                    QPlainTextEdit,
+                    QDialogButtonBox,
+                    QAbstractScrollArea,
+                ):
+                    for child in self.findChildren(widget_type):
+                        if isinstance(child, QWidget) and child not in candidate_widgets:
+                            candidate_widgets.append(child)
+
+                for child in candidate_widgets:
+                    if not (child.isVisible() and child.isEnabled()):
+                        continue
+                    origin = child.mapToGlobal(QPoint(0, 0))
+                    rect = QRect(origin, child.size())
+                    if rect.contains(pos):
+                        return
+        else:
+            self._local_press_record = None
+
+        btn = getattr(self, "configure_shortcut_button", None)
+        if btn is not None and btn.isDown():
+            return
+
+        self._toggle_recording()
+
+    @Slot(str)
+    def _on_mouse_shortcut_failed(self, message: str) -> None:
+        if getattr(self, "_is_closing", False):
+            return
+        self.status_label.setText(_sanitize_mouse_shortcut_error(message))
 
     @Slot()
     def _toggle_recording(self) -> None:
@@ -1101,6 +1770,7 @@ class MainWindow(QMainWindow):
         self.clear_text_button.setEnabled(not busy and has_text)
         self.terminal_button.setEnabled(not busy and has_text)
         self.configure_key_button.setEnabled(not busy and not recording)
+        self.configure_shortcut_button.setEnabled(not busy and not recording)
         self.debug_button.setEnabled(True)
         if not self.settings.has_api_key and self.state is AppState.IDLE:
             self.status_label.setText(self.settings.missing_api_key_message)
@@ -1111,6 +1781,18 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._is_closing = True
+        self._local_press_record = None
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.removeEventFilter(self)
+            except Exception:
+                pass
+        try:
+            self.mouse_shortcut_bridge.stop()
+        except Exception:
+            pass
         if self.recorder.is_recording():
             try:
                 self.recorder.stop()
