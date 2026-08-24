@@ -9,6 +9,8 @@ from falafacil.shortcuts import (
     BACKEND_FAILURE_MESSAGE,
     InputShortcutBridge,
     MAX_PROTOCOL_LINE_BYTES,
+    PRIMARY_MOUSE_BUTTON_MESSAGE,
+    UNSUPPORTED_MOUSE_BUTTON_MESSAGE,
     normalize_keyboard_shortcut,
     normalize_mouse_button_name,
 )
@@ -208,3 +210,22 @@ def test_close_invalidates_both_generations_and_discards_late_frames() -> None:
     assert bridge.keyboard_generation == keyboard_gen + 1
     assert bridge.ready is False
     assert socket.aborted is True
+
+
+def test_bridge_translates_mouse_rejection_error_codes() -> None:
+    bridge, socket = _bridge()
+    socket.server_send(b"READY 1\n")
+    failed: list[tuple[str, int, str]] = []
+    bridge.failed.connect(lambda kind, g, message: failed.append((kind, g, message)))
+
+    stale = bridge.begin_mouse_capture()
+    generation = bridge.begin_mouse_capture()
+    assert generation > stale
+    socket.server_send(f"ERROR mouse {generation} primary_button\n".encode())
+    socket.server_send(f"ERROR mouse {generation} unsupported_button\n".encode())
+    socket.server_send(f"ERROR mouse {stale} primary_button\n".encode())
+
+    assert failed == [
+        ("mouse", generation, PRIMARY_MOUSE_BUTTON_MESSAGE),
+        ("mouse", generation, UNSUPPORTED_MOUSE_BUTTON_MESSAGE),
+    ]

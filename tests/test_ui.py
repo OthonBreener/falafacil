@@ -22,9 +22,18 @@ from falafacil.audio import AudioCapture, AudioDevice, AudioRecorderError
 from falafacil.config import Settings
 from falafacil.credentials import CredentialStoreError
 from falafacil.storage import LocalStore, LocalStoreError, TokenTotals, TokenUsageRecord
+from falafacil.shortcuts import (
+    PRIMARY_MOUSE_BUTTON_MESSAGE,
+    UNSUPPORTED_MOUSE_BUTTON_MESSAGE,
+)
 from falafacil.terminal import TerminalBridgeError
 from falafacil.transcription import TokenUsage, TranscriptionDebug, TranscriptionError
-from falafacil.ui import AppState, MainWindow, TokenUsageChart
+from falafacil.ui import (
+    CAPTURE_WAITING_TEXT,
+    AppState,
+    MainWindow,
+    TokenUsageChart,
+)
 
 class FakeRecorder:
     def __init__(
@@ -1862,4 +1871,101 @@ def test_main_window_layout_settings_fullscreen_and_grabs(qapp) -> None:
     window._toggle_fullscreen()
     qapp.processEvents()
     assert not window.isFullScreen()
+    window.close()
+
+
+def test_mouse_rejected_button_keeps_capture_dialog_open(qapp) -> None:
+    for message, marker in (
+        (PRIMARY_MOUSE_BUTTON_MESSAGE, "esquerdo"),
+        (UNSUPPORTED_MOUSE_BUTTON_MESSAGE, "remapeie"),
+    ):
+        bridge = FakeInputShortcutBridge()
+        window, _ = make_window(qapp, input_shortcut_bridge=bridge)
+        dialog = QDialog(window)
+        status = QLineEdit(dialog)
+        window._capture_dialog = dialog
+        window._capture_status_label = status
+        window._capture_kind = "mouse"
+        window._capture_generation = 7
+
+        bridge.failed.emit("mouse", 7, message)
+        assert dialog.result() == 0
+        assert marker in status.text()
+
+        hinted = status.text()
+        bridge.failed.emit("mouse", 8, message)
+        assert status.text() == hinted
+        assert window.status_label.text() == message
+
+        window._capture_dialog = None
+        window._capture_status_label = None
+        window.close()
+
+
+def test_mouse_capture_timeout_hint_respects_generation_and_existing_text(qapp) -> None:
+    bridge = FakeInputShortcutBridge()
+    window, _ = make_window(qapp, input_shortcut_bridge=bridge)
+    status = QLineEdit(window)
+    status.setText(CAPTURE_WAITING_TEXT)
+    window._capture_status_label = status
+    window._capture_kind = "mouse"
+    window._capture_generation = 7
+
+    window._hint_capture_timeout("mouse", 8)
+    assert status.text() == CAPTURE_WAITING_TEXT
+    window._hint_capture_timeout("keyboard", 7)
+    assert status.text() == CAPTURE_WAITING_TEXT
+
+    window._hint_capture_timeout("mouse", 7)
+    assert "firmware" in status.text()
+
+    already = status.text()
+    window._hint_capture_timeout("mouse", 7)
+    assert status.text() == already
+
+    window._capture_status_label = None
+    window.close()
+
+
+def test_global_shortcut_raises_minimized_window_before_toggling(qapp) -> None:
+    bridge = FakeInputShortcutBridge()
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-token"),
+        transcriber=FakeTranscriber(),
+        input_shortcut_bridge=bridge,
+    )
+    window._activate_shortcut("mouse", "x1", persist=False)
+    order: list[str] = []
+    raise_to_front = window._raise_to_front
+    window._raise_to_front = lambda: (order.append("raise"), raise_to_front())[1]
+    window._toggle_recording = lambda: order.append("toggle")
+
+    window.showMinimized()
+    assert window.isMinimized() is True
+    bridge.mouse_activated.emit(bridge.mouse_generation, "x1")
+
+    assert order == ["raise", "toggle"]
+    assert window.isMinimized() is False
+
+    order.clear()
+    window.state = AppState.TRANSCRIBING
+    bridge.mouse_activated.emit(bridge.mouse_generation, "x1")
+    assert order == []
+    window.close()
+
+
+def test_raise_to_front_preserves_fullscreen_and_shows_hidden_window(qapp) -> None:
+    window, _ = make_window(qapp, settings=Settings(api_key="active-token"))
+    window.showFullScreen()
+    assert window.isFullScreen() is True
+    window._raise_to_front()
+    assert window.isFullScreen() is True
+
+    window.showNormal()
+    window.hide()
+    assert window.isVisible() is False
+    window._raise_to_front()
+    assert window.isVisible() is True
+    assert window.isMinimized() is False
     window.close()
