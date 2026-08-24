@@ -20,17 +20,118 @@ Aplicativo desktop local para Ubuntu que grava fala em português do Brasil, env
 
 ## Começo rápido
 
-A partir da raiz do projeto, instale as dependências e inicie a aplicação:
+### 1. Pré-requisitos no Ubuntu
+
+- **Python**: versão `>=3.11,<3.15`.
+- **Poetry**: para gerenciamento do ambiente virtual e das dependências.
+- **PortAudio (`libportaudio2`)**: biblioteca nativa necessária para captura de áudio pelo microfone.
+- **xdotool** *(opcional)*: necessário apenas para colagem automática em terminal em sessões X11.
+- **Secret Service**: o ambiente desktop deve fornecer um backend de Secret Service (como GNOME Keyring) para persistência segura da chave API via `keyring`. Sem Secret Service, a chave informada na interface permanece válida apenas durante a sessão atual da janela.
+
+Para instalar as bibliotecas do sistema no Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install libportaudio2
+sudo apt install xdotool  # opcional: apenas para colagem em terminal X11
+```
+
+### 2. Executar pelo código-fonte
+
+A partir da raiz do repositório, instale as dependências e inicie o FalaFácil:
 
 ```bash
 poetry install
 poetry run python -m falafacil
 ```
 
-Na janela, use `Configurar chave API` para informar a chave no campo de senha. A chave é mantida em memória e, quando o Secret Service estiver disponível, pode ser persistida pelo `keyring`; ela nunca deve ser colocada neste arquivo, em outro arquivo versionado, em logs ou em argumentos de processo. Também é possível fornecer `GEMINI_API_KEY` ou `GOOGLE_API_KEY` no ambiente local antes de iniciar o aplicativo.
+Você também pode iniciar usando o entry point equivalente:
 
-Os atalhos globais de mouse e teclado são configurados pela engrenagem. Se a integração ainda não estiver ativa, o próprio aplicativo explica o acesso restrito e abre a autorização do Ubuntu; não exige terminal, `sudo`, edição de grupos ou novo login. Ambos podem ficar ativos ao mesmo tempo em X11 e Wayland, e `Space`/`Gravar` continuam disponíveis.
+```bash
+poetry run falafacil
+```
 
-O microfone requer `libportaudio2` no Ubuntu. `xdotool` é opcional e só é usado para colagem em terminal X11; em Wayland ou sem ele, use `Copiar texto`.
+### 3. Gerar o executável distribuível
 
-Para conhecer os comandos de testes, empacotamento, limitações e contratos de segurança, consulte [AGENTS.md](AGENTS.md).
+Para compilar o binário Linux autônomo (*one-file*) com o PyInstaller:
+
+```bash
+poetry install --extras build
+./scripts/build_executable.sh
+```
+
+O script gera o executável em `dist/falafacil`. Você pode testá-lo diretamente a partir da raiz:
+
+```bash
+./dist/falafacil
+```
+
+### 4. Instalar no desktop
+
+Após compilar o executável, instale o aplicativo e seu atalho no menu de aplicativos do usuário:
+
+```bash
+./scripts/install_desktop.sh "$PWD/dist/falafacil"
+```
+
+A instalação realiza as seguintes configurações no diretório do usuário:
+- Copia o binário para `~/.local/bin/falafacil`.
+- Cria o lançador em `~/.local/share/applications/falafacil.desktop`.
+
+Você pode iniciar o FalaFácil pelo menu de aplicativos do sistema ou executando o caminho instalado:
+
+```bash
+~/.local/bin/falafacil
+```
+
+### 5. Recompilar e atualizar após alterações
+
+Sempre que modificar o código-fonte e desejar atualizar o aplicativo instalado:
+
+1. Feche qualquer instância em execução do FalaFácil (um processo aberto continua executando o código antigo retido na memória até ser encerrado).
+2. Recompile e reinstale o binário:
+
+```bash
+poetry install --extras build
+./scripts/build_executable.sh
+./scripts/install_desktop.sh "$PWD/dist/falafacil"
+```
+
+3. Abra novamente o aplicativo pelo menu ou por `~/.local/bin/falafacil`.
+
+### 6. Configuração no primeiro uso
+
+1. **Chave API Gemini**:
+   - Clique no ícone de engrenagem (`⚙` / `Configurações`) no topo da janela.
+   - Na seção **Chave API**, informe sua chave no campo protegido por senha.
+   - A chave é mantida em memória e, se o Secret Service estiver ativo, salva de forma segura.
+   - Alternativamente, você pode definir `GEMINI_API_KEY` ou `GOOGLE_API_KEY` no ambiente antes de abrir o aplicativo.
+
+2. **Atalhos globais de mouse e teclado**:
+   - Na janela de **Configurações**, configure o atalho de mouse (botões laterais `x1`/`x2` ou botão central `middle`) e o atalho de teclado (combinação com modificadores como `Ctrl+Alt+R` ou teclas especiais/função).
+   - Se a integração global não estiver instalada, estiver incompatível ou indisponível, o aplicativo exibe a opção de autorização.
+   - Toda a autorização ocorre dentro da própria interface gráfica via prompt administrativo do Ubuntu: você não precisa abrir terminal, usar `sudo`, editar grupos de usuários ou reiniciar a sessão.
+   - Aceite a autorização quando solicitada; o aplicativo instala o serviço local por UID e retoma a captura do atalho automaticamente.
+   - Os atalhos globais e os controles manuais (`Gravar` e tecla `Espaço`) podem coexistir e funcionar simultaneamente.
+
+### 7. Verificação e solução de problemas
+
+#### Testes locais e compilação
+
+Para validar o ambiente e a integridade do código sem abrir janelas gráficas:
+
+```bash
+QT_QPA_PLATFORM=offscreen poetry run pytest -q
+poetry run python -m compileall -q src tests
+```
+
+#### Diagnóstico de problemas comuns
+
+- **Microfone não inicia ou botão `Gravar` indisponível**: certifique-se de que o pacote `libportaudio2` está instalado no sistema e que um dispositivo de entrada de áudio funcional está conectado.
+- **Chave API pede para ser digitada novamente após reabrir**: indica ausência de um backend ativo de Secret Service (como GNOME Keyring). A chave continuará funcionando normalmente durante a sessão aberta, mas não será persistida em disco.
+- **Envio ao terminal indisponível ou em sessão Wayland**: a colagem direta em janelas de terminal é suportada apenas em sessões X11 com `xdotool` instalado e para emuladores de terminal suportados. Em Wayland ou sem `xdotool`, utilize o botão **Copiar texto** (ou o atalho `Ctrl+Shift+C`) e cole manualmente com `Ctrl+Shift+V`.
+- **Alterações no código não aparecem no aplicativo**: certifique-se de que encerrou completamente os processos anteriores do FalaFácil antes de testar a nova versão compilada. Um processo aberto continua executando os arquivos antigos que já estavam carregados na memória. Se a interface solicitar a atualização da integração global após uma reconstrução, autorize-a uma única vez no diálogo do sistema.
+
+---
+
+Para conhecer os comandos detalhados de desenvolvimento, contratos de segurança e limitações completas, consulte [AGENTS.md](AGENTS.md).
