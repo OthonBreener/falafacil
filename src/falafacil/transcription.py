@@ -11,6 +11,7 @@ from .config import DEFAULT_MODEL
 
 
 INLINE_LIMIT_BYTES = 20 * 1024 * 1024
+REQUEST_TIMEOUT_MS = 120_000
 PROMPT = (
     "Transcreva somente o que foi falado neste áudio. "
     "O idioma é português do Brasil. Preserve nomes próprios e termos técnicos, "
@@ -55,9 +56,14 @@ class GeminiTranscriber:
         if client is not None:
             self.client = client
         elif api_key:
-            self.client = genai.Client(api_key=api_key)
+            self.client = genai.Client(
+                api_key=api_key,
+                http_options={"timeout": REQUEST_TIMEOUT_MS},
+            )
         else:
-            self.client = genai.Client()
+            self.client = genai.Client(
+                http_options={"timeout": REQUEST_TIMEOUT_MS},
+            )
         self.model = model
         self._api_key = api_key or ""
         self._last_debug: TranscriptionDebug | None = None
@@ -236,8 +242,26 @@ def _friendly_api_error(exc: Exception, *, secret: str = "") -> str:
         return "Chave Gemini inválida ou ausente. Verifique GEMINI_API_KEY."
     if "404" in lowered or "model_not_found" in lowered:
         return "Modelo Gemini não encontrado. Confira GEMINI_MODEL."
+    if _mentions_depleted_credits(lowered):
+        return (
+            "Créditos pré-pagos da API Gemini esgotados. "
+            "Recarregue o projeto em https://ai.studio/projects."
+        )
     if "429" in lowered or "quota" in lowered or "rate_limit" in lowered:
         return "Limite da API Gemini atingido. Tente novamente mais tarde."
     if any(code in lowered for code in ("500", "503", "504", "unavailable", "deadline")):
         return "O serviço Gemini está indisponível no momento. Tente novamente."
+    if "timeout" in lowered or "timed out" in lowered:
+        return (
+            "O Gemini não respondeu dentro do tempo limite. "
+            "Tente novamente ou grave uma fala mais curta."
+        )
     return "Não foi possível transcrever o áudio."
+
+
+def _mentions_depleted_credits(lowered: str) -> bool:
+    if "prepayment" in lowered:
+        return True
+    return "credit" in lowered and any(
+        marker in lowered for marker in ("deplet", "exhaust", "insufficient")
+    )
