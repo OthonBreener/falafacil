@@ -131,7 +131,7 @@ def test_main_startup_with_persisted_model_and_persisted_key(
     assert exit_code == 0
     assert fake_app.org_name == "FalaFácil"
     assert fake_app.app_name == "FalaFácil"
-    assert fake_app.app_version == "0.2.0"
+    assert fake_app.app_version == "0.2.1"
     assert len(created_windows) == 1
     window = created_windows[0]
     assert window.shown is True
@@ -359,7 +359,7 @@ def test_main_startup_homebrew_registers_desktop_entry_before_show(
     monkeypatch.setattr(app_module, "KeyringApiKeyStore", lambda: FakeApiKeyStoreForApp(api_key=None))
 
     fake_installation = HomebrewInstallation(
-        version="0.2.0",
+        version="0.2.1",
         formula="OthonBreener/falafacil/falafacil",
         homebrew_prefix=Path("/home/linuxbrew/.linuxbrew"),
         brew_path=Path("/home/linuxbrew/.linuxbrew/bin/brew"),
@@ -467,7 +467,7 @@ def test_main_startup_homebrew_registration_failure_is_fail_soft(
     monkeypatch.setattr(app_module, "KeyringApiKeyStore", lambda: FakeApiKeyStoreForApp(api_key=None))
 
     fake_installation = HomebrewInstallation(
-        version="0.2.0",
+        version="0.2.1",
         formula="OthonBreener/falafacil/falafacil",
         homebrew_prefix=Path("/home/linuxbrew/.linuxbrew"),
         brew_path=Path("/home/linuxbrew/.linuxbrew/bin/brew"),
@@ -562,7 +562,7 @@ def test_main_startup_homebrew_controller_init_failure_is_fail_soft_and_register
     )
 
     fake_installation = HomebrewInstallation(
-        version="0.2.0",
+        version="0.2.1",
         formula="OthonBreener/falafacil/falafacil",
         homebrew_prefix=Path("/home/linuxbrew/.linuxbrew"),
         brew_path=Path("/home/linuxbrew/.linuxbrew/bin/brew"),

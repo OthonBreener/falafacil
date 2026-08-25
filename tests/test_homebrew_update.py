@@ -560,13 +560,13 @@ def test_detect_homebrew_installation_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _prefix, cellar_exec, marker_file = _create_valid_homebrew_tree(tmp_path, version="0.2.0")
+    _prefix, cellar_exec, marker_file = _create_valid_homebrew_tree(tmp_path, version="0.2.1")
 
     monkeypatch.setattr("falafacil.homebrew_update._resolve_self_executable", lambda: cellar_exec)
 
     installation = detect_homebrew_installation()
     assert installation is not None
-    assert installation.version == "0.2.0"
+    assert installation.version == "0.2.1"
     assert installation.formula == HOMEBREW_FORMULA
 
 
