@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import __version__
 from .homebrew_update import HomebrewUpdateError, load_homebrew_marker
+from .path_security import has_foreign_write
 
 DESKTOP_ENTRY_CATEGORIES = "Utility;AudioVideo;"
 
@@ -77,7 +78,7 @@ def _validate_user_dir_component(directory: Path) -> None:
         raise DesktopInstallError(
             f"Diretório '{directory}' pertence a outro usuário (UID {st.st_uid} != {current_uid})."
         )
-    if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) != 0:
+    if has_foreign_write(st):
         raise DesktopInstallError(
             f"Diretório '{directory}' possui permissões de escrita para grupo/outros."
         )
@@ -106,7 +107,7 @@ def _validate_developer_executable(executable: Path) -> None:
         raise DesktopInstallError(
             f"Executável developer não pertence ao usuário atual (UID {st.st_uid} != {current_uid})."
         )
-    if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) != 0:
+    if has_foreign_write(st):
         raise DesktopInstallError(
             f"Executável developer possui permissões de escrita para grupo/outros: '{executable}'."
         )
@@ -195,7 +196,7 @@ def install_user_desktop_entry(executable: Path) -> Path:
             raise DesktopInstallError(
                 f"Destino '{desktop_entry_path}' pertence a outro usuário (UID {dst_st.st_uid} != {current_uid})."
             )
-        if (dst_st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) != 0:
+        if has_foreign_write(dst_st):
             raise DesktopInstallError(
                 f"Destino '{desktop_entry_path}' possui permissões de escrita para grupo/outros."
             )

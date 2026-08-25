@@ -13,6 +13,7 @@ import pytest
 from PySide6.QtCore import QObject, QProcess, Signal
 from PySide6.QtWidgets import QApplication
 
+from falafacil import path_security
 from falafacil.homebrew_update import (
     GENERIC_FAILURE_MESSAGE,
     HOMEBREW_CHANNEL,
@@ -89,6 +90,67 @@ def _create_valid_homebrew_tree(
     marker_file.chmod(0o644)
 
     return prefix, cellar_exec, marker_file
+
+
+def _force_shared_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulate a group shared with another account, which must stay rejected."""
+    owner_uid = os.getuid()
+    monkeypatch.setattr(
+        path_security,
+        "_lookup_group_uids",
+        lambda gid: frozenset({owner_uid, owner_uid + 4242}),
+    )
+
+
+def _force_private_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulate a private per-user group, the Ubuntu/Homebrew default."""
+    owner_uid = os.getuid()
+    monkeypatch.setattr(path_security, "_lookup_group_uids", lambda gid: frozenset({owner_uid}))
+
+
+def _relax_tree_to_umask_002(prefix: Path, version: str) -> None:
+    """Apply the permissions Homebrew really creates under umask 002."""
+    for directory in (
+        prefix,
+        prefix / "bin",
+        prefix / "opt",
+        prefix / "Cellar",
+        prefix / "Cellar" / "falafacil",
+        prefix / "Cellar" / "falafacil" / version,
+        prefix / "Cellar" / "falafacil" / version / "libexec",
+        prefix / "Cellar" / "falafacil" / version / "bin",
+    ):
+        directory.chmod(0o775)
+    (prefix / "bin" / "brew").chmod(0o775)
+    (prefix / "Cellar" / "falafacil" / version / "libexec" / "falafacil").chmod(0o775)
+    (prefix / "Cellar" / "falafacil" / version / "libexec" / "falafacil-homebrew.json").chmod(0o664)
+
+
+def test_load_homebrew_marker_accepts_umask_002_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Homebrew prefix created under umask 002 loads when the group is private."""
+    prefix, _cellar_exec, marker_file = _create_valid_homebrew_tree(tmp_path, version="0.2.0")
+    _relax_tree_to_umask_002(prefix, "0.2.0")
+    _force_private_group(monkeypatch)
+
+    installation = load_homebrew_marker(marker_file, expected_version="0.2.0")
+
+    assert installation.version == "0.2.0"
+    assert installation.homebrew_prefix == prefix
+
+
+def test_load_homebrew_marker_fails_on_umask_002_tree_with_shared_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix, _cellar_exec, marker_file = _create_valid_homebrew_tree(tmp_path, version="0.2.0")
+    _relax_tree_to_umask_002(prefix, "0.2.0")
+    _force_shared_group(monkeypatch)
+
+    with pytest.raises(HomebrewUpdateError, match="permissões de escrita inseguras para grupo/outros"):
+        load_homebrew_marker(marker_file, expected_version="0.2.0")
 
 
 def test_load_homebrew_marker_valid_tree(tmp_path: Path) -> None:
@@ -218,12 +280,27 @@ def test_load_homebrew_marker_payload_schema_validations(
         load_homebrew_marker(marker_file)
 
 
-def test_load_homebrew_marker_fails_on_group_writable_marker(tmp_path: Path) -> None:
+def test_load_homebrew_marker_fails_on_shared_group_writable_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _prefix, _cellar_exec, marker_file = _create_valid_homebrew_tree(tmp_path)
     marker_file.chmod(0o664)
+    _force_shared_group(monkeypatch)
 
     with pytest.raises(HomebrewUpdateError, match="permissões de escrita inseguras"):
         load_homebrew_marker(marker_file)
+
+
+def test_load_homebrew_marker_accepts_private_group_writable_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _prefix, _cellar_exec, marker_file = _create_valid_homebrew_tree(tmp_path)
+    marker_file.chmod(0o664)
+    _force_private_group(monkeypatch)
+
+    assert load_homebrew_marker(marker_file).version == "0.2.0"
 
 
 def test_load_homebrew_marker_fails_on_non_executable_brew(tmp_path: Path) -> None:
@@ -388,26 +465,17 @@ def test_load_homebrew_marker_fails_on_wrong_uid_via_stat_seam(
     ],
     ids=["prefix", "bin_dir", "opt_dir", "cellar_dir", "formula_dir", "keg_dir", "libexec_dir"],
 )
-@pytest.mark.parametrize(
-    "gid_fn",
-    [
-        lambda: os.getgid(),
-        lambda: os.getegid(),
-        lambda: os.getgroups()[0] if hasattr(os, "getgroups") and os.getgroups() else os.getgid(),
-    ],
-    ids=["primary_gid", "effective_gid", "supplementary_gid"],
-)
-def test_load_homebrew_marker_fails_on_group_writable_directory_across_all_nodes(
+def test_load_homebrew_marker_fails_on_shared_group_writable_directory_across_all_nodes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     target_dir_fn: Any,
-    gid_fn: Any,
 ) -> None:
     prefix, _cellar_exec, marker_file = _create_valid_homebrew_tree(tmp_path, version="0.2.0")
     target_dir = target_dir_fn(prefix, "0.2.0")
     target_dir_str = str(target_dir)
     target_dir_resolved_str = str(target_dir.resolve())
-    test_gid = gid_fn()
+    test_gid = os.getgid()
+    _force_shared_group(monkeypatch)
 
     orig_stat = os.stat
     orig_lstat = os.lstat

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from falafacil import __version__
+from falafacil import __version__, path_security
 from falafacil.desktop_install import (
     DesktopInstallError,
     desktop_escape,
@@ -82,6 +82,22 @@ def _create_developer_bin(home: Path) -> Path:
     dev_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     dev_bin.chmod(0o755)
     return dev_bin
+
+
+def _force_shared_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulate a group shared with another account, which must stay rejected."""
+    owner_uid = os.getuid()
+    monkeypatch.setattr(
+        path_security,
+        "_lookup_group_uids",
+        lambda gid: frozenset({owner_uid, owner_uid + 4242}),
+    )
+
+
+def _force_private_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulate a private per-user group, the Ubuntu/Homebrew default."""
+    owner_uid = os.getuid()
+    monkeypatch.setattr(path_security, "_lookup_group_uids", lambda gid: frozenset({owner_uid}))
 
 
 def _create_valid_homebrew_tree(
@@ -176,6 +192,40 @@ def test_homebrew_install_success_and_preserves_stable_launch_path(
     assert f'Exec="{launch_path}"' in content
     assert f"TryExec={launch_path}" in content
     assert "Categories=Utility;AudioVideo;" in content
+
+
+def test_homebrew_install_under_umask_002_registers_desktop_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a Homebrew prefix with 0o775 dirs and a 0o664 marker must register."""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    home.chmod(0o755)
+    monkeypatch.setenv("HOME", str(home))
+
+    prefix, launch_path, marker = _create_valid_homebrew_tree(tmp_path)
+    version = __version__
+    for directory in (
+        prefix,
+        prefix / "bin",
+        prefix / "opt",
+        prefix / "Cellar",
+        prefix / "Cellar" / "falafacil",
+        prefix / "Cellar" / "falafacil" / version,
+        prefix / "Cellar" / "falafacil" / version / "libexec",
+        prefix / "Cellar" / "falafacil" / version / "bin",
+    ):
+        directory.chmod(0o775)
+    (prefix / "bin" / "brew").chmod(0o775)
+    (prefix / "Cellar" / "falafacil" / version / "libexec" / "falafacil").chmod(0o775)
+    marker.chmod(0o664)
+    _force_private_group(monkeypatch)
+
+    desktop_path = install_user_desktop_entry(launch_path)
+
+    assert desktop_path.is_file()
+    assert f'Exec="{launch_path}"' in desktop_path.read_text(encoding="utf-8")
 
 
 def test_atomic_replacement_and_reinstall(
@@ -323,7 +373,7 @@ def test_rejects_developer_executable_not_regular_or_not_executable(
         install_user_desktop_entry(dev_bin)
 
 
-def test_rejects_developer_executable_group_writable(
+def test_rejects_developer_executable_shared_group_writable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -332,9 +382,30 @@ def test_rejects_developer_executable_group_writable(
 
     dev_bin = _create_developer_bin(home)
     dev_bin.chmod(0o775)  # group writable
+    _force_shared_group(monkeypatch)
 
     with pytest.raises(DesktopInstallError, match="permissões de escrita para grupo/outros"):
         install_user_desktop_entry(dev_bin)
+
+
+def test_accepts_developer_tree_created_under_umask_002(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A developer install whose binary and parents are 0o775 stays valid on a private group."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+
+    dev_bin = _create_developer_bin(home)
+    dev_bin.chmod(0o775)
+    (home / ".local").chmod(0o775)
+    (home / ".local" / "bin").chmod(0o775)
+    _force_private_group(monkeypatch)
+
+    desktop_entry_path = install_user_desktop_entry(dev_bin)
+
+    assert desktop_entry_path.is_file()
+    assert f'Exec="{dev_bin}"' in desktop_entry_path.read_text(encoding="utf-8")
 
 
 def test_rejects_arbitrary_non_canonical_non_homebrew_path(
@@ -617,20 +688,10 @@ def test_rejects_applications_directory_world_writable(
     ],
     ids=["dot_local", "dot_local_bin", "dot_local_share", "applications"],
 )
-@pytest.mark.parametrize(
-    "gid_fn",
-    [
-        lambda: os.getgid(),
-        lambda: os.getegid(),
-        lambda: os.getgroups()[0] if hasattr(os, "getgroups") and os.getgroups() else os.getgid(),
-    ],
-    ids=["primary_gid", "effective_gid", "supplementary_gid"],
-)
-def test_rejects_user_directory_group_writable_across_all_components(
+def test_rejects_user_directory_shared_group_writable_across_all_components(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     target_dir_fn: Any,
-    gid_fn: Any,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
@@ -646,7 +707,8 @@ def test_rejects_user_directory_group_writable_across_all_components(
     target_dir = target_dir_fn(home)
     target_dir_str = str(target_dir)
     target_dir_resolved_str = str(target_dir.resolve())
-    test_gid = gid_fn()
+    test_gid = os.getgid()
+    _force_shared_group(monkeypatch)
 
     orig_stat = os.stat
     orig_lstat = os.lstat
