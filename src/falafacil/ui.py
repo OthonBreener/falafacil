@@ -590,6 +590,22 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
         self._settings_dialog: QDialog | None = None
+        # These controls belong to the transient settings dialog.  Keep the
+        # references explicit so they can be invalidated when Qt destroys the
+        # dialog instead of retaining wrappers around deleted C++ objects.
+        self.configure_key_button: QPushButton | None = None
+        self.model_combo: QComboBox | None = None
+        self.apply_model_button: QPushButton | None = None
+        self.mouse_settings_status: QLabel | None = None
+        self.keyboard_settings_status: QLabel | None = None
+        self.configure_mouse_button: QPushButton | None = None
+        self.disable_mouse_button: QPushButton | None = None
+        self.configure_keyboard_button: QPushButton | None = None
+        self.disable_keyboard_button: QPushButton | None = None
+        self.installed_version_label: QLabel | None = None
+        self.update_status_label: QLabel | None = None
+        self.update_progress_bar: QProgressBar | None = None
+        self.install_update_button: QPushButton | None = None
 
         header = QHBoxLayout()
         title = QLabel("FalaFácil", central)
@@ -839,10 +855,31 @@ class MainWindow(QMainWindow):
             dialog.exec()
         finally:
             self._settings_dialog = None
+            # QDialog::exec() may have destroyed the child widgets already.
+            # Drop every Python wrapper before a later state update can touch
+            # one of them (for example after sending a pending recording).
+            self.configure_key_button = None
+            self.model_combo = None
+            self.apply_model_button = None
+            self.mouse_settings_status = None
+            self.keyboard_settings_status = None
+            self.configure_mouse_button = None
+            self.disable_mouse_button = None
+            self.configure_keyboard_button = None
+            self.disable_keyboard_button = None
+            self.installed_version_label = None
+            self.update_status_label = None
+            self.update_progress_bar = None
+            self.install_update_button = None
 
     def _update_settings_dialog(self) -> None:
         dialog = self._settings_dialog
         if dialog is None:
+            return
+        # The dialog can be in the process of closing while queued UI signals
+        # are being delivered.  Its child wrappers are only valid while the
+        # dialog is active.
+        if self.configure_key_button is None:
             return
         busy = self.state in (AppState.RECORDING, AppState.TRANSCRIBING)
         self.mouse_settings_status.setText(
@@ -868,17 +905,17 @@ class MainWindow(QMainWindow):
         self.disable_keyboard_button.setEnabled(
             not busy and self._active_keyboard_shortcut is not None
         )
-        model_combo = getattr(self, "model_combo", None)
-        apply_model_button = getattr(self, "apply_model_button", None)
+        model_combo = self.model_combo
+        apply_model_button = self.apply_model_button
         if model_combo is not None:
             model_combo.setEnabled(not busy and not self.settings.model_from_environment)
         if apply_model_button is not None:
             apply_model_button.setEnabled(
                 not busy and not self.settings.model_from_environment
             )
-        update_status_label = getattr(self, "update_status_label", None)
-        update_progress_bar = getattr(self, "update_progress_bar", None)
-        install_update_button = getattr(self, "install_update_button", None)
+        update_status_label = self.update_status_label
+        update_progress_bar = self.update_progress_bar
+        install_update_button = self.install_update_button
         if self.homebrew_update_controller is None:
             if update_status_label is not None:
                 update_status_label.setText(
@@ -1947,9 +1984,6 @@ class MainWindow(QMainWindow):
         self.copy_button.setEnabled(not busy and has_text)
         self.clear_text_button.setEnabled(not busy and has_text)
         self.terminal_button.setEnabled(not busy and has_text)
-        configure_key = getattr(self, "configure_key_button", None)
-        if configure_key is not None:
-            configure_key.setEnabled(not busy and not recording)
         self.settings_button.setEnabled(True)
         self._update_settings_dialog()
         if not self.settings.has_api_key and self.state is AppState.IDLE:

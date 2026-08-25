@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import gc
 import sqlite3
 import threading
 import time
@@ -946,6 +947,39 @@ def test_update_actions_tracks_key_text_and_busy_state(qapp) -> None:
     assert not window.clear_text_button.isEnabled()
     assert not window.terminal_button.isEnabled()
     assert window.settings_button.isEnabled()
+    window.close()
+
+
+def test_send_after_settings_dialog_closes_does_not_use_deleted_widgets(qapp) -> None:
+    """Closing Settings must not leave stale Qt wrappers on MainWindow."""
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-token"),
+        transcriber=FakeTranscriber(),
+        recorder=FakeRecorder(),
+    )
+
+    def close_settings() -> None:
+        assert window._settings_dialog is not None
+        window._settings_dialog.reject()
+
+    QTimer.singleShot(0, close_settings)
+    window._open_settings_dialog()
+    assert window._settings_dialog is None
+
+    # Let Qt destroy the dialog's C++ children, matching the real event-loop
+    # lifecycle that previously exposed the orphaned QPushButton wrapper.
+    gc.collect()
+    qapp.processEvents()
+    window._update_actions()
+
+    window._start_recording()
+    window._finish_recording()
+    window._send_pending_audio()
+    wait_for_worker(qapp, window)
+
+    assert window.state is AppState.READY
+    assert window.editor.toPlainText() == "synthetic transcript"
     window.close()
 
 
