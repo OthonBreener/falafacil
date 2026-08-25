@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
+
+from .path_security import has_foreign_write
+
 HOMEBREW_FORMULA = "OthonBreener/falafacil/falafacil"
 HOMEBREW_CHANNEL = "homebrew"
 HOMEBREW_SCHEMA_VERSION = 1
@@ -106,7 +109,7 @@ def _validate_directory_node(
             f"{name} resolvido '{directory.resolve()}' possui proprietário inválido (UID {st.st_uid} != {current_uid})."
         )
 
-    if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) != 0:
+    if has_foreign_write(st):
         raise HomebrewUpdateError(
             f"{name} '{directory}' possui permissões de escrita inseguras para grupo/outros."
         )
@@ -210,12 +213,12 @@ def _validate_path_security(
     if require_directory:
         if not stat.S_ISDIR(st.st_mode):
             raise HomebrewUpdateError(f"Caminho '{resolved}' não é um diretório.")
-        if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) != 0:
+        if has_foreign_write(st):
             raise HomebrewUpdateError(
                 f"Diretório '{resolved}' possui permissões de escrita inseguras para grupo/outros."
             )
     else:
-        if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) != 0:
+        if has_foreign_write(st):
             raise HomebrewUpdateError(
                 f"Caminho '{resolved}' possui permissões de escrita inseguras para grupo/outros."
             )
