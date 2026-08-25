@@ -19,6 +19,7 @@ Aplicativo desktop local para Ubuntu que grava fala em português do Brasil, env
 - [Regras e contratos do produto](AGENTS.md)
 - [Mapa da arquitetura e invariantes](ARQUITETURA.md)
 - [Índice da documentação](docs/INDEX.md)
+- [Ciclo de release e publicação Homebrew](docs/RELEASE.md)
 
 ## Instalação recomendada (Homebrew no Ubuntu)
 
@@ -29,6 +30,7 @@ brew install OthonBreener/falafacil/falafacil
 ```
 
 O executável distribuído via Homebrew é autônomo (*one-file*) e já inclui a biblioteca PortAudio embutida, não exigindo a instalação manual de `libportaudio2` pelo apt. Execute o `falafacil` uma vez no terminal após a instalação para registrá-lo no menu de aplicativos do desktop. Atualizações posteriores são realizadas diretamente pela interface gráfica do aplicativo em **Configurações → Atualizações**.
+Caso você possua uma instalação prévia de desenvolvimento (`~/.local/bin/falafacil`), remova-a com `rm -f ~/.local/bin/falafacil ~/.local/share/applications/falafacil.desktop` antes de instalar via Homebrew. As preferências no diretório de dados, a chave API no Secret Service e o serviço de atalhos do usuário são mantidos automaticamente. Consulte o [guia de migração e release](docs/RELEASE.md) para mais detalhes.
 
 ## Começo rápido para desenvolvimento
 

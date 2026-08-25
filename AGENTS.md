@@ -9,6 +9,7 @@ Aplicativo desktop local para Ubuntu que grava fala em português do Brasil, env
 - [Índice da documentação](docs/INDEX.md) — catálogo dos documentos do projeto.
 - [Contrato de agentes](docs/architecture/agentes.md) — papéis e ciclo de desenvolvimento.
 - [Gate de smoke](docs/agents/smoke-tests.md) — critérios de validação e smoke aplicáveis.
+- [Ciclo de release e publicação Homebrew](docs/RELEASE.md) — guia de versionamento, publicação e automação de release.
 
 ## Produto e fluxo
 
@@ -65,7 +66,9 @@ As restrições e dependências declaradas em `pyproject.toml` são:
 | `README.md` | Entrada do projeto, navegação e começo rápido. |
 | `CLAUDE.md` | Symlink para `AGENTS.md`; mantém um único contrato de agentes sob os dois nomes. |
 | `ARQUITETURA.md` | Mapa arquitetural, fluxo de dependências e invariantes técnicos. |
-| `docs/` | Índice, contrato dos agentes de desenvolvimento e gate de smoke. |
+| `docs/` | Índice, contrato dos agentes de desenvolvimento, gate de smoke e guia de release. |
+| `docs/RELEASE.md` | Guia autoritativo do ciclo de release, versionamento SemVer, publicação no GitHub Releases, sincronização do tap Homebrew e migração. |
+| `.claude/skills/falafacil-release/` | Definição da skill de release do FalaFácil para agentes Claude Code. |
 | `.omp/agents/` | Definições dos papéis delegados de implementador, testador e revisor. |
 | `pyproject.toml` | Metadados, restrição de Python, dependências de runtime, extras `dev`/`build`, `package-mode = false` para dependências gerenciadas pelo Poetry, versão dinâmica via `[tool.setuptools.dynamic] version = {attr = "falafacil.__version__"}`, entry point e configuração do Pytest. |
 | `src/falafacil/__main__.py` | Despacha os modos internos exatos de daemon/instalação de atalhos, `--update-probe VERSION` e `--install-user-desktop EXECUTABLE` (retornando 0 para sucesso, 1 para falha de validação/escrita e 2 para aridade malformada sem instanciar GUI) antes da GUI; demais argumentos iniciam `falafacil.app.main`. |
@@ -154,12 +157,12 @@ A aplicação não possui camadas de servidor próprio, ORM ou API web do produt
 
 - O agente principal deve pesquisar o repositório, resolver ambiguidades e preparar um plano preciso, com arquivos, símbolos, comportamento esperado, critérios verificáveis e comandos de validação, antes de delegar.
 - A escrita delegada fica exclusivamente com o `implementador`, que altera somente o escopo recebido; ele pode executar testes que escreveu ou editou, validações mais amplas ficam com o `testador`, que executa os comandos solicitados; o gate final fica com o `revisor`, que audita pedido, plano, diff, critérios e evidências.
+- Exceção estrita de release: quando a automação de release do FalaFácil for invocada explicitamente pelo usuário (via skill ou gatilhos autorizados), após a execução completa dos gates pelo `testador` (`PASS`) e a aprovação formal do `revisor` (`APROVADO`), o agente principal / operador de release fica estritamente autorizado a realizar os commits de bump na branch `main`, push para `origin main` e criação/push da tag anotada `vX.Y.Z`. Nenhum papel delegado (`implementador`, `testador`, `revisor`) pode realizar commits, pushes, tags ou mutações de branch/PR; nenhuma outra branch ou PR pode ser criada ou mutacionada.
 - O FalaFácil é um repositório único: não existe backend/frontend separado nem ordem entre essas camadas.
 - Mantenha planos transitórios do harness em `local://`; só crie histórico em `.plans/` quando a tarefa pedir explicitamente esse registro.
 - Antes de alterar ou remover qualquer símbolo exportado, localize todas as referências. Quando um contrato mudar, atualize os consumidores, testes e documentação aplicáveis no mesmo corte.
 - Atualize `ARQUITETURA.md` somente quando a arquitetura ou seus invariantes mudarem; atualize `docs/INDEX.md` somente quando o catálogo ou os caminhos documentados mudarem; atualize `docs/architecture/agentes.md` somente quando o ciclo ou os papéis de agentes mudarem.
 - Se o papel delegado estiver indisponível, registre explicitamente na resposta final qual papel faltou, o motivo e quais validações ou gates não puderam ser executados; não declare aprovação sem essa exceção.
-
 ## Configuração
 
 Execute a partir da raiz do projeto:
@@ -204,7 +207,7 @@ QT_QPA_PLATFORM=offscreen poetry run pytest -q \
   tests/test_shortcuts.py tests/test_storage.py tests/test_ui.py \
   tests/test_packaging.py
 poetry run pytest -q
-poetry run python -m compileall -q src tests
+poetry run python -m compileall -q src tests scripts
 poetry run python -m falafacil
 poetry run python -m sounddevice
 ```
@@ -248,7 +251,7 @@ A suíte cobre contratos locais e determinísticos:
 - `tests/test_desktop_install.py`: geração e substituição atômica de desktop entry modo `0644`, escaping de caracteres complexos, validação de executável developer e Homebrew e rejeição de symlinks, caminhos inseguros e controles.
 - `tests/test_packaging.py`: desktop installer seguro, dispatch interno exato (incluindo `--update-probe` e `--install-user-desktop`), versão dinâmica e integridade de metadata, spec com PortAudio obrigatório, validação de template/renderer da fórmula, contrato do workflow de release e estrutura do tarball de distribuição.
 
-Execute primeiro os testes focados com `QT_QPA_PLATFORM=offscreen`, depois `poetry run pytest -q` e `poetry run python -m compileall -q src tests`. Para a entrega empacotada, use `poetry install --extras build`, `poetry run pip install --no-deps -e .`, `./scripts/build_executable.sh` e o instalador em um `HOME` temporário. O smoke do bundle deve iniciar `QT_QPA_PLATFORM=offscreen dist/falafacil`, confirmar a inicialização da janela sem rede e encerrar pelo controle do processo; não se deve exigir chave, microfone ou terminal para essa verificação.
+Execute primeiro os testes focados com `QT_QPA_PLATFORM=offscreen`, depois `poetry run pytest -q` e `poetry run python -m compileall -q src tests scripts` (o workflow de CI executa `compileall` em `src tests`). Para a entrega empacotada, use `poetry install --extras build`, `poetry run pip install --no-deps -e .`, `./scripts/build_executable.sh`, probe `./dist/falafacil --update-probe 0.2.0` e o instalador em um `HOME` temporário. O smoke do bundle deve iniciar o executável instalado via `env -u GEMINI_API_KEY -u GOOGLE_API_KEY -u LD_LIBRARY_PATH HOME="$tmp_home" QT_QPA_PLATFORM=offscreen timeout 5s "$tmp_home/.local/bin/falafacil" || [ $? -eq 124 ]`, confirmando a inicialização da janela sem rede e encerrando pelo controle de tempo/processo (código 124 por timeout controlado); não se deve exigir chave, microfone ou terminal para essa verificação.
 
 Smoke manual: conferir diagnóstico permanente, editor limitado, duas linhas de ações, engrenagem com cinco grupos (`Chave API`, `Modelo Gemini`, `Atalho do mouse`, `Atalho do teclado` e `Atualizações`) e fullscreen. No app instalado, autorizar a integração uma vez, configurar `x1` e `Ctrl+Alt+R` e testar ambos fora de foco em X11 e Wayland quando disponíveis; release/repeat/texto não alternam, e desativar um tipo preserva o outro. O fluxo de áudio/Gemini e a colagem X11 continuam conforme os contratos anteriores.
 
@@ -274,5 +277,6 @@ Smoke manual: conferir diagnóstico permanente, editor limitado, duas linhas de 
 Use os módulos e símbolos existentes como fonte de verdade antes de atualizar este documento. Ao alterar um contrato de áudio, transcrição, UI, credenciais, ambiente, empacotamento ou terminal, atualize a seção correspondente e os testes determinísticos que cobrem o comportamento observável.
 Após qualquer alteração no código, é obrigatório recriar o executável Linux one-file `dist/falafacil` com `poetry install --extras build`, `poetry run pip install --no-deps -e .` e `./scripts/build_executable.sh`, reinstalá-lo localmente com `./scripts/install_desktop.sh "$PWD/dist/falafacil"` (o que reinstala e atualiza `~/.local/bin/falafacil` e `~/.local/share/applications/falafacil.desktop`) e executar o smoke do bundle quando aplicável. Revise também este `AGENTS.md` e atualize a documentação sempre que o comportamento, os contratos, os comandos, as dependências, a estrutura ou as limitações do projeto forem afetados. Não deixe a documentação desatualizada em relação à implementação entregue.
 
+Para criação de novas versões, publicação no GitHub Releases e sincronização do tap Homebrew, siga o procedimento e as regras de imutabilidade descritos em [docs/RELEASE.md](docs/RELEASE.md) e na skill [.claude/skills/falafacil-release/SKILL.md](.claude/skills/falafacil-release/SKILL.md).
 Antes de documentar recurso, confirme código, testes e `pyproject.toml`; não prometa servidor, TTS, Files/Live API, AppImage, colagem Wayland ou execução de comandos. Preserve separação entre UI, áudio, transcrição, credenciais, serviço global local e terminal X11; chamadas bloqueantes não entram no thread principal.
 Confirme que todos os links relativos desta documentação resolvem e que cada promessa sobre o produto permanece sustentada pelo código, pelos testes ou pelo `pyproject.toml`; corrija links e promessas desatualizados no mesmo corte.

@@ -19,7 +19,8 @@ O principal:
 2. pesquisa o código, os testes e os consumidores afetados;
 3. registra decisões, escopo, critérios de aceitação e riscos;
 4. encaminha escrita ao `implementador`, validação ao `testador` e gate final ao `revisor`;
-5. confere as respostas e repete o ciclo quando a evidência não cobrir o contrato.
+5. confere as respostas e repete o ciclo quando a evidência não cobrir o contrato;
+6. na operação de release invocada explicitamente pelo usuário, após o `testador` reportar `PASS` no gate e o `revisor` responder `APROVADO`, o principal / operador de release fica estritamente autorizado a realizar os commits de bump na branch `main`, push para `origin main` e criação/push da tag anotada `vX.Y.Z` conforme [`docs/RELEASE.md`](../RELEASE.md).
 
 O principal não pode usar a delegação para ocultar uma ambiguidade, reduzir o escopo sem aprovação ou declarar sucesso sem diff e evidência correspondentes.
 
@@ -103,4 +104,4 @@ principal pesquisa/planeja/orquestra
 
 Antes de exportar ou remover qualquer símbolo, o implementador deve localizar referências. Depois da edição, nenhum consumidor, teste ou documento aplicável pode permanecer no contrato antigo. A entrega só passa quando o revisor tem acesso ao plano, diff/arquivos e resultados do `testador`; sem evidência, o resultado é bloqueio, não aprovação.
 
-Nenhum papel cria commit, push, branch ou PR. Nenhum papel grava ou expõe segredo, adiciona stub, mock falso, no-op ou `TODO`, nem introduz capacidades não confirmadas no código e no `AGENTS.md`.
+Nenhum papel cria commit, push, branch ou PR, exceto pela regra estrita de release: quando a automação de release do FalaFácil for invocada explicitamente pelo usuário (via skill ou gatilhos autorizados), após a execução completa dos gates pelo `testador` (`PASS`) e a aprovação formal do `revisor` (`APROVADO`), o agente principal / operador de release fica estritamente autorizado a realizar os commits de bump na branch `main`, push para `origin main` e criação/push da tag anotada `vX.Y.Z`. Nenhum papel delegado (`implementador`, `testador`, `revisor`) pode realizar commits, pushes, tags ou mutações de branch/PR; nenhuma outra branch ou PR pode ser criada ou mutacionada. Nenhum papel grava ou expõe segredo, adiciona stub, mock falso, no-op ou `TODO`, nem introduz capacidades não confirmadas no código e no `AGENTS.md`.
