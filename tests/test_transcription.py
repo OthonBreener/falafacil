@@ -86,6 +86,21 @@ def test_transcriber_sends_inline_wav_and_returns_trimmed_text() -> None:
     assert debug.error is None
 
 
+def test_transcription_prompt_contract() -> None:
+    assert isinstance(PROMPT, str)
+    assert len(PROMPT.strip()) > 0
+    assert "português do Brasil" in PROMPT
+    assert "fidelidade ao sentido original" in PROMPT
+    assert "correções sutis de fala" in PROMPT
+    assert "hesitações" in PROMPT
+    assert "cacoetes" in PROMPT
+    assert "concordância" in PROMPT
+    assert "nomes próprios" in PROMPT
+    assert "termos técnicos" in PROMPT
+    assert "não invente conteúdo" in PROMPT
+    assert "texto simples pronto para copiar" in PROMPT
+
+
 def test_transcriber_limits_debug_preview_for_oversized_audio() -> None:
     transcriber = GeminiTranscriber(client=FakeClient())
 

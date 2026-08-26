@@ -184,7 +184,17 @@ A sequência de pré-voo deve garantir primeiro o estado limpo e sincronizado da
    gh api repos/OthonBreener/falafacil/immutable-releases --jq .enabled  # deve retornar true
    ```
    *Não apenas reconhecer teoricamente; se a API retornar false ou erro, interrompa o processo imediatamente.*
-6. **Análise de Histórico, Resumo de Release e Seleção SemVer Monotônica (pós-sincronização)**:
+6. **Consulta e Resolução Obrigatória de Pendências (`docs/PENDENCIAS.md`)**:
+   - Antes de consolidar o resumo de release e executar o bump de versão, o operador ou agente deve consultar obrigatoriamente `docs/PENDENCIAS.md`.
+   - Se existirem pendências registradas ou tarefas planejadas para a release:
+     - O `implementador` implementa o código e os testes correspondentes (preservando o registro em `docs/PENDENCIAS.md` durante a etapa).
+     - O `testador` executa os testes e validação de smoke (`PASS`).
+     - Após a validação com `PASS`, o `implementador` remove o item resolvido de `docs/PENDENCIAS.md` (deixando o documento limpo contendo apenas `# Pendências para próximas releases\n\nNenhuma pendência no momento.` se não restarem pendências).
+     - O `revisor` audita o diff completo (incluindo código, testes e a limpeza de `docs/PENDENCIAS.md`) e concede `APROVADO`.
+     - O agente principal / operador de release realiza o commit das pendências resolvidas na branch `main` antes de iniciar o resumo e bump de versão.
+   - Se `docs/PENDENCIAS.md` já estiver limpo (`Nenhuma pendência no momento.`), prosseguir diretamente com a análise de histórico e seleção de versão.
+
+7. **Análise de Histórico, Resumo de Release e Seleção SemVer Monotônica (pós-sincronização)**:
    - Identificar a tag mais recente no repositório sincronizado:
      ```bash
      git describe --tags --abbrev=0
@@ -197,7 +207,7 @@ A sequência de pré-voo deve garantir primeiro o estado limpo e sincronizado da
    - Formular e registrar um resumo conciso das mudanças (features, fixes, chores).
    - Selecionar a versão alvo `X.Y.Z`: honrar a versão SemVer informada pelo usuário ou inferir conservadoramente PATCH, MINOR ou MAJOR. Validar obrigatoriamente que a tupla numérica `(target_major, target_minor, target_patch)` é estritamente maior que a versão atual (`falafacil.__version__`) e estritamente maior que a última tag de release. Interrompa se a versão for igual ou menor. Solicitar esclarecimento ao usuário apenas se houver uma ambiguidade real não resolvida entre versão MAJOR e MINOR.
 
-7. **Prevenção de Colisão de Versão/Tag**:
+8. **Prevenção de Colisão de Versão/Tag**:
    ```bash
    # Confirmar que a versão e a tag vX.Y.Z não existem localmente nem no remoto:
    git tag -l "vX.Y.Z"
@@ -205,14 +215,13 @@ A sequência de pré-voo deve garantir primeiro o estado limpo e sincronizado da
    gh release view vX.Y.Z
    ```
    Se a tag ou a release já existirem, interrompa o processo imediatamente.
-
 ### 2. Gate Local do Ciclo de Agentes
 
 O ciclo de agentes segue rigorosamente os papéis definidos em `AGENTS.md` e `docs/architecture/agentes.md`:
 - **`implementador`**: é o único papel autorizado a editar `src/falafacil/__init__.py` e atualizar os contratos documentais e testes vinculados à versão.
 - **`testador`**: executa o gate local completo de compilação, testes offscreen, build, probe e o smoke do binário de desenvolvedor instalado.
 - **`revisor`**: audita o diff completo (`git diff`), a lista de arquivos alterados e as evidências do `testador`, concedendo aprovação formal antes de qualquer commit ou criação de tag Git.
-- **Exceção estrita de release para o agente principal / operador**: somente após a aprovação formal do `revisor` (`APROVADO`) e o resultado `PASS` do `testador` em uma invocação explícita de release pelo usuário, o operador principal é autorizado a executar commits de bump, push para `origin main` e criação/push da tag `vX.Y.Z`. Os papéis delegados (`implementador`, `testador`, `revisor`) continuam estritamente proibidos de realizar commits, pushes, tags ou mutações de branch.
+- **Exceção estrita de release para o agente principal / operador**: em uma invocação explícita de release pelo usuário, antes do bump de versão o operador realiza a consulta obrigatória a `docs/PENDENCIAS.md`. Havendo pendências ativas para a release, elas são implementadas pelo `implementador` com testes (preservando o registro em `docs/PENDENCIAS.md`), validadas pelo `testador` (`PASS`), o item resolvido é removido de `docs/PENDENCIAS.md` pelo `implementador` (deixando o documento limpo quando não restarem pendências), o diff é auditado pelo `revisor` (`APROVADO`), e o agente principal / operador de release fica estritamente autorizado a realizar o commit das pendências resolvidas na branch `main`. Em seguida, para o bump de versão, somente após a execução completa dos gates pelo `testador` (`PASS`) e a aprovação formal do `revisor` (`APROVADO`), o operador principal é autorizado a executar os commits de bump na branch `main`, push para `origin main` e criação/push da tag anotada `vX.Y.Z`. Os papéis delegados (`implementador`, `testador`, `revisor`) continuam estritamente proibidos de realizar commits, pushes, tags ou mutações de branch/PR.
 
 Comandos obrigatórios do gate local na raiz do repositório:
 
@@ -578,4 +587,4 @@ A automação de release e o fluxo de release do FalaFácil podem ser invocados 
 - [ARQUITETURA.md](../ARQUITETURA.md) — Mapa dos módulos, distribuição e invariantes de runtime.
 - [Índice da Documentação](INDEX.md) — Catálogo central de documentos.
 - [Gate de Smoke](agents/smoke-tests.md) — Critérios de validação de bundle e testes determinísticos.
-- [Skill de Release](../.claude/skills/falafacil-release/SKILL.md) — Definição da automação de release e publicação para agentes.
+- [Skill de Release](../.agents/skills/falafacil-release/SKILL.md) — Definição da automação de release e publicação para agentes.

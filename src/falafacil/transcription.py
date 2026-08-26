@@ -13,9 +13,11 @@ from .config import DEFAULT_MODEL
 INLINE_LIMIT_BYTES = 20 * 1024 * 1024
 REQUEST_TIMEOUT_MS = 120_000
 PROMPT = (
-    "Transcreva somente o que foi falado neste áudio. "
-    "O idioma é português do Brasil. Preserve nomes próprios e termos técnicos, "
-    "corrija apenas a pontuação necessária e não invente conteúdo. "
+    "Transcreva o que foi falado neste áudio em português do Brasil com fidelidade ao sentido original. "
+    "Faça correções sutis de fala: elimine hesitações, gaguejos, repetições involuntárias, cacoetes (como 'né', 'tipo') "
+    "e fragmentos desconexos, e ajuste pequenos deslizes gramaticais, de concordância (como 'do/da') ou palavras truncadas "
+    "identificáveis pelo contexto imediato, sem alterar o sentido nem o vocabulário pretendido pelo locutor. "
+    "Preserve nomes próprios e termos técnicos, corrija a pontuação e não invente conteúdo. "
     "Retorne apenas o texto simples pronto para copiar."
 )
 

@@ -1935,3 +1935,217 @@ sys.exit(1)
     # O hash retornado deve ser estritamente o do asset remoto já publicado e imutável
     assert sha256_retry == sha256
     assert f"sha256={sha256}\n" in github_output_retry.read_text(encoding="utf-8")
+
+
+def validate_pendencias_structure(content: str) -> bool:
+    header = "# Pendências para próximas releases\n\n"
+    if not content.startswith(header):
+        return False
+    body = content[len(header):]
+    stripped_body = body.strip()
+    if not stripped_body:
+        return False
+    if stripped_body == "Nenhuma pendência no momento.":
+        return True
+
+    if not body.startswith("## "):
+        return False
+
+    sections = re.split(r"(?m)^## ", body)
+    if sections[0] != "":
+        return False
+
+    section_entries = sections[1:]
+    if not section_entries:
+        return False
+
+    version_pattern = re.compile(r"^\d+\.\d+\.\d+\s*[-—].+")
+    for sec in section_entries:
+        lines = sec.splitlines()
+        if not lines:
+            return False
+        title_line = lines[0]
+        if not version_pattern.match(title_line):
+            return False
+        sec_content = "\n".join(lines[1:]).strip()
+        if not sec_content:
+            return False
+
+    return True
+
+
+def test_release_skill_structure_and_pendencias_contract() -> None:
+    skill_file = ROOT / ".agents" / "skills" / "falafacil-release" / "SKILL.md"
+    claude_symlink = ROOT / ".claude" / "skills" / "falafacil-release"
+    omp_symlink = ROOT / ".omp" / "skills" / "falafacil-release"
+    release_doc = ROOT / "docs" / "RELEASE.md"
+    pendencias_doc = ROOT / "docs" / "PENDENCIAS.md"
+    agents_doc = ROOT / "AGENTS.md"
+    architecture_agents_doc = ROOT / "docs" / "architecture" / "agentes.md"
+
+    # 1. Arquivo canônico da skill
+    assert skill_file.is_file()
+    assert not skill_file.is_symlink()
+
+    # 2. Symlink no .claude
+    assert claude_symlink.is_symlink()
+    assert os.readlink(claude_symlink) == "../../.agents/skills/falafacil-release"
+    assert claude_symlink.resolve() == (ROOT / ".agents" / "skills" / "falafacil-release").resolve()
+    assert (claude_symlink / "SKILL.md").is_file()
+
+    # 3. Symlink no .omp
+    assert omp_symlink.is_symlink()
+    assert os.readlink(omp_symlink) == "../../.agents/skills/falafacil-release"
+    assert omp_symlink.resolve() == (ROOT / ".agents" / "skills" / "falafacil-release").resolve()
+    assert (omp_symlink / "SKILL.md").is_file()
+
+    # 4. Conteúdo da skill e consulta/resolução de PENDENCIAS.md + sequência e governança
+    skill_content = skill_file.read_text(encoding="utf-8")
+    assert "docs/PENDENCIAS.md" in skill_content
+    assert "Nenhuma pendência no momento." in skill_content
+
+    skill_step_impl = "Implement the pending changes and corresponding tests (role `implementador`)."
+    skill_step_test = "Run verification suite and smoke validation (role `testador`, requires `PASS`)."
+    skill_step_clean = (
+        "After `PASS`, remove the resolved item from `docs/PENDENCIAS.md` (role `implementador`). "
+        "When all pendencies are resolved, ensure `docs/PENDENCIAS.md` is clean "
+        "(containing only `# Pendências para próximas releases\\n\\nNenhuma pendência no momento.`)."
+    )
+    skill_step_rev = "Review complete diff including the cleaned `docs/PENDENCIAS.md` and test evidence (role `revisor`, requires `APROVADO`)."
+    skill_step_commit = "Commit the implemented pendencies to `main` branch (role: principal / release operator) before initiating version bump."
+
+    assert skill_step_impl in skill_content
+    assert skill_step_test in skill_content
+    assert skill_step_clean in skill_content
+    assert skill_step_rev in skill_content
+    assert skill_step_commit in skill_content
+
+    pos_sk_impl = skill_content.index(skill_step_impl)
+    pos_sk_test = skill_content.index(skill_step_test)
+    pos_sk_clean = skill_content.index(skill_step_clean)
+    pos_sk_rev = skill_content.index(skill_step_rev)
+    pos_sk_commit = skill_content.index(skill_step_commit)
+    assert pos_sk_impl < pos_sk_test < pos_sk_clean < pos_sk_rev < pos_sk_commit
+
+    assert "authorizes only the principal/release operator to commit resolved pendencies to `main`" in skill_content
+    assert "Delegated roles (`implementador`, `testador`, `revisor`) remain strictly forbidden" in skill_content
+
+    # 5. Documentação em RELEASE.md
+    release_content = release_doc.read_text(encoding="utf-8")
+    assert "docs/PENDENCIAS.md" in release_content
+    assert "Nenhuma pendência no momento." in release_content
+    assert ".agents/skills/falafacil-release/SKILL.md" in release_content
+
+    rel_step_impl = "O `implementador` implementa o código e os testes correspondentes (preservando o registro em `docs/PENDENCIAS.md` durante a etapa)."
+    rel_step_test = "O `testador` executa os testes e validação de smoke (`PASS`)."
+    rel_step_clean = (
+        "Após a validação com `PASS`, o `implementador` remove o item resolvido de `docs/PENDENCIAS.md` "
+        "(deixando o documento limpo contendo apenas `# Pendências para próximas releases\\n\\nNenhuma pendência no momento.` se não restarem pendências)."
+    )
+    rel_step_rev = "O `revisor` audita o diff completo (incluindo código, testes e a limpeza de `docs/PENDENCIAS.md`) e concede `APROVADO`."
+    rel_step_commit = "O agente principal / operador de release realiza o commit das pendências resolvidas na branch `main` antes de iniciar o resumo e bump de versão."
+
+    assert rel_step_impl in release_content
+    assert rel_step_test in release_content
+    assert rel_step_clean in release_content
+    assert rel_step_rev in release_content
+    assert rel_step_commit in release_content
+
+    pos_rel_impl = release_content.index(rel_step_impl)
+    pos_rel_test = release_content.index(rel_step_test)
+    pos_rel_clean = release_content.index(rel_step_clean)
+    pos_rel_rev = release_content.index(rel_step_rev)
+    pos_rel_commit = release_content.index(rel_step_commit)
+    assert pos_rel_impl < pos_rel_test < pos_rel_clean < pos_rel_rev < pos_rel_commit
+
+    assert "Exceção estrita de release para o agente principal / operador" in release_content
+    assert "commit das pendências resolvidas na branch `main`" in release_content
+    assert "commits de bump na branch `main`, push para `origin main` e criação/push da tag anotada `vX.Y.Z`" in release_content
+    assert "Os papéis delegados (`implementador`, `testador`, `revisor`) continuam estritamente proibidos" in release_content
+
+    # 6. Contrato de governança em AGENTS.md
+    assert agents_doc.is_file()
+    agents_content = agents_doc.read_text(encoding="utf-8")
+    assert "Exceção estrita de release:" in agents_content
+    assert "antes do bump de versão deve ser realizada a consulta obrigatória a `docs/PENDENCIAS.md`" in agents_content
+    assert "elas são implementadas pelo `implementador` com testes" in agents_content
+    assert "validadas pelo `testador` (`PASS`)" in agents_content
+    assert "o item resolvido é removido de `docs/PENDENCIAS.md` pelo `implementador` (deixando o documento limpo quando não restarem pendências)" in agents_content
+    assert "o diff é auditado pelo `revisor` (`APROVADO`)" in agents_content
+    assert "agente principal / operador de release fica estritamente autorizado a realizar o commit das pendências resolvidas na branch `main`" in agents_content
+
+    pos_ag_impl = agents_content.index("elas são implementadas pelo `implementador` com testes")
+    pos_ag_test = agents_content.index("validadas pelo `testador` (`PASS`)")
+    pos_ag_clean = agents_content.index("o item resolvido é removido de `docs/PENDENCIAS.md` pelo `implementador` (deixando o documento limpo quando não restarem pendências)")
+    pos_ag_rev = agents_content.index("o diff é auditado pelo `revisor` (`APROVADO`)")
+    pos_ag_commit = agents_content.index("agente principal / operador de release fica estritamente autorizado a realizar o commit das pendências resolvidas na branch `main`")
+    assert pos_ag_impl < pos_ag_test < pos_ag_clean < pos_ag_rev < pos_ag_commit
+
+    assert "commits de bump na branch `main`, push para `origin main` e criação/push da tag anotada `vX.Y.Z`" in agents_content
+    assert "Nenhum papel delegado (`implementador`, `testador`, `revisor`) pode realizar commits, pushes, tags ou mutações de branch/PR" in agents_content
+
+    # 7. Contrato de governança em docs/architecture/agentes.md
+    assert architecture_agents_doc.is_file()
+    arch_content = architecture_agents_doc.read_text(encoding="utf-8")
+    assert "realiza a consulta prévia obrigatória a `docs/PENDENCIAS.md`" in arch_content
+
+    arch_p1_impl = "encaminha a implementação ao `implementador` e a validação ao `testador`"
+    arch_p1_pass = "após o `PASS`"
+    arch_p1_clean = "o `implementador` remove o item concluído de `docs/PENDENCIAS.md` (deixando o documento limpo)"
+    arch_p1_rev = "o `revisor` audita o diff com `APROVADO`"
+    arch_p1_commit = "o principal fica estritamente autorizado a realizar o commit das pendências resolvidas na branch `main`"
+
+    assert arch_p1_impl in arch_content
+    assert arch_p1_pass in arch_content
+    assert arch_p1_clean in arch_content
+    assert arch_p1_rev in arch_content
+    assert arch_p1_commit in arch_content
+
+    pos_arch_impl = arch_content.index(arch_p1_impl)
+    pos_arch_pass = arch_content.index(arch_p1_pass)
+    pos_arch_clean = arch_content.index(arch_p1_clean)
+    pos_arch_rev = arch_content.index(arch_p1_rev)
+    pos_arch_commit = arch_content.index(arch_p1_commit)
+    assert pos_arch_impl < pos_arch_pass < pos_arch_clean < pos_arch_rev < pos_arch_commit
+
+    arch_c2_impl = "elas são implementadas pelo `implementador` com testes"
+    arch_c2_test = "validadas pelo `testador` (`PASS`)"
+    arch_c2_clean = "o item resolvido é removido de `docs/PENDENCIAS.md` pelo `implementador` (deixando o documento limpo quando não restarem pendências)"
+    arch_c2_rev = "o diff é auditado pelo `revisor` (`APROVADO`)"
+    arch_c2_commit = "o agente principal / operador de release fica estritamente autorizado a realizar o commit das pendências resolvidas na branch `main`"
+
+    assert arch_c2_impl in arch_content
+    assert arch_c2_test in arch_content
+    assert arch_c2_clean in arch_content
+    assert arch_c2_rev in arch_content
+    assert arch_c2_commit in arch_content
+
+    pos_c2_impl = arch_content.index(arch_c2_impl)
+    pos_c2_test = arch_content.index(arch_c2_test)
+    pos_c2_clean = arch_content.index(arch_c2_clean)
+    pos_c2_rev = arch_content.index(arch_c2_rev)
+    pos_c2_commit = arch_content.index(arch_c2_commit)
+    assert pos_c2_impl < pos_c2_test < pos_c2_clean < pos_c2_rev < pos_c2_commit
+
+    assert "Nenhum papel delegado (`implementador`, `testador`, `revisor`) pode realizar commits, pushes, tags ou mutações de branch/PR" in arch_content
+    # 8. Validação estrutural de PENDENCIAS.md (casos negativos e positivos)
+    # Casos negativos:
+    assert not validate_pendencias_structure("")
+    assert not validate_pendencias_structure("# Pendências para próximas releases")
+    assert not validate_pendencias_structure("# Pendências para próximas releases\n")
+    assert not validate_pendencias_structure("# Pendências para próximas releases\n\n")
+    assert not validate_pendencias_structure("\n# Pendências para próximas releases\n\nNenhuma pendência no momento.")
+    assert not validate_pendencias_structure("## 0.2.2 — sem header principal\n\ncorpo")
+    assert not validate_pendencias_structure("# Pendências para próximas releases\n\nTexto solto antes de seção\n## 0.2.2 — teste\n\nconteúdo")
+    assert not validate_pendencias_structure("# Pendências para próximas releases\n\n## 0.2.2 — teste sem corpo\n")
+    assert not validate_pendencias_structure("# Pendências para próximas releases\n\n## VersaoInvalida — teste\n\nconteúdo")
+
+    # Casos positivos:
+    assert validate_pendencias_structure("# Pendências para próximas releases\n\nNenhuma pendência no momento.")
+    assert validate_pendencias_structure("# Pendências para próximas releases\n\nNenhuma pendência no momento.\n")
+    assert validate_pendencias_structure("# Pendências para próximas releases\n\n## 0.2.2 — teste pendencia\n\ncorpo da pendencia")
+
+    # Documento real no repositório:
+    assert pendencias_doc.is_file()
+    pendencias_content = pendencias_doc.read_text(encoding="utf-8")
+    assert validate_pendencias_structure(pendencias_content)
