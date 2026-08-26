@@ -573,7 +573,7 @@ def test_configure_api_key_accepts_key_and_enables_recording(qapp, monkeypatch) 
 
     window._configure_api_key()
 
-    assert factory_calls == [("ui-session-token", "gemini-2.5-flash-lite")]
+    assert factory_calls == [("ui-session-token", "gemini-3.5-flash-lite")]
     assert store.saved == ["ui-session-token"]
     assert window.settings.api_key == "ui-session-token"
     assert window.transcriber is not None
@@ -659,18 +659,16 @@ def test_settings_dialog_model_choices_populated_and_selected(qapp) -> None:
     def inspect() -> None:
         dialog = window._settings_dialog
         assert dialog is not None
-        assert window.model_combo.count() == 3
-        labels = [window.model_combo.itemText(i) for i in range(3)]
-        data = [window.model_combo.itemData(i) for i in range(3)]
+        assert window.model_combo.count() == 2
+        labels = [window.model_combo.itemText(i) for i in range(2)]
+        data = [window.model_combo.itemData(i) for i in range(2)]
         assert data == [
-            "gemini-2.5-flash-lite",
             "gemini-3.5-flash-lite",
             "gemini-3.7-flash",
         ]
         assert labels == [
-            "Mais econômico — Gemini 2.5 Flash-Lite",
-            "Flash-Lite mais recente — Gemini 3.5 Flash-Lite",
-            "Flash mais capaz — Gemini 3.7 Flash",
+            "Mais recente — Gemini 3.5 Flash-Lite",
+            "Mais capaz — Gemini 3.7 Flash",
         ]
         assert window.model_combo.currentData() == "gemini-3.5-flash-lite"
         dialog.reject()
@@ -690,13 +688,13 @@ def test_apply_model_preference_with_active_key(qapp) -> None:
 
     window, _ = make_window(
         qapp,
-        settings=Settings(api_key="active-key", model="gemini-2.5-flash-lite"),
+        settings=Settings(api_key="active-key", model="gemini-3.5-flash-lite"),
         local_store=local_store,
         factory=factory,
     )
 
     def apply_choice() -> None:
-        idx = window.model_combo.findData("gemini-3.5-flash-lite")
+        idx = window.model_combo.findData("gemini-3.7-flash")
         assert idx >= 0
         window.model_combo.setCurrentIndex(idx)
         window.apply_model_button.click()
@@ -705,9 +703,9 @@ def test_apply_model_preference_with_active_key(qapp) -> None:
     QTimer.singleShot(0, apply_choice)
     window._open_settings_dialog()
 
-    assert factory_calls == [("active-key", "gemini-3.5-flash-lite")]
-    assert window.settings.model == "gemini-3.5-flash-lite"
-    assert local_store.get_gemini_model() == "gemini-3.5-flash-lite"
+    assert factory_calls == [("active-key", "gemini-3.7-flash")]
+    assert window.settings.model == "gemini-3.7-flash"
+    assert local_store.get_gemini_model() == "gemini-3.7-flash"
     assert window.transcriber is not None
     assert "Modelo Gemini configurado com sucesso." in window.status_label.text()
     window.close()
@@ -719,7 +717,7 @@ def test_apply_model_preference_without_key(qapp) -> None:
 
     window, _ = make_window(
         qapp,
-        settings=Settings(model="gemini-2.5-flash-lite"),
+        settings=Settings(model="gemini-3.5-flash-lite"),
         local_store=local_store,
         factory=lambda k, m: factory_calls.append((k, m)) or FakeTranscriber(),
     )
@@ -744,34 +742,34 @@ def test_apply_model_preference_without_key(qapp) -> None:
 
 def test_apply_model_preference_factory_failure_rolls_back(qapp) -> None:
     local_store = FakeLocalStore()
-    original_transcriber = FakeTranscriber(model="gemini-2.5-flash-lite")
+    original_transcriber = FakeTranscriber(model="gemini-3.5-flash-lite")
 
     def failing_factory(api_key: str, model: str):
         raise RuntimeError("factory construction failed")
 
     window, _ = make_window(
         qapp,
-        settings=Settings(api_key="active-key", model="gemini-2.5-flash-lite"),
+        settings=Settings(api_key="active-key", model="gemini-3.5-flash-lite"),
         transcriber=original_transcriber,
         local_store=local_store,
         factory=failing_factory,
     )
 
     def apply_choice() -> None:
-        idx = window.model_combo.findData("gemini-3.5-flash-lite")
+        idx = window.model_combo.findData("gemini-3.7-flash")
         window.model_combo.setCurrentIndex(idx)
         window.apply_model_button.click()
         # Verify visual rollback while dialog is still open
-        assert window.model_combo.currentData() == "gemini-2.5-flash-lite"
+        assert window.model_combo.currentData() == "gemini-3.5-flash-lite"
         assert window.model_combo.currentIndex() == window.model_combo.findData(
-            "gemini-2.5-flash-lite"
+            "gemini-3.5-flash-lite"
         )
         window._settings_dialog.reject()
 
     QTimer.singleShot(0, apply_choice)
     window._open_settings_dialog()
 
-    assert window.settings.model == "gemini-2.5-flash-lite"
+    assert window.settings.model == "gemini-3.5-flash-lite"
     assert window.transcriber is original_transcriber
     assert local_store.get_gemini_model() is None
     assert "Não foi possível configurar o modelo Gemini." in window.status_label.text()
@@ -783,12 +781,12 @@ def test_apply_model_preference_store_failure_keeps_session_model_only(qapp) -> 
 
     window, _ = make_window(
         qapp,
-        settings=Settings(model="gemini-2.5-flash-lite"),
+        settings=Settings(model="gemini-3.5-flash-lite"),
         local_store=local_store,
     )
 
     def apply_choice() -> None:
-        idx = window.model_combo.findData("gemini-3.5-flash-lite")
+        idx = window.model_combo.findData("gemini-3.7-flash")
         window.model_combo.setCurrentIndex(idx)
         window.apply_model_button.click()
         window._settings_dialog.accept()
@@ -796,7 +794,7 @@ def test_apply_model_preference_store_failure_keeps_session_model_only(qapp) -> 
     QTimer.singleShot(0, apply_choice)
     window._open_settings_dialog()
 
-    assert window.settings.model == "gemini-3.5-flash-lite"
+    assert window.settings.model == "gemini-3.7-flash"
     assert "apenas nesta sessão" in window.status_label.text()
     window.close()
 
@@ -805,7 +803,7 @@ def test_apply_model_preference_store_failure_with_active_key_keeps_session_mode
     qapp,
 ) -> None:
     local_store = FakeLocalStore(fail_model_save=True)
-    original_transcriber = FakeTranscriber(model="gemini-2.5-flash-lite")
+    original_transcriber = FakeTranscriber(model="gemini-3.5-flash-lite")
     factory_calls: list[tuple[str, str]] = []
 
     def tracking_factory(api_key: str, model: str):
@@ -814,14 +812,14 @@ def test_apply_model_preference_store_failure_with_active_key_keeps_session_mode
 
     window, _ = make_window(
         qapp,
-        settings=Settings(api_key="active-key", model="gemini-2.5-flash-lite"),
+        settings=Settings(api_key="active-key", model="gemini-3.5-flash-lite"),
         transcriber=original_transcriber,
         local_store=local_store,
         factory=tracking_factory,
     )
 
     def apply_choice() -> None:
-        idx = window.model_combo.findData("gemini-3.5-flash-lite")
+        idx = window.model_combo.findData("gemini-3.7-flash")
         window.model_combo.setCurrentIndex(idx)
         window.apply_model_button.click()
         window._settings_dialog.accept()
@@ -829,10 +827,10 @@ def test_apply_model_preference_store_failure_with_active_key_keeps_session_mode
     QTimer.singleShot(0, apply_choice)
     window._open_settings_dialog()
 
-    assert factory_calls == [("active-key", "gemini-3.5-flash-lite")]
-    assert window.settings.model == "gemini-3.5-flash-lite"
+    assert factory_calls == [("active-key", "gemini-3.7-flash")]
+    assert window.settings.model == "gemini-3.7-flash"
     assert window.transcriber is not original_transcriber
-    assert window.transcriber.model == "gemini-3.5-flash-lite"
+    assert window.transcriber.model == "gemini-3.7-flash"
     assert local_store.gemini_model is None
     assert "apenas nesta sessão" in window.status_label.text()
     window.close()

@@ -124,10 +124,92 @@ def test_gemini_model_persistence_reopen_and_overwrite(tmp_path: Path) -> None:
 def test_invalid_gemini_model_raises_error(tmp_path: Path) -> None:
     db_path = tmp_path / "falafacil.sqlite3"
     with LocalStore(db_path) as store:
-        for invalid in ("", "   ", "unknown", "gemini-1.5-flash", "gemini-test"):
+        for invalid in ("", "   ", "unknown", "gemini-1.5-flash", "gemini-test", "gemini-2.5-flash-lite"):
             with pytest.raises(LocalStoreError, match="inválido"):
                 store.save_gemini_model(invalid)
 
+def test_legacy_gemini_2_5_model_is_migrated_on_read(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    with LocalStore(db_path) as store:
+        with store._conn:
+            store._conn.execute(
+                "INSERT INTO preferences (key, value) VALUES ('gemini_model', 'gemini-2.5-flash-lite');"
+            )
+        assert store.get_gemini_model() == "gemini-3.5-flash-lite"
+        cursor = store._conn.cursor()
+        cursor.execute("SELECT value FROM preferences WHERE key = 'gemini_model';")
+        assert cursor.fetchone()[0] == "gemini-3.5-flash-lite"
+
+
+def test_legacy_gemini_2_5_model_is_migrated_on_schema_init(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+    conn.execute(
+        "CREATE TABLE token_usage ("
+        "id INTEGER PRIMARY KEY, "
+        "recorded_at TEXT NOT NULL, "
+        "model TEXT NOT NULL, "
+        "input_tokens INTEGER, "
+        "output_tokens INTEGER, "
+        "thought_tokens INTEGER, "
+        "cached_tokens INTEGER, "
+        "tool_use_tokens INTEGER, "
+        "total_tokens INTEGER, "
+        "outcome TEXT NOT NULL CHECK(outcome IN ('success', 'error'))"
+        ");"
+    )
+    conn.execute("INSERT INTO preferences (key, value) VALUES ('gemini_model', 'gemini-2.5-flash-lite');")
+    conn.execute("PRAGMA user_version = 1;")
+    conn.commit()
+    conn.close()
+
+    with LocalStore(db_path) as store:
+        assert store.get_gemini_model() == "gemini-3.5-flash-lite"
+        cursor = store._conn.cursor()
+        cursor.execute("SELECT value FROM preferences WHERE key = 'gemini_model';")
+        assert cursor.fetchone()[0] == "gemini-3.5-flash-lite"
+
+
+def test_legacy_gemini_2_5_migration_is_fail_soft_on_db_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    with LocalStore(db_path) as store:
+        with store._conn:
+            store._conn.execute(
+                "INSERT INTO preferences (key, value) VALUES ('gemini_model', 'gemini-2.5-flash-lite');"
+            )
+
+        real_conn = store._conn
+        assert real_conn is not None
+
+        class FailingCommitConnection:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real_conn, name)
+
+            def commit(self) -> None:
+                raise sqlite3.OperationalError("simulated commit failure during migration")
+
+            def __enter__(self) -> FailingCommitConnection:
+                return self
+
+            def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+                if exc_type is None:
+                    self.commit()
+                else:
+                    real_conn.rollback()
+
+        failing_conn = FailingCommitConnection()
+        monkeypatch.setattr(store, "_conn", failing_conn)
+
+        assert store.get_gemini_model() == "gemini-3.5-flash-lite"
+        assert store._conn.in_transaction is False
+
+        monkeypatch.undo()
+
+        store.save_gemini_model("gemini-3.7-flash")
+        assert store.get_gemini_model() == "gemini-3.7-flash"
 
 def test_unrecognized_stored_gemini_model_returns_none(tmp_path: Path) -> None:
     db_path = tmp_path / "falafacil.sqlite3"
@@ -137,7 +219,6 @@ def test_unrecognized_stored_gemini_model_returns_none(tmp_path: Path) -> None:
                 "INSERT INTO preferences (key, value) VALUES ('gemini_model', 'obsolete-model');"
             )
         assert store.get_gemini_model() is None
-
 
 def test_gemini_model_storage_errors_are_sanitized(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -152,7 +233,7 @@ def test_gemini_model_storage_errors_are_sanitized(
                 "Erro ao ler preferência de modelo Gemini.",
             ),
             (
-                lambda: store.save_gemini_model("gemini-2.5-flash-lite"),
+                lambda: store.save_gemini_model("gemini-3.5-flash-lite"),
                 "Erro ao salvar preferência de modelo Gemini.",
             ),
         ):

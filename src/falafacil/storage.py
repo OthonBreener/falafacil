@@ -158,6 +158,22 @@ class LocalStore:
         else:
             raise LocalStoreError(f"Versão de schema incompatível: {version}.")
 
+        try:
+            cursor.execute(
+                """
+                UPDATE preferences
+                SET value = 'gemini-3.5-flash-lite'
+                WHERE key = 'gemini_model' AND value = 'gemini-2.5-flash-lite';
+                """
+            )
+            self._conn.commit()
+        except Exception:
+            try:
+                if self._conn is not None and getattr(self._conn, "in_transaction", False):
+                    self._conn.rollback()
+            except Exception:
+                pass
+
     def _ensure_open(self) -> sqlite3.Connection:
         if self._closed or self._conn is None:
             raise LocalStoreError("O armazenamento local está fechado.")
@@ -303,6 +319,19 @@ class LocalStore:
             if row is None:
                 return None
             value = str(row[0])
+            if value == "gemini-2.5-flash-lite":
+                try:
+                    with conn:
+                        conn.execute(
+                            "UPDATE preferences SET value = 'gemini-3.5-flash-lite' WHERE key = 'gemini_model';"
+                        )
+                except Exception:
+                    try:
+                        if getattr(conn, "in_transaction", False):
+                            conn.rollback()
+                    except Exception:
+                        pass
+                return "gemini-3.5-flash-lite"
             valid_choices = {choice[0] for choice in MODEL_CHOICES}
             if value not in valid_choices:
                 return None

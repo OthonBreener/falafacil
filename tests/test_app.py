@@ -201,7 +201,7 @@ def test_main_startup_with_opaque_environment_model(
     fake_app = FakeApp([])
     monkeypatch.setattr(app_module, "QApplication", lambda argv: fake_app)
 
-    fake_store = FakeStoreForApp(model="gemini-2.5-flash-lite")
+    fake_store = FakeStoreForApp(model="gemini-3.5-flash-lite")
     monkeypatch.setattr(app_module, "resolve_storage_path", lambda: "synthetic.db")
     monkeypatch.setattr(app_module, "LocalStore", lambda path: fake_store)
 
@@ -239,7 +239,7 @@ def test_main_startup_without_api_key_leaves_transcriber_none(
     fake_app = FakeApp([])
     monkeypatch.setattr(app_module, "QApplication", lambda argv: fake_app)
 
-    fake_store = FakeStoreForApp(model="gemini-2.5-flash-lite")
+    fake_store = FakeStoreForApp(model="gemini-3.5-flash-lite")
     monkeypatch.setattr(app_module, "resolve_storage_path", lambda: "synthetic.db")
     monkeypatch.setattr(app_module, "LocalStore", lambda path: fake_store)
 
@@ -268,6 +268,45 @@ def test_main_startup_without_api_key_leaves_transcriber_none(
     assert window.settings.has_api_key is False
     assert window.transcriber is None
     assert len(transcriber_creations) == 0
+
+
+def test_main_startup_with_legacy_stored_model_migrates_to_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_app = FakeApp([])
+    monkeypatch.setattr(app_module, "QApplication", lambda argv: fake_app)
+
+    fake_store = FakeStoreForApp(model="gemini-2.5-flash-lite")
+    monkeypatch.setattr(app_module, "resolve_storage_path", lambda: "synthetic.db")
+    monkeypatch.setattr(app_module, "LocalStore", lambda path: fake_store)
+
+    fake_key_store = FakeApiKeyStoreForApp(api_key="persisted-secret-key")
+    monkeypatch.setattr(app_module, "KeyringApiKeyStore", lambda: fake_key_store)
+
+    transcriber_creations: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        app_module,
+        "GeminiTranscriber",
+        lambda api_key, model: transcriber_creations.append((api_key, model))
+        or FakeTranscriberForApp(api_key=api_key, model=model),
+    )
+
+    created_windows: list[FakeMainWindowForApp] = []
+    monkeypatch.setattr(
+        app_module,
+        "MainWindow",
+        lambda **kwargs: created_windows.append(FakeMainWindowForApp(**kwargs)) or created_windows[-1],
+    )
+
+    exit_code = app_module.main()
+
+    assert exit_code == 0
+    window = created_windows[0]
+    assert window.settings.model == DEFAULT_MODEL
+    assert window.settings.model == "gemini-3.5-flash-lite"
+    assert window.settings.model_from_environment is False
+    assert transcriber_creations == [("persisted-secret-key", "gemini-3.5-flash-lite")]
+    assert window.transcriber.model == "gemini-3.5-flash-lite"
 
 
 def test_main_startup_local_store_init_failure_results_in_none_and_default_model(

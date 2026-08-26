@@ -4,11 +4,10 @@ from falafacil.config import DEFAULT_MODEL, MODEL_CHOICES, Settings
 
 
 def test_default_model_and_choices() -> None:
-    assert DEFAULT_MODEL == "gemini-2.5-flash-lite"
+    assert DEFAULT_MODEL == "gemini-3.5-flash-lite"
     assert MODEL_CHOICES == (
-        ("gemini-2.5-flash-lite", "Mais econômico — Gemini 2.5 Flash-Lite"),
-        ("gemini-3.5-flash-lite", "Flash-Lite mais recente — Gemini 3.5 Flash-Lite"),
-        ("gemini-3.7-flash", "Flash mais capaz — Gemini 3.7 Flash"),
+        ("gemini-3.5-flash-lite", "Mais recente — Gemini 3.5 Flash-Lite"),
+        ("gemini-3.7-flash", "Mais capaz — Gemini 3.7 Flash"),
     )
 
 
@@ -92,3 +91,15 @@ def test_settings_redacts_api_key_from_repr_and_missing_message(monkeypatch) -> 
 
     assert secret not in repr(settings)
     assert secret not in settings.missing_api_key_message
+
+
+def test_settings_migrates_legacy_fallback_model(monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    settings = Settings.from_env(fallback_model="gemini-2.5-flash-lite")
+
+    assert settings.model == "gemini-3.5-flash-lite"
+    assert settings.model == DEFAULT_MODEL
+    assert settings.model_from_environment is False

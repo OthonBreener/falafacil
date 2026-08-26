@@ -5,7 +5,7 @@ Aplicativo desktop local para Ubuntu que grava fala em português do Brasil, env
 ## Recursos e comportamento
 
 - **Seleção inteligente de microfone**: priorização automática por ordem determinística: headset detectado por heurística local (metadados de nome e host API) → dispositivo selecionado na sessão atual → memória do último microfone utilizado persistida no banco local → dispositivo interno → padrão do sistema (`is_default`) → primeiro dispositivo disponível.
-- **Escolha de modelo Gemini**: seleção entre `gemini-2.5-flash-lite` (padrão mais econômico), `gemini-3.5-flash-lite` (Flash-Lite mais recente) e `gemini-3.7-flash` (Flash mais capaz) pela interface de configurações. A preferência é persistida no banco SQLite local e pode ser sobrescrita pelo ambiente via `GEMINI_MODEL`. A API de transcrição utiliza a ordem direta prompt→áudio e registra `total_cached_tokens` observados do cache implícito da API, sem camadas explícitas de cache.
+- **Escolha de modelo Gemini**: seleção entre `gemini-3.5-flash-lite` (padrão mais recente) e `gemini-3.7-flash` (Flash mais capaz) pela interface de configurações. A preferência é persistida no banco SQLite local e pode ser sobrescrita pelo ambiente via `GEMINI_MODEL`. A API de transcrição utiliza a ordem direta prompt→áudio e registra `total_cached_tokens` observados do cache implícito da API, sem camadas explícitas de cache.
 - **Gravação e revisão em memória**: captura de áudio com validação de nível e pré-visualização para reproduzir antes de enviar explicitamente ao Gemini.
 - **Atalhos globais simultâneos**: um botão lateral/central do mouse e um atalho seguro de teclado podem alternar a gravação em X11 e Wayland. A engrenagem `Configurações` orienta a autorização administrativa única, instala e ativa o serviço local por UID e preserva `Gravar`/`Space` quando a integração está ausente. O serviço lê `/dev/input` somente para comparar ou capturar triggers, não usa `grab()`, não suprime eventos, não armazena teclas/cliques e não envia dados pela rede.
 - **Diagnóstico permanente**: a janela principal mantém `Diagnóstico` visível à direita, com abas de áudio, payload, retorno e consumo e o gráfico de tokens abaixo. A transcrição ocupa 120–190 px; as ações ficam em duas linhas; a engrenagem concentra chave, modelo e atalhos; o controle adjacente alterna tela cheia.
@@ -125,8 +125,7 @@ poetry run pip install --no-deps -e .
 2. **Modelo Gemini**:
    - Na janela de **Configurações**, na seção **Modelo Gemini**, escolha o modelo desejado e clique em **Aplicar modelo**.
    - As opções disponíveis na interface são:
-     - `gemini-2.5-flash-lite` (padrão, mais econômico)
-     - `gemini-3.5-flash-lite` (Flash-Lite mais recente)
+     - `gemini-3.5-flash-lite` (padrão, mais recente)
      - `gemini-3.7-flash` (Flash mais capaz)
    - A preferência escolhida é salva no banco SQLite local.
    - Se a variável de ambiente `GEMINI_MODEL` estiver definida com valor não vazio, ela terá precedência sobre o modelo salvo e travará o seletor na interface.

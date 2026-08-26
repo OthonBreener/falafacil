@@ -5,12 +5,11 @@ from dataclasses import dataclass, field
 
 
 
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 MODEL_CHOICES: tuple[tuple[str, str], ...] = (
-    ("gemini-2.5-flash-lite", "Mais econômico — Gemini 2.5 Flash-Lite"),
-    ("gemini-3.5-flash-lite", "Flash-Lite mais recente — Gemini 3.5 Flash-Lite"),
-    ("gemini-3.7-flash", "Flash mais capaz — Gemini 3.7 Flash"),
+    ("gemini-3.5-flash-lite", "Mais recente — Gemini 3.5 Flash-Lite"),
+    ("gemini-3.7-flash", "Mais capaz — Gemini 3.7 Flash"),
 )
 
 
@@ -42,7 +41,10 @@ class Settings:
             model = env_model
             model_from_environment = True
         elif fallback_model is not None and fallback_model != "":
-            model = fallback_model
+            if fallback_model == "gemini-2.5-flash-lite":
+                model = DEFAULT_MODEL
+            else:
+                model = fallback_model
             model_from_environment = False
         else:
             model = DEFAULT_MODEL
