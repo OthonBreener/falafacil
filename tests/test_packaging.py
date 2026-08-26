@@ -601,8 +601,8 @@ def test_pyproject_requires_evdev_two_point_zero_floor() -> None:
 def test_single_source_of_truth_version_and_pyproject_dynamic_metadata() -> None:
     import falafacil
 
-    assert falafacil.__version__ == "0.2.1"
-    assert importlib.metadata.version("falafacil") == "0.2.1"
+    assert falafacil.__version__ == "0.2.2"
+    assert importlib.metadata.version("falafacil") == "0.2.2"
 
     pyproject_path = ROOT / "pyproject.toml"
     with pyproject_path.open("rb") as fp:
@@ -630,7 +630,7 @@ def test_single_source_of_truth_version_and_pyproject_dynamic_metadata() -> None
 def test_installed_distribution_metadata_and_console_script() -> None:
     import falafacil
 
-    assert importlib.metadata.version("falafacil") == "0.2.1"
+    assert importlib.metadata.version("falafacil") == "0.2.2"
     assert importlib.metadata.version("falafacil") == falafacil.__version__
 
     entry_points = importlib.metadata.entry_points(group="console_scripts")
@@ -651,7 +651,7 @@ def test_clean_checkout_tag_validation_import_ordering() -> None:
         check=False,
     )
     assert res.returncode == 0, f"Import falafacil failed with PYTHONPATH=src: {res.stderr}"
-    assert res.stdout.strip() == "0.2.1"
+    assert res.stdout.strip() == "0.2.2"
 
 def test_module_dispatches_update_probe_contract(monkeypatch) -> None:
     from falafacil import __main__ as module_entry
@@ -668,7 +668,7 @@ def test_module_dispatches_update_probe_contract(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "falafacil.app", app_module)
 
     # Versão correspondente -> exit 0
-    monkeypatch.setattr(sys, "argv", ["falafacil", "--update-probe", "0.2.1"])
+    monkeypatch.setattr(sys, "argv", ["falafacil", "--update-probe", "0.2.2"])
     assert module_entry.main() == 0
     assert not app_called
 
@@ -682,7 +682,7 @@ def test_module_dispatches_update_probe_contract(monkeypatch) -> None:
     # Aridade malformada -> exit 2
     monkeypatch.setattr(sys, "argv", ["falafacil", "--update-probe"])
     assert module_entry.main() == 2
-    monkeypatch.setattr(sys, "argv", ["falafacil", "--update-probe", "0.2.1", "extra"])
+    monkeypatch.setattr(sys, "argv", ["falafacil", "--update-probe", "0.2.2", "extra"])
     assert module_entry.main() == 2
     assert not app_called
 
@@ -940,10 +940,10 @@ def test_release_workflow_tag_validation_simulation(tmp_path: Path) -> None:
 
     output_file = tmp_path / "github_output.txt"
 
-    # 1. Caso válido correspondente à versão do pacote (v0.2.1)
+    # 1. Caso válido correspondente à versão do pacote (v0.2.2)
     output_file.write_text("", encoding="utf-8")
     env = os.environ.copy()
-    env["RELEASE_TAG"] = "v0.2.1"
+    env["RELEASE_TAG"] = "v0.2.2"
     env["GITHUB_OUTPUT"] = str(output_file)
     env["PYTHONPATH"] = str(ROOT / "src")
     res = subprocess.run(
@@ -956,8 +956,8 @@ def test_release_workflow_tag_validation_simulation(tmp_path: Path) -> None:
     )
     assert res.returncode == 0, res.stderr
     out_text = output_file.read_text(encoding="utf-8")
-    assert "version=0.2.1\n" in out_text
-    assert "tag=v0.2.1\n" in out_text
+    assert "version=0.2.2\n" in out_text
+    assert "tag=v0.2.2\n" in out_text
 
     # 2. Caso com divergência de versão (v0.3.0)
     env["RELEASE_TAG"] = "v0.3.0"
@@ -1783,7 +1783,7 @@ def test_publish_release_validations_and_cli(tmp_path: Path) -> None:
         mod.validate_tag_and_version("v0.2.0", "v0.2.0")
 
     with pytest.raises(mod.ReleaseError, match="diverge"):
-        mod.validate_tag_and_version("v0.2.0", "0.2.1")
+        mod.validate_tag_and_version("v0.2.0", "0.2.2")
 
     # Arquivos locais ausentes ou com nomes inválidos
     raw_path, tar_path = _create_synthetic_release_assets(tmp_path, "0.2.0", marker="valid")
