@@ -7,8 +7,9 @@ import threading
 import time
 import numpy as np
 import pytest
-from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QEventLoop, QObject, QPoint, QPointF, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QKeySequence, QMouseEvent
+from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QEventLoop, QObject, QPoint, QPointF, QRect, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QCloseEvent, QCursor, QGuiApplication, QKeyEvent, QKeySequence, QMouseEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -37,6 +38,7 @@ from falafacil.ui import (
     CAPTURE_WAITING_TEXT,
     AppState,
     MainWindow,
+    SpellSuggestionPopup,
     TokenUsageChart,
 )
 
@@ -3350,4 +3352,453 @@ def test_editor_context_menu_does_not_leak_qmenu_on_repeated_invocations(
 
     # Nenhum QMenu deve permanecer retido como filho de self.editor
     assert len(window.editor.findChildren(QMenu)) == 0
+    window.close()
+
+
+def test_spell_popup_visible_on_cursor_in_misspelled_word_and_hidden_on_valid_or_space(
+    qapp,
+) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto", "erado"]},
+    )
+    window, _ = make_window(qapp, spell_checker=checker)
+    window.editor.setPlainText("palavra errado aqui")
+    qapp.processEvents()
+
+    assert window._spell_popup.isVisible() is False
+
+    # 1. Cursor posicionado dentro de "errado" (posição 10)
+    cursor = window.editor.textCursor()
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+
+    assert window._spell_popup.isVisible() is True
+    assert len(window._spell_popup.suggestion_buttons) == 2
+    assert window._spell_popup.suggestion_buttons[0].text() == "correto"
+    assert window._spell_popup.suggestion_buttons[1].text() == "erado"
+    assert window._spell_popup.ignore_button is not None
+
+    # 2. Cursor movido para palavra válida "palavra" (posição 2)
+    cursor.setPosition(2)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is False
+
+    # 3. Cursor movido de volta para "errado" (posição 11)
+    cursor.setPosition(11)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is True
+
+    # 4. Cursor movido para o espaço após "errado" (posição 14)
+    cursor.setPosition(14)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is False
+
+    window.close()
+
+
+def test_spell_popup_click_suggestion_replaces_word(qapp) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto"]},
+    )
+    window, _ = make_window(qapp, spell_checker=checker)
+    window.editor.setPlainText("palavra errado aqui")
+
+    cursor = window.editor.textCursor()
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+
+    assert window._spell_popup.isVisible() is True
+    assert len(window._spell_popup.suggestion_buttons) == 1
+
+    chip = window._spell_popup.suggestion_buttons[0]
+    # Transição do ponteiro e clique real via QTest
+    QTest.mouseMove(window._spell_popup, chip.rect().center())
+    QTest.mouseClick(chip, Qt.MouseButton.LeftButton)
+    qapp.processEvents()
+
+    assert window.editor.toPlainText() == "palavra correto aqui"
+    assert window._spell_popup.isVisible() is False
+    assert window.editor.hasFocus() is True
+
+    # Testa histórico de desfazer (Undo)
+    window.editor.undo()
+    assert window.editor.toPlainText() == "palavra errado aqui"
+
+    window.close()
+
+
+def test_spell_popup_click_ignore_adds_to_ignored_and_rehighlights(qapp) -> None:
+    store = FakeLocalStore()
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto"]},
+    )
+    window, _ = make_window(qapp, local_store=store, spell_checker=checker)
+    window.editor.setPlainText("palavra errado aqui")
+
+    cursor = window.editor.textCursor()
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+
+    assert window._spell_popup.isVisible() is True
+    assert window._spell_popup.ignore_button is not None
+
+    ignore_btn = window._spell_popup.ignore_button
+    # Transição do ponteiro e clique real via QTest
+    QTest.mouseMove(window._spell_popup, ignore_btn.rect().center())
+    QTest.mouseClick(ignore_btn, Qt.MouseButton.LeftButton)
+    qapp.processEvents()
+
+    assert window._spell_popup.isVisible() is False
+    assert window.editor.hasFocus() is True
+    assert checker.is_ignored("errado") is True
+    assert "errado" in store.get_spellcheck_ignored_words()
+
+    # Ao mover o cursor novamente para a palavra ignorada, o popup não abre
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is False
+
+    window.close()
+
+
+def test_spell_popup_hover_trigger_after_timer(qapp) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto"]},
+    )
+    window, _ = make_window(qapp, spell_checker=checker)
+    window.editor.setPlainText("palavra errado aqui")
+
+    cursor = window.editor.textCursor()
+    cursor.setPosition(10)
+    pos_errado = window.editor.cursorRect(cursor).center()
+
+    # Simula hover do mouse sobre "errado"
+    hover_event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(pos_errado),
+        QPointF(pos_errado),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    window.eventFilter(window.editor.viewport(), hover_event)
+
+    assert window._hover_spell_timer.isActive() is True
+    assert window._last_hover_pos == pos_errado
+
+    # Dispara o temporizador de hover
+    window._hover_spell_timer.timeout.emit()
+    qapp.processEvents()
+
+    assert window._spell_popup.isVisible() is True
+    assert len(window._spell_popup.suggestion_buttons) == 1
+    assert window._spell_popup.suggestion_buttons[0].text() == "correto"
+
+    window.close()
+
+
+def test_spell_popup_suppressed_during_review_and_readonly(qapp) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto"]},
+    )
+    window, _ = make_window(qapp, spell_checker=checker)
+    window.editor.setPlainText("palavra errado aqui")
+
+    # 1. Durante revisão com IA
+    window._is_reviewing = True
+    cursor = window.editor.textCursor()
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is False
+
+    # 2. Modo somente leitura
+    window._is_reviewing = False
+    window.editor.setReadOnly(True)
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is False
+
+    # 3. Corretor desabilitado no highlighter
+    window.editor.setReadOnly(False)
+    window.highlighter.enabled = False
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is False
+
+    window.close()
+
+
+def test_spell_popup_automatic_dismissal_events(qapp) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto"]},
+    )
+    window, _ = make_window(qapp, spell_checker=checker)
+    window.editor.setPlainText("palavra errado aqui")
+
+    # Abre o balão
+    cursor = window.editor.textCursor()
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is True
+
+    # 1. Tecla Escape fecha o popup e consome o evento
+    key_event = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier
+    )
+    consumed = window.eventFilter(window.editor, key_event)
+    assert consumed is True
+    assert window._spell_popup.isVisible() is False
+
+    # Abre novamente
+    cursor.setPosition(11)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is True
+
+    # 2. Evento Leave no viewport inicia timer de tolerância e timeout fecha o popup
+    leave_event = QEvent(QEvent.Type.Leave)
+    window.eventFilter(window.editor.viewport(), leave_event)
+    assert window._popup_dismiss_timer.isActive() is True
+    assert window._spell_popup.isVisible() is True
+    QCursor.setPos(QPoint(0, 0))
+    window._is_mouse_over_popup = False
+    window._on_popup_dismiss_timer_timeout()
+    assert window._spell_popup.isVisible() is False
+    # Abre novamente
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is True
+
+    # 3. Evento Wheel fecha o popup
+    wheel_event = QEvent(QEvent.Type.Wheel)
+    window.eventFilter(window.editor.viewport(), wheel_event)
+    assert window._spell_popup.isVisible() is False
+
+    # Abre novamente
+    cursor.setPosition(11)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is True
+
+    # 4. Redimensionamento fecha o popup
+    window.resize(window.width() + 20, window.height() + 20)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is False
+
+    # Abre novamente
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is True
+    # 5. Movimentação da janela fecha o popup
+    window.move(window.x() + 30, window.y() + 30)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is False
+    window.close()
+
+
+def test_spell_popup_no_suggestions_displays_label(qapp) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=(),
+        suggestions={"xyz": []},
+    )
+    window, _ = make_window(qapp, spell_checker=checker)
+    window.editor.setPlainText("xyz")
+
+    cursor = window.editor.textCursor()
+    cursor.setPosition(1)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+
+    assert window._spell_popup.isVisible() is True
+    assert len(window._spell_popup.suggestion_buttons) == 0
+    assert window._spell_popup.no_suggestions_label is not None
+    assert window._spell_popup.no_suggestions_label.text() == "Sem sugestões"
+    assert window._spell_popup.ignore_button is not None
+
+    window.close()
+
+
+def test_spell_popup_cleaned_up_on_close(qapp) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra",),
+        suggestions={"errado": ["correto"]},
+    )
+    window, _ = make_window(qapp, spell_checker=checker)
+    window.editor.setPlainText("errado")
+    cursor = window.editor.textCursor()
+    cursor.setPosition(2)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup is not None
+    assert window._spell_popup.isVisible() is True
+
+    window.close()
+    assert window._spell_popup is None
+
+
+def test_spell_popup_pointer_transition_and_hover_tolerance(qapp) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto"]},
+    )
+    window, _ = make_window(qapp, spell_checker=checker)
+    window.editor.setPlainText("palavra errado aqui")
+
+    # Posiciona no token com erro para abrir popup
+    cursor = window.editor.textCursor()
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is True
+
+    # 1. Ponteiro sai do viewport em direção ao popup: timer de 200ms inicia, popup permanece visível
+    leave_vp = QEvent(QEvent.Type.Leave)
+    window.eventFilter(window.editor.viewport(), leave_vp)
+    assert window._popup_dismiss_timer.isActive() is True
+    assert window._spell_popup.isVisible() is True
+
+    # 2. Ponteiro entra no popup antes do timeout: cancela timer de fechamento e registra hover
+    enter_popup = QEvent(QEvent.Type.Enter)
+    window.eventFilter(window._spell_popup, enter_popup)
+    assert window._is_mouse_over_popup is True
+    assert window._popup_dismiss_timer.isActive() is False
+    assert window._spell_popup.isVisible() is True
+
+    # 3. Movimento sobre o popup mantém o estado de mouse sobre o popup
+    move_popup = QEvent(QEvent.Type.MouseMove)
+    window.eventFilter(window._spell_popup, move_popup)
+    assert window._is_mouse_over_popup is True
+
+    # 4. Timeout do dismiss timer não fecha o popup se mouse estiver sobre ele
+    window._on_popup_dismiss_timer_timeout()
+    assert window._spell_popup.isVisible() is True
+
+    # 5. Ponteiro sai do popup para fora da área do token: popup fecha
+    QCursor.setPos(QPoint(0, 0))
+    leave_popup = QEvent(QEvent.Type.Leave)
+    window.eventFilter(window._spell_popup, leave_popup)
+    assert window._is_mouse_over_popup is False
+    assert window._spell_popup.isVisible() is False
+    # 6. Se o dismiss timer disparar quando o mouse não estiver no popup, popup fecha
+    cursor.setPosition(11)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is True
+    window.eventFilter(window.editor.viewport(), leave_vp)
+    assert window._popup_dismiss_timer.isActive() is True
+    window._is_mouse_over_popup = False
+    QCursor.setPos(QPoint(0, 0))
+    window._on_popup_dismiss_timer_timeout()
+    assert window._spell_popup.isVisible() is False
+
+    window.close()
+
+
+def test_spell_popup_screen_edge_clamping_and_above_positioning(qapp) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=(),
+        suggestions={"errado": ["correto", "sugestao2"]},
+    )
+    window, _ = make_window(qapp, spell_checker=checker)
+    popup = window._spell_popup
+
+    screen = QGuiApplication.primaryScreen()
+    screen_geom = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+
+    # 1. Posição na borda inferior da tela: popup deve ser renderizado ACIMA da palavra
+    # e dentro dos limites verticais da tela disponível
+    bottom_y = screen_geom.bottom() - 10
+    target_rect_bottom = QRect(200, bottom_y, 80, 20)
+    popup.show_suggestions("errado", ["correto", "sugestao2"], target_rect_bottom)
+    qapp.processEvents()
+
+    assert popup.isVisible() is True
+    assert popup.y() < target_rect_bottom.top()
+    assert popup.y() >= screen_geom.top() + 4
+    assert popup.geometry().bottom() <= screen_geom.bottom() - 4
+
+    # 2. Posição na borda direita da tela: popup deve ser limitado horizontalmente (clamping)
+    right_x = screen_geom.right() - 20
+    target_rect_right = QRect(right_x, 300, 80, 20)
+    popup.show_suggestions("errado", ["correto", "sugestao2"], target_rect_right)
+    qapp.processEvents()
+
+    assert popup.isVisible() is True
+    assert popup.geometry().right() <= screen_geom.right() - 4
+    assert popup.x() >= screen_geom.left() + 4
+
+    # 3. Posição no canto inferior direito extremo
+    target_rect_corner = QRect(screen_geom.right() - 10, screen_geom.bottom() - 10, 60, 20)
+    popup.show_suggestions("errado", ["correto"], target_rect_corner)
+    qapp.processEvents()
+
+    assert popup.isVisible() is True
+    assert popup.y() < target_rect_corner.top()
+    assert popup.geometry().right() <= screen_geom.right() - 4
+    assert popup.geometry().bottom() <= screen_geom.bottom() - 4
+    assert popup.x() >= screen_geom.left() + 4
+    assert popup.y() >= screen_geom.top() + 4
+
+    window.close()
+
+
+def test_spell_popup_dismissed_on_scrollbar_scroll(qapp) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto"]},
+    )
+    window, _ = make_window(qapp, spell_checker=checker)
+    window.editor.setPlainText("palavra errado aqui")
+
+    # Abre o popup
+    cursor = window.editor.textCursor()
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is True
+
+    # 1. Rolagem da barra vertical fecha o popup
+    window.editor.verticalScrollBar().valueChanged.emit(10)
+    assert window._spell_popup.isVisible() is False
+
+    # Abre novamente
+    cursor.setPosition(11)
+    window.editor.setTextCursor(cursor)
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is True
+
+    # 2. Rolagem da barra horizontal fecha o popup
+    window.editor.horizontalScrollBar().valueChanged.emit(5)
+    assert window._spell_popup.isVisible() is False
+
     window.close()

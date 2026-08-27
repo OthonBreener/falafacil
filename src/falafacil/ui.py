@@ -12,19 +12,23 @@ from PySide6.QtCore import (
     QIODevice,
     QObject,
     QPoint,
+    QRect,
     QRectF,
     QSize,
     QThread,
     QTimer,
     QUrl,
     Qt,
+    Signal,
     Slot,
 )
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
     QColor,
+    QCursor,
     QFont,
+    QGuiApplication,
     QIcon,
     QKeySequence,
     QPainter,
@@ -40,6 +44,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -473,6 +478,152 @@ class TokenUsageChart(QWidget):
 
         self.last_rendered_bar_rects = tuple(rendered_bars)
 
+class SpellSuggestionPopup(QFrame):
+    """Balão flutuante moderno de sugestões ortográficas para palavras com erro."""
+
+    suggestion_selected = Signal(str)
+    ignore_selected = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(
+            parent,
+            Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setMouseTracking(True)
+        self._current_word: str = ""
+        self.suggestion_buttons: list[QPushButton] = []
+        self.ignore_button: QPushButton | None = None
+        self.no_suggestions_label: QLabel | None = None
+        self._setup_style()
+        self._init_layout()
+
+    def _setup_style(self) -> None:
+        self.setStyleSheet(
+            """
+            SpellSuggestionPopup {
+                background-color: #1E293B;
+                border: 1px solid #475569;
+                border-radius: 6px;
+            }
+            QPushButton#suggestion_chip {
+                background-color: #334155;
+                color: #38BDF8;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                padding: 3px 8px;
+                font-weight: 500;
+                font-size: 12px;
+            }
+            QPushButton#suggestion_chip:hover {
+                background-color: #0284C7;
+                color: #FFFFFF;
+                border-color: #0284C7;
+            }
+            QPushButton#ignore_button {
+                background-color: transparent;
+                color: #94A3B8;
+                border: none;
+                border-radius: 4px;
+                padding: 3px 6px;
+                font-size: 11px;
+            }
+            QPushButton#ignore_button:hover {
+                background-color: #334155;
+                color: #E2E8F0;
+            }
+            QLabel {
+                color: #94A3B8;
+                font-size: 12px;
+                border: none;
+                padding: 2px 4px;
+            }
+            """
+        )
+
+    def _init_layout(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(4)
+
+    def show_suggestions(
+        self, word: str, suggestions: list[str], target_rect: QRect
+    ) -> None:
+        self._current_word = word
+        self.suggestion_buttons.clear()
+        self.ignore_button = None
+        self.no_suggestions_label = None
+
+        layout = self.layout()
+        if layout is None:
+            return
+
+        while layout.count() > 0:
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+        top_suggestions = suggestions[:3]
+        if top_suggestions:
+            for sug in top_suggestions:
+                btn = QPushButton(sug, self)
+                btn.setObjectName("suggestion_chip")
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.clicked.connect(
+                    lambda checked=False, s=sug: self._on_suggestion_clicked(s)
+                )
+                btn.show()
+                layout.addWidget(btn)
+                self.suggestion_buttons.append(btn)
+        else:
+            lbl = QLabel("Sem sugestões", self)
+            lbl.show()
+            layout.addWidget(lbl)
+            self.no_suggestions_label = lbl
+
+        ignore_btn = QPushButton("Ignorar", self)
+        ignore_btn.setObjectName("ignore_button")
+        ignore_btn.setToolTip(f'Ignorar "{word}"')
+        ignore_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ignore_btn.clicked.connect(self._on_ignore_clicked)
+        ignore_btn.show()
+        layout.addWidget(ignore_btn)
+        self.ignore_button = ignore_btn
+
+        self.adjustSize()
+        screen = (
+            QGuiApplication.screenAt(target_rect.center())
+            or QGuiApplication.primaryScreen()
+        )
+        screen_geom = (
+            screen.availableGeometry()
+            if screen is not None
+            else QRect(0, 0, 1920, 1080)
+        )
+        popup_w = self.sizeHint().width()
+        popup_h = self.sizeHint().height()
+        x = target_rect.left()
+        y = target_rect.bottom() + 4
+        if y + popup_h > screen_geom.bottom() - 6:
+            y = target_rect.top() - popup_h - 4
+        x = max(screen_geom.left() + 4, min(x, screen_geom.right() - popup_w - 4))
+        y = max(screen_geom.top() + 4, min(y, screen_geom.bottom() - popup_h - 4))
+        self.move(QPoint(x, y))
+        self.show()
+        self.raise_()
+
+    def _on_suggestion_clicked(self, suggestion: str) -> None:
+        self.hide()
+        self.suggestion_selected.emit(suggestion)
+
+    def _on_ignore_clicked(self) -> None:
+        word = self._current_word
+        self.hide()
+        self.ignore_selected.emit(word)
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -609,6 +760,31 @@ class MainWindow(QMainWindow):
         )
         self.editor.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.editor.customContextMenuRequested.connect(self._show_editor_context_menu)
+        self._spell_popup = SpellSuggestionPopup(self.editor)
+        self._spell_popup.suggestion_selected.connect(
+            self._on_popup_suggestion_selected
+        )
+        self._spell_popup.ignore_selected.connect(self._on_popup_ignore_selected)
+        self._spell_popup.installEventFilter(self)
+        self._is_mouse_over_popup: bool = False
+        self._active_spell_token: tuple[int, int, str] | None = None
+        self._hover_spell_timer = QTimer(self)
+        self._hover_spell_timer.setSingleShot(True)
+        self._hover_spell_timer.timeout.connect(self._on_hover_spell_timer_timeout)
+        self._popup_dismiss_timer = QTimer(self)
+        self._popup_dismiss_timer.setSingleShot(True)
+        self._popup_dismiss_timer.timeout.connect(
+            self._on_popup_dismiss_timer_timeout
+        )
+        self._last_hover_pos: QPoint | None = None
+        self.editor.cursorPositionChanged.connect(
+            self._on_editor_cursor_position_changed
+        )
+        self.editor.viewport().installEventFilter(self)
+        self.editor.installEventFilter(self)
+        self.editor.viewport().setMouseTracking(True)
+        self.editor.verticalScrollBar().valueChanged.connect(self._hide_spell_popup)
+        self.editor.horizontalScrollBar().valueChanged.connect(self._hide_spell_popup)
         self._restore_shortcuts()
         self._refresh_microphones()
         self._refresh_token_usage_chart()
@@ -1022,6 +1198,8 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _on_spellcheck_toggled(self, checked: bool) -> None:
         self.highlighter.enabled = checked
+        if not checked:
+            self._hide_spell_popup()
         if self.local_store is not None:
             try:
                 self.local_store.save_spellcheck_enabled(checked)
@@ -2057,6 +2235,7 @@ class MainWindow(QMainWindow):
         if not self.editor.toPlainText().strip():
             self.status_label.setText("Não há texto para apagar.")
             return
+        self._hide_spell_popup()
         self.editor.clear()
         self.status_label.setText("Texto apagado.")
 
@@ -2172,6 +2351,114 @@ class MainWindow(QMainWindow):
                 pass
         self.highlighter.rehighlight()
 
+    def _hide_spell_popup(self) -> None:
+        if hasattr(self, "_hover_spell_timer") and self._hover_spell_timer.isActive():
+            self._hover_spell_timer.stop()
+        if (
+            hasattr(self, "_popup_dismiss_timer")
+            and self._popup_dismiss_timer.isActive()
+        ):
+            self._popup_dismiss_timer.stop()
+        self._is_mouse_over_popup = False
+        if hasattr(self, "_spell_popup") and self._spell_popup is not None:
+            self._spell_popup.hide()
+        self._active_spell_token = None
+
+    def _on_popup_dismiss_timer_timeout(self) -> None:
+        if self._spell_popup is None or not self._spell_popup.isVisible():
+            return
+        cursor_pos = QCursor.pos()
+        if self._is_mouse_over_popup or self._spell_popup.geometry().contains(cursor_pos):
+            return
+        self._hide_spell_popup()
+
+    def _on_editor_cursor_position_changed(self) -> None:
+        self._check_spell_under_cursor(self.editor.textCursor(), source="cursor")
+
+    def _on_hover_spell_timer_timeout(self) -> None:
+        if self._last_hover_pos is None:
+            return
+        cursor = self.editor.cursorForPosition(self._last_hover_pos)
+        self._check_spell_under_cursor(cursor, source="hover")
+
+    def _check_spell_under_cursor(
+        self, cursor: QTextCursor, source: str = "cursor"
+    ) -> None:
+        del source
+        if (
+            self._is_reviewing
+            or self.editor.isReadOnly()
+            or not self.highlighter.enabled
+            or not self.spell_checker.is_available()
+            or self._spell_popup is None
+        ):
+            self._hide_spell_popup()
+            return
+
+        block = cursor.block()
+        block_text = block.text()
+        pos_in_block = cursor.positionInBlock()
+
+        tokens = self.spell_checker.tokenize(block_text)
+        utf16_map = utf16_code_unit_offsets(block_text)
+        matched_token: tuple[int, int, str] | None = None
+        for start, end, t_word in tokens:
+            qt_start = utf16_map[start]
+            qt_end = utf16_map[end]
+            if qt_start <= pos_in_block < qt_end:
+                matched_token = (qt_start, qt_end, t_word)
+                break
+
+        if matched_token is None:
+            self._hide_spell_popup()
+            return
+
+        qt_start, qt_end, word = matched_token
+        if self.spell_checker.check(word):
+            self._hide_spell_popup()
+            return
+
+        block_pos = block.position()
+        global_start = block_pos + qt_start
+        global_end = block_pos + qt_end
+
+        if (
+            self._spell_popup.isVisible()
+            and self._active_spell_token == (global_start, global_end, word)
+        ):
+            return
+
+        self._active_spell_token = (global_start, global_end, word)
+        suggestions = self.spell_checker.suggest(word, limit=3)
+
+        word_cursor = QTextCursor(cursor)
+        word_cursor.setPosition(global_start)
+        word_cursor.setPosition(global_end, QTextCursor.MoveMode.KeepAnchor)
+        cursor_rect = self.editor.cursorRect(word_cursor)
+        global_top_left = self.editor.viewport().mapToGlobal(cursor_rect.topLeft())
+        target_rect = QRect(global_top_left, cursor_rect.size())
+
+        self._spell_popup.show_suggestions(word, suggestions, target_rect)
+
+    def _on_popup_suggestion_selected(self, replacement: str) -> None:
+        if self._active_spell_token is None:
+            return
+        start, end, _word = self._active_spell_token
+        cursor = self.editor.textCursor()
+        cursor.beginEditBlock()
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(replacement)
+        cursor.endEditBlock()
+        self.editor.setTextCursor(cursor)
+        self.editor.setFocus()
+        self._hide_spell_popup()
+
+    def _on_popup_ignore_selected(self, word: str) -> None:
+        self._ignore_spellcheck_word(word)
+        self.editor.setFocus()
+        self._hide_spell_popup()
+
     @Slot()
     def _review_text_with_ai(self) -> None:
         text = self.editor.toPlainText().strip()
@@ -2186,6 +2473,7 @@ class MainWindow(QMainWindow):
         if self._is_reviewing:
             return
 
+        self._hide_spell_popup()
         self._is_reviewing = True
         self.editor.setReadOnly(True)
         self.status_label.setText("Revisando texto com IA...")
@@ -2245,6 +2533,82 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
         self._update_actions()
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._hide_spell_popup()
+
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        self._hide_spell_popup()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.editor.viewport():
+            event_type = event.type()
+            if event_type == QEvent.Type.MouseMove:
+                if (
+                    hasattr(self, "_popup_dismiss_timer")
+                    and self._popup_dismiss_timer.isActive()
+                ):
+                    self._popup_dismiss_timer.stop()
+                pos = (
+                    event.position().toPoint()
+                    if hasattr(event, "position")
+                    else event.pos()
+                )
+                self._last_hover_pos = pos
+                self._hover_spell_timer.start(250)
+            elif event_type == QEvent.Type.Leave:
+                if (
+                    hasattr(self, "_hover_spell_timer")
+                    and self._hover_spell_timer.isActive()
+                ):
+                    self._hover_spell_timer.stop()
+                if self._spell_popup is not None and self._spell_popup.isVisible():
+                    self._popup_dismiss_timer.start(200)
+            elif event_type in (QEvent.Type.Wheel, QEvent.Type.Resize):
+                if (
+                    hasattr(self, "_hover_spell_timer")
+                    and self._hover_spell_timer.isActive()
+                ):
+                    self._hover_spell_timer.stop()
+                self._hide_spell_popup()
+        elif watched is self._spell_popup:
+            event_type = event.type()
+            if event_type in (QEvent.Type.Enter, QEvent.Type.MouseMove):
+                self._is_mouse_over_popup = True
+                if (
+                    hasattr(self, "_popup_dismiss_timer")
+                    and self._popup_dismiss_timer.isActive()
+                ):
+                    self._popup_dismiss_timer.stop()
+            elif event_type == QEvent.Type.Leave:
+                self._is_mouse_over_popup = False
+                cursor_pos = QCursor.pos()
+                viewport = self.editor.viewport()
+                vp_pos = viewport.mapFromGlobal(cursor_pos)
+                is_over_token = False
+                if (
+                    viewport.rect().contains(vp_pos)
+                    and self._active_spell_token is not None
+                ):
+                    text_cursor = self.editor.cursorForPosition(vp_pos)
+                    start, end, _word = self._active_spell_token
+                    pos = text_cursor.position()
+                    if start <= pos <= end:
+                        is_over_token = True
+                if not is_over_token:
+                    self._hide_spell_popup()
+        elif watched is self.editor:
+            event_type = event.type()
+            if event_type == QEvent.Type.KeyPress:
+                if event.key() == Qt.Key.Key_Escape:
+                    if self._spell_popup is not None and self._spell_popup.isVisible():
+                        self._hide_spell_popup()
+                        return True
+            elif event_type in (QEvent.Type.Resize, QEvent.Type.Move):
+                self._hide_spell_popup()
+        return super().eventFilter(watched, event)
+
     def closeEvent(self, event: QCloseEvent) -> None:
         if (
             self.homebrew_update_controller is not None
@@ -2256,6 +2620,19 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._is_closing = True
+        if hasattr(self, "_hover_spell_timer") and self._hover_spell_timer.isActive():
+            self._hover_spell_timer.stop()
+        if (
+            hasattr(self, "_popup_dismiss_timer")
+            and self._popup_dismiss_timer.isActive()
+        ):
+            self._popup_dismiss_timer.stop()
+        if hasattr(self, "_spell_popup") and self._spell_popup is not None:
+            try:
+                self._spell_popup.close()
+            except Exception:
+                pass
+            self._spell_popup = None
         if self._capture_dialog is not None:
             self._capture_dialog.reject()
         try:
