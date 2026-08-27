@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
+import json
 from pathlib import Path
 import sqlite3
 from typing import Any, Literal
@@ -359,6 +360,92 @@ class LocalStore:
         except sqlite3.Error:
             raise LocalStoreError(
                 "Erro ao salvar preferência de modelo Gemini."
+            ) from None
+
+    def get_spellcheck_enabled(self) -> bool:
+        conn = self._ensure_open()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT value FROM preferences WHERE key = 'spellcheck_enabled';"
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return True
+            val = str(row[0])
+            return val != "0"
+        except sqlite3.Error:
+            raise LocalStoreError(
+                "Erro ao ler preferência de corretor ortográfico."
+            ) from None
+
+    def save_spellcheck_enabled(self, enabled: bool) -> None:
+        conn = self._ensure_open()
+        if not isinstance(enabled, bool):
+            raise LocalStoreError(
+                "Valor inválido para preferência de corretor ortográfico."
+            )
+        value = "1" if enabled else "0"
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO preferences (key, value)
+                    VALUES ('spellcheck_enabled', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                    """,
+                    (value,),
+                )
+        except sqlite3.Error:
+            raise LocalStoreError(
+                "Erro ao salvar preferência de corretor ortográfico."
+            ) from None
+
+    def get_spellcheck_ignored_words(self) -> list[str]:
+        conn = self._ensure_open()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT value FROM preferences WHERE key = 'spellcheck_ignored_words';"
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return []
+            raw = str(row[0])
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    return [str(w) for w in data if isinstance(w, str) and w.strip()]
+            except Exception:
+                pass
+            return []
+        except sqlite3.Error:
+            raise LocalStoreError(
+                "Erro ao ler lista de palavras ignoradas."
+            ) from None
+
+    def add_spellcheck_ignored_word(self, word: str) -> None:
+        conn = self._ensure_open()
+        if not isinstance(word, str) or not word.strip():
+            raise LocalStoreError("Palavra ignorada inválida.")
+        clean = word.strip().lower()
+        try:
+            current = self.get_spellcheck_ignored_words()
+            if clean not in current:
+                current.append(clean)
+                encoded = json.dumps(current, ensure_ascii=False)
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO preferences (key, value)
+                        VALUES ('spellcheck_ignored_words', ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                        """,
+                        (encoded,),
+                    )
+        except (sqlite3.Error, LocalStoreError):
+            raise LocalStoreError(
+                "Erro ao salvar lista de palavras ignoradas."
             ) from None
     def record_token_usage(
         self,

@@ -11,6 +11,7 @@ from PySide6.QtCore import (
     QEvent,
     QIODevice,
     QObject,
+    QPoint,
     QRectF,
     QSize,
     QThread,
@@ -20,6 +21,7 @@ from PySide6.QtCore import (
     Slot,
 )
 from PySide6.QtGui import (
+    QAction,
     QCloseEvent,
     QColor,
     QFont,
@@ -29,10 +31,12 @@ from PySide6.QtGui import (
     QPaintEvent,
     QPen,
     QShortcut,
+    QTextCursor,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -41,6 +45,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -73,7 +78,14 @@ from .shortcuts import (
     normalize_mouse_button_name,
 )
 from .terminal import TerminalBridge, TerminalBridgeError
-from .transcription import GeminiTranscriber, TranscriptionDebug, TranscriptionWorker
+from .spell_highlighter import SpellHighlighter
+from .spellcheck import LocalSpellChecker, utf16_code_unit_offsets
+from .transcription import (
+    GeminiTranscriber,
+    ProofreadingWorker,
+    TranscriptionDebug,
+    TranscriptionWorker,
+)
 
 
 class AppState(Enum):
@@ -476,6 +488,7 @@ class MainWindow(QMainWindow):
         input_shortcut_bridge: InputShortcutBridge | None = None,
         shortcut_service_installer: ShortcutServiceInstaller | None = None,
         homebrew_update_controller: HomebrewUpdateController | None = None,
+        spell_checker: LocalSpellChecker | None = None,
     ) -> None:
         super().__init__()
         self.homebrew_update_controller = homebrew_update_controller
@@ -504,6 +517,21 @@ class MainWindow(QMainWindow):
         self._microphone_refreshing = False
         self._microphone_available = False
         self._is_closing = False
+        if spell_checker is not None:
+            self.spell_checker = spell_checker
+        else:
+            ignored = None
+            if self.local_store:
+                try:
+                    ignored = self.local_store.get_spellcheck_ignored_words()
+                except Exception:
+                    ignored = None
+            self.spell_checker = LocalSpellChecker(ignored_words=ignored)
+        self._is_reviewing = False
+        self._proofreading_thread: QThread | None = None
+        self._proofreading_worker: ProofreadingWorker | None = None
+        self.spellcheck_status_label: QLabel | None = None
+        self.spellcheck_checkbox: QCheckBox | None = None
 
         self.input_shortcut_bridge = input_shortcut_bridge or InputShortcutBridge(parent=self)
         self.shortcut_service_installer = (
@@ -568,6 +596,19 @@ class MainWindow(QMainWindow):
         self._media_player, self._audio_output = self._media_player_factory(self)
         self._connect_media_signals()
         self._build_ui()
+        spellcheck_enabled = True
+        if self.local_store:
+            try:
+                spellcheck_enabled = self.local_store.get_spellcheck_enabled()
+            except Exception:
+                spellcheck_enabled = True
+        self.highlighter = SpellHighlighter(
+            self.editor.document(),
+            spell_checker=self.spell_checker,
+            enabled=bool(spellcheck_enabled and self.spell_checker.is_available()),
+        )
+        self.editor.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.editor.customContextMenuRequested.connect(self._show_editor_context_menu)
         self._restore_shortcuts()
         self._refresh_microphones()
         self._refresh_token_usage_chart()
@@ -606,6 +647,8 @@ class MainWindow(QMainWindow):
         self.update_status_label: QLabel | None = None
         self.update_progress_bar: QProgressBar | None = None
         self.install_update_button: QPushButton | None = None
+        self.spellcheck_status_label = None
+        self.spellcheck_checkbox = None
 
         header = QHBoxLayout()
         title = QLabel("FalaFácil", central)
@@ -687,6 +730,12 @@ class MainWindow(QMainWindow):
         self.copy_button.setToolTip("Copia o texto para a área de transferência")
         self.copy_button.clicked.connect(self.copy_text)
         output_actions.addWidget(self.copy_button)
+        self.review_button = QPushButton("Revisar com IA", left_panel)
+        self.review_button.setToolTip(
+            "Revisa gramática, concordância, crase e pontuação com o Gemini"
+        )
+        self.review_button.clicked.connect(self._review_text_with_ai)
+        output_actions.addWidget(self.review_button)
         self.clear_text_button = QPushButton("Apagar texto", left_panel)
         self.clear_text_button.setToolTip("Apaga o texto do editor")
         self.clear_text_button.clicked.connect(self.clear_text)
@@ -827,6 +876,29 @@ class MainWindow(QMainWindow):
         keyboard_actions.addWidget(self.disable_keyboard_button)
         keyboard_layout.addLayout(keyboard_actions)
         layout.addWidget(keyboard_group)
+        spell_group = QGroupBox("Corretor ortográfico", dialog)
+        spell_layout = QVBoxLayout(spell_group)
+        self.spellcheck_status_label = QLabel(spell_group)
+        self.spellcheck_status_label.setWordWrap(True)
+        if self.spell_checker.is_available():
+            self.spellcheck_status_label.setText(
+                "Dicionário local: Instalado (pt_BR via libenchant)"
+            )
+        else:
+            self.spellcheck_status_label.setText(
+                "Dicionário local: Não instalado (opcional — instale com: sudo apt install hunspell-pt-br)"
+            )
+        spell_layout.addWidget(self.spellcheck_status_label)
+
+        self.spellcheck_checkbox = QCheckBox(
+            "Sublinhar palavras desconhecidas no editor", spell_group
+        )
+        self.spellcheck_checkbox.setChecked(bool(self.highlighter.enabled))
+        self.spellcheck_checkbox.setEnabled(self.spell_checker.is_available())
+        self.spellcheck_checkbox.toggled.connect(self._on_spellcheck_toggled)
+        spell_layout.addWidget(self.spellcheck_checkbox)
+        layout.addWidget(spell_group)
+
 
         update_group = QGroupBox("Atualizações", dialog)
         update_layout = QVBoxLayout(update_group)
@@ -871,6 +943,8 @@ class MainWindow(QMainWindow):
             self.update_status_label = None
             self.update_progress_bar = None
             self.install_update_button = None
+            self.spellcheck_status_label = None
+            self.spellcheck_checkbox = None
 
     def _update_settings_dialog(self) -> None:
         dialog = self._settings_dialog
@@ -933,6 +1007,26 @@ class MainWindow(QMainWindow):
                 update_progress_bar.setVisible(is_running)
             if install_update_button is not None:
                 install_update_button.setEnabled(not busy and not is_running)
+        if self.spellcheck_status_label is not None:
+            if self.spell_checker.is_available():
+                self.spellcheck_status_label.setText(
+                    "Dicionário local: Instalado (pt_BR via libenchant)"
+                )
+            else:
+                self.spellcheck_status_label.setText(
+                    "Dicionário local: Não instalado (opcional — instale com: sudo apt install hunspell-pt-br)"
+                )
+        if self.spellcheck_checkbox is not None:
+            self.spellcheck_checkbox.setEnabled(self.spell_checker.is_available())
+
+    @Slot(bool)
+    def _on_spellcheck_toggled(self, checked: bool) -> None:
+        self.highlighter.enabled = checked
+        if self.local_store is not None:
+            try:
+                self.local_store.save_spellcheck_enabled(checked)
+            except Exception:
+                pass
 
     @Slot()
     def _on_install_updates_clicked(self) -> None:
@@ -1564,7 +1658,11 @@ class MainWindow(QMainWindow):
             self._activate_recording_shortcut()
 
     def _activate_recording_shortcut(self) -> None:
-        if self._is_closing or self.state is AppState.TRANSCRIBING:
+        if (
+            self._is_closing
+            or self.state is AppState.TRANSCRIBING
+            or self._is_reviewing
+        ):
             return
         self._raise_to_front()
         self._toggle_recording()
@@ -1614,12 +1712,16 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message or BACKEND_FAILURE_MESSAGE)
     @Slot()
     def _toggle_recording(self) -> None:
+        if self._is_reviewing:
+            return
         if self.state is AppState.RECORDING:
             self._finish_recording()
         elif self.state is not AppState.TRANSCRIBING:
             self._start_recording()
 
     def _start_recording(self) -> None:
+        if self._is_reviewing:
+            return
         if not self.settings.has_api_key or self.transcriber is None:
             self._set_error(self.settings.missing_api_key_message)
             return
@@ -1831,17 +1933,22 @@ class MainWindow(QMainWindow):
         error: str | None = None,
     ) -> None:
         if debug is not None:
-            self.payload_debug.setPlainText(
-                "\n".join(
+            payload_lines = [
+                f"Modelo: {debug.model}",
+                f"Prompt: {debug.prompt}",
+            ]
+            if debug.audio_mime_type:
+                payload_lines.extend(
                     (
-                        f"Modelo: {debug.model}",
-                        f"Prompt: {debug.prompt}",
                         f"MIME: {debug.audio_mime_type}",
                         f"Áudio: {debug.audio_bytes} bytes",
                         f"Base64: {debug.audio_base64_length} caracteres",
                     )
                 )
-            )
+            else:
+                payload_lines.append(f"Texto: {debug.audio_bytes} bytes")
+
+            self.payload_debug.setPlainText("\n".join(payload_lines))
             response = debug.response_text or text
             self.return_debug.setPlainText(
                 response if not (debug.error or error) else f"Erro: {debug.error or error}"
@@ -1971,24 +2078,168 @@ class MainWindow(QMainWindow):
         recording = self.state is AppState.RECORDING
         audio_ready = self.state is AppState.AUDIO_READY
         has_text = bool(self.editor.toPlainText().strip())
+        reviewing = self._is_reviewing
         self.record_button.setEnabled(
-            not busy and self.settings.has_api_key and self._microphone_available
+            not busy and not reviewing and self.settings.has_api_key and self._microphone_available
         )
         self.record_button.setText("Parar e revisar áudio" if recording else "Gravar")
-        self.play_audio_button.setEnabled(audio_ready)
+        self.play_audio_button.setEnabled(audio_ready and not reviewing)
         self.send_to_gemini_button.setEnabled(
-            audio_ready and self.settings.has_api_key and self.transcriber is not None
+            audio_ready and not reviewing and self.settings.has_api_key and self.transcriber is not None
         )
-        self.microphone_combo.setEnabled(not busy and not recording)
-        self.refresh_microphones_button.setEnabled(not busy and not recording)
-        self.copy_button.setEnabled(not busy and has_text)
-        self.clear_text_button.setEnabled(not busy and has_text)
-        self.terminal_button.setEnabled(not busy and has_text)
+        self.microphone_combo.setEnabled(not busy and not recording and not reviewing)
+        self.refresh_microphones_button.setEnabled(not busy and not recording and not reviewing)
+        self.copy_button.setEnabled(not busy and not reviewing and has_text)
+        self.review_button.setEnabled(
+            not busy
+            and not recording
+            and self.settings.has_api_key
+            and self.transcriber is not None
+            and has_text
+            and not reviewing
+        )
+        self.clear_text_button.setEnabled(not busy and not reviewing and has_text)
+        self.terminal_button.setEnabled(not busy and not reviewing and has_text)
         self.settings_button.setEnabled(True)
         self._update_settings_dialog()
         if not self.settings.has_api_key and self.state is AppState.IDLE:
             self.status_label.setText(self.settings.missing_api_key_message)
 
+    def _show_editor_context_menu(self, pos: QPoint) -> None:
+        menu = self.editor.createStandardContextMenu()
+        if menu is None:
+            menu = QMenu(self.editor)
+        try:
+            cursor = self.editor.cursorForPosition(pos)
+
+            if (
+                not self._is_reviewing
+                and not self.editor.isReadOnly()
+                and self.highlighter.enabled
+                and self.spell_checker.is_available()
+            ):
+                block = cursor.block()
+                block_text = block.text()
+                pos_in_block = cursor.positionInBlock()
+                tokens = self.spell_checker.tokenize(block_text)
+                utf16_map = utf16_code_unit_offsets(block_text)
+                matched_token: tuple[int, int, str] | None = None
+                for start, end, t_word in tokens:
+                    qt_start = utf16_map[start]
+                    qt_end = utf16_map[end]
+                    if qt_start <= pos_in_block < qt_end:
+                        matched_token = (qt_start, qt_end, t_word)
+                        break
+
+                if matched_token is not None:
+                    qt_start, qt_end, word = matched_token
+                    block_pos = block.position()
+                    cursor.setPosition(block_pos + qt_start)
+                    cursor.setPosition(block_pos + qt_end, QTextCursor.MoveMode.KeepAnchor)
+
+                    if not self.spell_checker.check(word):
+                        first_action = menu.actions()[0] if menu.actions() else None
+                        suggestions = self.spell_checker.suggest(word, limit=5)
+                        for sug in suggestions:
+                            sug_act = QAction(sug, menu)
+                            sug_act.triggered.connect(
+                                lambda checked=False, s=sug, c=cursor: c.insertText(s)
+                            )
+                            menu.insertAction(first_action, sug_act)
+
+                        if not suggestions:
+                            no_sug_act = QAction("Nenhuma sugestão encontrada", menu)
+                            no_sug_act.setEnabled(False)
+                            menu.insertAction(first_action, no_sug_act)
+
+                        ignore_act = QAction(f'Ignorar "{word}"', menu)
+                        ignore_act.triggered.connect(
+                            lambda checked=False, w=word: self._ignore_spellcheck_word(w)
+                        )
+                        menu.insertAction(first_action, ignore_act)
+                        menu.insertSeparator(first_action)
+
+            menu.exec(self.editor.mapToGlobal(pos))
+        finally:
+            menu.deleteLater()
+
+    def _ignore_spellcheck_word(self, word: str) -> None:
+        self.spell_checker.ignore_word(word)
+        if self.local_store is not None:
+            try:
+                self.local_store.add_spellcheck_ignored_word(word)
+            except Exception:
+                pass
+        self.highlighter.rehighlight()
+
+    @Slot()
+    def _review_text_with_ai(self) -> None:
+        text = self.editor.toPlainText().strip()
+        if not text:
+            self.status_label.setText("Não há texto para revisar.")
+            return
+        if not self.settings.has_api_key or self.transcriber is None:
+            self.status_label.setText(
+                "Configure a chave API para revisar o texto com IA."
+            )
+            return
+        if self._is_reviewing:
+            return
+
+        self._is_reviewing = True
+        self.editor.setReadOnly(True)
+        self.status_label.setText("Revisando texto com IA...")
+        self._update_actions()
+
+        self._proofreading_thread = QThread(self)
+        self._proofreading_worker = ProofreadingWorker(self.transcriber, text)
+        self._proofreading_worker.moveToThread(self._proofreading_thread)
+
+        self._proofreading_thread.started.connect(self._proofreading_worker.run)
+        self._proofreading_worker.finished.connect(self._on_proofreading_finished)
+        self._proofreading_worker.failed.connect(self._on_proofreading_failed)
+        self._proofreading_worker.finished.connect(self._proofreading_thread.quit)
+        self._proofreading_worker.failed.connect(self._proofreading_thread.quit)
+        self._proofreading_worker.finished.connect(self._proofreading_worker.deleteLater)
+        self._proofreading_worker.failed.connect(self._proofreading_worker.deleteLater)
+        self._proofreading_thread.finished.connect(self._on_proofreading_thread_finished)
+        self._proofreading_thread.start()
+
+    @Slot(str, object)
+    def _on_proofreading_finished(
+        self,
+        revised_text: str,
+        debug: TranscriptionDebug | None,
+    ) -> None:
+        if self._is_closing:
+            return
+        self.editor.setPlainText(revised_text)
+        self.editor.selectAll()
+        self._render_transcription_debug(debug, text=revised_text)
+        self._record_and_render_usage(debug, "success")
+        self.status_label.setText("Texto revisado com sucesso pelo Gemini.")
+
+    @Slot(str, object)
+    def _on_proofreading_failed(
+        self,
+        message: str,
+        debug: TranscriptionDebug | None,
+    ) -> None:
+        if self._is_closing:
+            return
+        self._render_transcription_debug(debug, error=message)
+        self._record_and_render_usage(debug, "error")
+        self.status_label.setText(message)
+
+    @Slot()
+    def _on_proofreading_thread_finished(self) -> None:
+        self.editor.setReadOnly(False)
+        self._is_reviewing = False
+        if self._proofreading_thread is not None:
+            self._proofreading_thread.deleteLater()
+        self._proofreading_worker = None
+        self._proofreading_thread = None
+        self._update_actions()
     def _set_error(self, message: str) -> None:
         self.state = AppState.ERROR
         self.status_label.setText(message)
@@ -2034,6 +2285,11 @@ class MainWindow(QMainWindow):
             thread.quit()
             if not thread.wait(5000):
                 thread.wait()
+        proof_thread = self._proofreading_thread
+        if proof_thread is not None and proof_thread.isRunning():
+            proof_thread.quit()
+            if not proof_thread.wait(5000):
+                proof_thread.wait()
         if self.local_store is not None:
             try:
                 self.local_store.close()

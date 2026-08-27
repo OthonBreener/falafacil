@@ -6,7 +6,7 @@ O FalaFácil é um aplicativo desktop local para Ubuntu. A composição abaixo d
 
 `falafacil.app:main` cria a única `QApplication`, define os nomes da aplicação (`FalaFácil`) e a versão da aplicação (`app.setApplicationVersion(__version__)` a partir de `falafacil.__version__` como fonte única da versão `0.2.2`), inicializa de forma fail-soft o `LocalStore`, lê o modelo Gemini e a credencial persistidos, detecta de forma fail-soft a instalação Homebrew (`detect_homebrew_installation()`), instancia de forma fail-soft o `HomebrewUpdateController`, injeta-o em `MainWindow` e registra o desktop entry do usuário (`install_user_desktop_entry()`) a partir da mesma instalação antes de exibir `MainWindow` (execução por código-fonte ou modo developer não realiza escrita automática) e compõe `Settings`, factory de transcritor `(api_key, model)`, `GeminiTranscriber` e `MainWindow`. `src/falafacil/__main__.py` despacha antes da GUI os modos internos exatos `--shortcut-daemon`, `--install-shortcut-service`, `--update-probe` e `--install-user-desktop`.
 
-`MainWindow` e `AppState` vivem em `src/falafacil/ui.py`. A janela usa cabeçalho e `QSplitter` horizontal: transcrição e ações em duas linhas à esquerda, `Diagnóstico` permanente com abas e gráfico à direita. A engrenagem abre um diálogo único para chave API, modelo Gemini, os dois atalhos e atualizações (`Chave API`, `Modelo Gemini`, `Atalho do mouse`, `Atalho do teclado`, `Atualizações`); o controle adjacente alterna tela cheia. A UI mantém bindings ativos/pendentes separados e só persiste após o ACK assíncrono do serviço.
+`MainWindow` e `AppState` vivem em `src/falafacil/ui.py`. A janela usa cabeçalho e `QSplitter` horizontal: transcrição e ações em duas linhas à esquerda, `Diagnóstico` permanente com abas e gráfico à direita. A engrenagem abre um diálogo único para chave API, modelo Gemini, os dois atalhos, corretor ortográfico e atualizações (`Chave API`, `Modelo Gemini`, `Atalho do mouse`, `Atalho do teclado`, `Corretor ortográfico`, `Atualizações`); o controle adjacente alterna tela cheia. A UI mantém bindings ativos/pendentes separados e só persiste após o ACK assíncrono do serviço.
 
 ## Áudio
 
@@ -45,6 +45,14 @@ A integração independe de X11, Wayland, `DISPLAY` ou compositor. Mouse e tecla
 A resposta da API Interactions (`client.interactions.create()`) fornece metadados de consumo em `interaction.usage`. O transcritor extrai os campos de contagem (`total_input_tokens`, `total_output_tokens`, `total_thought_tokens`, `total_cached_tokens`, `total_tool_use_tokens` e `total_tokens`) em um DTO imutável `TokenUsage`, associado a `TranscriptionDebug`. `total_cached_tokens` reflete o cache implícito automático da API. Campos ausentes permanecem `None` (indisponíveis), sem fabricação artificial de zeros.
 
 A única ação que inicia a chamada é `Enviar para Gemini`, depois de uma captura válida e da pré-visualização. A chamada executa em `TranscriptionWorker` dentro de um `QThread`. Os sinais `finished` e `failed` retornam ao thread principal com o texto/erro e o `TranscriptionDebug`, sem acessar widgets ou banco de dados a partir do worker. Resposta sem `output_text` é tratada como erro recuperável, mas preserva os tokens consumidos para registro e diagnóstico.
+## Corretor ortográfico e revisor com IA
+
+`src/falafacil/spellcheck.py` encapsula `LocalSpellChecker`, wrapper `ctypes` fail-soft para `libenchant-2.so.2` com dicionário `pt_BR`. Se a biblioteca C ou o dicionário não estiverem disponíveis, o corretor opera em modo fail-soft (`is_available() == False`), sem propagar exceções ou impactar o fluxo do aplicativo. Palavras acentuadas, hifenizadas, acrônimos, termos numéricos e palavras marcadas como ignoradas são tratados com segurança léxica. A função utilitária `utf16_code_unit_offsets` mapeia índices de code points Python para unidades UTF-16 do Qt (`QString`, `QTextCursor`, `QSyntaxHighlighter`), assegurando alinhamento milimétrico de sublinhado e substituição mesmo na presença de emojis e caracteres fora do BMP.
+
+`src/falafacil/spell_highlighter.py` implementa `SpellHighlighter(QSyntaxHighlighter)` conectado ao editor de transcrição, aplicando o formato de sublinhado vermelho ondulado (`SpellCheckUnderline`) em palavras desconhecidas quando o corretor está ativo e disponível. O editor oferece menu de contexto customizado com sugestões de correção e a opção de ignorar a palavra na sessão e no banco local.
+
+A revisão profunda gramatical e ortográfica é realizada pelo botão `Revisar com IA`, acionando `GeminiTranscriber.proofread()` assincronamente via `ProofreadingWorker` em um `QThread`. A revisão utiliza o prompt especializado `PROOFREADING_PROMPT` para correção rigorosa de concordância, regência, crase, pontuação e homófonos contextuais em português do Brasil, preservando vocabulário e estilo do locutor, e registrando o consumo de tokens de forma independente no `LocalStore`.
+
 
 ## Armazenamento local
 
@@ -58,7 +66,7 @@ O schema é versionado via `PRAGMA user_version`:
 - Qualquer outra versão (ex.: versões futuras ou incompatíveis): a inicialização é recusada levantando `LocalStoreError` sanitizado (`Versão de schema incompatível: <versão>.`), operando em modo fail-soft (`local_store=None` na UI) e preservando o arquivo SQLite sem qualquer mutação de schema ou dados.
 
 O schema v1 é composto por:
-- Tabela `preferences(key TEXT PRIMARY KEY, value TEXT NOT NULL)`: armazena `last_microphone_identity`, `recording_mouse_button`, `recording_keyboard_shortcut` e `gemini_model` (restrito aos IDs de `MODEL_CHOICES`: `gemini-3.5-flash-lite` ou `gemini-3.7-flash`); o schema permanece v1.
+- Tabela `preferences(key TEXT PRIMARY KEY, value TEXT NOT NULL)`: armazena `last_microphone_identity`, `recording_mouse_button`, `recording_keyboard_shortcut`, `gemini_model` (restrito aos IDs de `MODEL_CHOICES`: `gemini-3.5-flash-lite` ou `gemini-3.7-flash`), `spellcheck_enabled` e `spellcheck_ignored_words`; o schema permanece v1.
 - Tabela `token_usage(id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER, thought_tokens INTEGER, cached_tokens INTEGER, tool_use_tokens INTEGER, total_tokens INTEGER, outcome TEXT NOT NULL CHECK(outcome IN ('success', 'error')))`: armazena o histórico de consumo de tokens por chamada.
 - Índice `idx_token_usage_recorded_at ON token_usage(recorded_at)` para ordenação cronológica.
 
@@ -68,7 +76,7 @@ Esse histórico alimenta diretamente `TokenUsageChart` no painel `Diagnóstico` 
 
 O armazenamento opera no thread principal com tratamento fail-soft. As preferências de mouse e teclado são independentes e só são persistidas após `WATCHING_*`; falha de escrita mantém o binding apenas na sessão. `MainWindow.closeEvent` cancela o instalador, fecha `InputShortcutBridge`, encerra áudio/worker e então fecha o `LocalStore`.
 
-O banco armazena somente as quatro preferências locais allowlisted, timestamp, modelo, seis contagens de tokens anuláveis e outcome. Nunca armazena chaves, áudio, base64, prompt, transcrição, resposta textual, exceção bruta ou preço.
+O banco armazena somente as preferências locais allowlisted, timestamp, modelo, seis contagens de tokens anuláveis e outcome. Nunca armazena chaves, áudio, base64, prompt, transcrição, resposta textual, exceção bruta ou preço.
 
 ## Configuração e credenciais
 
@@ -110,7 +118,7 @@ app ──> ui ──> InputShortcutBridge ──AF_UNIX──> shortcut_service
 
 ## Invariantes
 1. Nenhuma chave Gemini é gravada em código, testes, `pyproject.toml`, desktop entry, logs, arquivos gerados, argumentos do launcher ou banco SQLite local. A fonte ativa segue a precedência definida em `config.py` e a credencial persistida fica exclusivamente no Secret Service.
-2. O SQLite armazena somente `last_microphone_identity`, `recording_mouse_button`, `recording_keyboard_shortcut`, `gemini_model` e os metadados de consumo allowlisted. Nunca armazena chave, áudio, base64, prompt, transcrição, resposta, exceção bruta ou preço.
+2. O SQLite armazena somente `last_microphone_identity`, `recording_mouse_button`, `recording_keyboard_shortcut`, `gemini_model`, `spellcheck_enabled`, `spellcheck_ignored_words` e os metadados de consumo allowlisted. Nunca armazena chave, áudio, base64, prompt, transcrição, resposta, exceção bruta ou preço.
 3. Campos de tokens não fornecidos pela API permanecem indisponíveis (`None`), sem conversão em zero artificial; o total agregado e o gráfico tratam valores ausentes com segurança e exibem zero somente quando não há registros no histórico. As barras do gráfico diferenciam visualmente sucesso e erro para valores conhecidos de `total_tokens`. A aplicação mede exclusivamente consumo de tokens, não precificação monetária da API, e não calcula nem estima preços.
 4. A conexão com o banco local pertence e é acessada exclusivamente no thread principal; a validação de schema via `PRAGMA user_version` aceita estritamente versão `0` para criação do schema v1 e `1` para reabertura, recusando qualquer outra versão com erro sanitizado e fail-soft sem mutar o arquivo SQLite; falhas no armazenamento local não impedem captura de áudio, transcrição ou uso do clipboard.
 5. Widgets, player, clipboard e banco pertencem ao thread principal. O worker de transcrição usa sinais; o daemon de atalhos é outro processo e transmite somente ACKs, capturas canônicas e ativações correspondentes.

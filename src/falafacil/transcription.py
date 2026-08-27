@@ -21,6 +21,19 @@ PROMPT = (
     "Retorne apenas o texto simples pronto para copiar."
 )
 
+PROOFREADING_PROMPT = (
+    "Você é um revisor gramatical e ortográfico especialista em português do Brasil.\n"
+    "Revise o texto a seguir corrigindo rigorosamente:\n"
+    "1. Erros ortográficos, acentuação e hífen (conforme o Acordo Ortográfico vigente).\n"
+    "2. Concordância verbal e nominal, regência e crase.\n"
+    "3. Pontuação (vírgulas, pontos finais, interrogações) para garantir fluidez e clareza natural.\n"
+    "4. Homófonos contextuais comuns na transcrição de fala (ex: 'mas'/'mais', 'a'/'há', 'sessão'/'seção', 'mau'/'mal').\n"
+    "REGRAS INVIOLÁVEIS:\n"
+    "- Preserve fielmente o vocabulário, estilo, termos técnicos, nomes próprios, gírias e a intenção do locutor.\n"
+    "- Não acrescente explicações, comentários, introduções ou notas.\n"
+    "- Retorne exclusivamente o texto simples pronto para copiar."
+)
+
 
 class TranscriptionError(RuntimeError):
     """Erro recuperável ao solicitar uma transcrição."""
@@ -129,6 +142,55 @@ class GeminiTranscriber:
         self._last_debug = replace_debug(self._last_debug, response_text=text)
         return text
 
+    def proofread(self, text: str) -> str:
+        clean_text = text.strip() if isinstance(text, str) else ""
+        text_bytes = len(clean_text.encode("utf-8"))
+        self._last_debug = TranscriptionDebug(
+            model=self.model,
+            prompt=PROOFREADING_PROMPT,
+            audio_bytes=text_bytes,
+            audio_mime_type="",
+            audio_base64_length=0,
+            audio_base64_preview="",
+            response_text="",
+            error=None,
+            usage=None,
+        )
+        if not clean_text:
+            return self._raise_transcription_error(
+                "O texto para revisão está vazio."
+            )
+
+        prompt = f"{PROOFREADING_PROMPT}\n\nTexto:\n{clean_text}"
+        try:
+            interaction = self.client.interactions.create(
+                model=self.model,
+                input=[{"type": "text", "text": prompt}],
+            )
+        except Exception as exc:
+            raise self._transcription_error(
+                _friendly_api_error(exc, secret=self._api_key)
+            ) from exc
+
+        raw_usage = getattr(interaction, "usage", None)
+        if raw_usage is None and isinstance(interaction, dict):
+            raw_usage = interaction.get("usage")
+        usage = _extract_usage(raw_usage)
+        if usage is not None:
+            self._last_debug = replace_debug(self._last_debug, usage=usage)
+
+        if isinstance(interaction, dict):
+            output_text = interaction.get("output_text", "")
+        else:
+            output_text = getattr(interaction, "output_text", "")
+        revised_text = str(output_text or "").strip()
+        if not revised_text:
+            raise self._transcription_error(
+                "O Gemini não retornou texto para a revisão."
+            )
+        self._last_debug = replace_debug(self._last_debug, response_text=revised_text)
+        return revised_text
+
     def _raise_transcription_error(self, message: str) -> str:
         raise self._transcription_error(message)
 
@@ -156,6 +218,30 @@ class TranscriptionWorker(QObject):
         except Exception:
             self.failed.emit(
                 "Falha inesperada na transcrição.",
+                _last_debug(self._transcriber),
+            )
+
+
+class ProofreadingWorker(QObject):
+    finished = Signal(str, object)
+    failed = Signal(str, object)
+
+    def __init__(self, transcriber: GeminiTranscriber, text: str) -> None:
+        super().__init__()
+        self._transcriber = transcriber
+        self.text = text
+        self._text = text
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            revised_text = self._transcriber.proofread(self.text)
+            self.finished.emit(revised_text, _last_debug(self._transcriber))
+        except TranscriptionError as exc:
+            self.failed.emit(str(exc), _last_debug(self._transcriber))
+        except Exception:
+            self.failed.emit(
+                "Falha inesperada na revisão do texto.",
                 _last_debug(self._transcriber),
             )
 

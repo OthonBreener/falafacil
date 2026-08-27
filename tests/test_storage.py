@@ -509,6 +509,18 @@ def test_closed_store_raises_error(tmp_path: Path) -> None:
     with pytest.raises(LocalStoreError, match="fechado"):
         store.clear_recording_keyboard_shortcut()
 
+    with pytest.raises(LocalStoreError, match="fechado"):
+        store.get_spellcheck_enabled()
+
+    with pytest.raises(LocalStoreError, match="fechado"):
+        store.save_spellcheck_enabled(True)
+
+    with pytest.raises(LocalStoreError, match="fechado"):
+        store.get_spellcheck_ignored_words()
+
+    with pytest.raises(LocalStoreError, match="fechado"):
+        store.add_spellcheck_ignored_word("docker")
+
 
 def test_token_usage_history_empty(tmp_path: Path) -> None:
     db_path = tmp_path / "falafacil.sqlite3"
@@ -694,3 +706,99 @@ def test_incompatible_schema_version_raises_error_without_file_mutation(tmp_path
     data = verify_conn.execute("SELECT data FROM future_schema;").fetchall()
     assert data == [("dados_preservados",)]
     verify_conn.close()
+
+
+def test_spellcheck_preferences_persistence_and_reopen(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    with LocalStore(db_path) as store:
+        # Valor padrão inicial é True
+        assert store.get_spellcheck_enabled() is True
+
+        # Salva desabilitado
+        store.save_spellcheck_enabled(False)
+        assert store.get_spellcheck_enabled() is False
+
+    # Reabre e verifica que persistiu
+    with LocalStore(db_path) as store2:
+        assert store2.get_spellcheck_enabled() is False
+        # Salva habilitado novamente
+        store2.save_spellcheck_enabled(True)
+        assert store2.get_spellcheck_enabled() is True
+
+    with LocalStore(db_path) as store3:
+        assert store3.get_spellcheck_enabled() is True
+
+
+def test_spellcheck_ignored_words_persistence_and_reopen(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    with LocalStore(db_path) as store:
+        # Lista padrão inicial é vazia
+        assert store.get_spellcheck_ignored_words() == []
+
+        # Adiciona palavras
+        store.add_spellcheck_ignored_word("docker")
+        store.add_spellcheck_ignored_word("Docker")  # Case insensitive, não duplica
+        store.add_spellcheck_ignored_word("kubernetes")
+
+        assert store.get_spellcheck_ignored_words() == ["docker", "kubernetes"]
+
+    # Reabre e verifica persistência
+    with LocalStore(db_path) as store2:
+        assert store2.get_spellcheck_ignored_words() == ["docker", "kubernetes"]
+        store2.add_spellcheck_ignored_word("falafacil")
+        assert store2.get_spellcheck_ignored_words() == ["docker", "kubernetes", "falafacil"]
+
+
+def test_spellcheck_invalid_inputs_raise_errors(tmp_path: Path) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    with LocalStore(db_path) as store:
+        with pytest.raises(LocalStoreError, match="Valor inválido"):
+            store.save_spellcheck_enabled("true")  # type: ignore[arg-type]
+
+        with pytest.raises(LocalStoreError, match="Valor inválido"):
+            store.save_spellcheck_enabled(1)  # type: ignore[arg-type]
+
+        with pytest.raises(LocalStoreError, match="Palavra ignorada inválida"):
+            store.add_spellcheck_ignored_word("")
+
+        with pytest.raises(LocalStoreError, match="Palavra ignorada inválida"):
+            store.add_spellcheck_ignored_word("   ")
+
+        with pytest.raises(LocalStoreError, match="Palavra ignorada inválida"):
+            store.add_spellcheck_ignored_word(123)  # type: ignore[arg-type]
+
+
+def test_spellcheck_storage_errors_are_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "falafacil.sqlite3"
+    leak_marker = "SYNTHETIC_SPELLCHECK_SQLITE_SECRET"
+
+    with LocalStore(db_path) as store:
+        failing_conn = _FailingConnection(sqlite3.OperationalError(leak_marker))
+        for operation, expected in (
+            (
+                lambda: store.get_spellcheck_enabled(),
+                "Erro ao ler preferência de corretor ortográfico.",
+            ),
+            (
+                lambda: store.save_spellcheck_enabled(True),
+                "Erro ao salvar preferência de corretor ortográfico.",
+            ),
+            (
+                lambda: store.get_spellcheck_ignored_words(),
+                "Erro ao ler lista de palavras ignoradas.",
+            ),
+            (
+                lambda: store.add_spellcheck_ignored_word("docker"),
+                "Erro ao salvar lista de palavras ignoradas.",
+            ),
+        ):
+            monkeypatch.setattr(store, "_conn", failing_conn)
+            with pytest.raises(LocalStoreError) as exc_info:
+                operation()
+            assert str(exc_info.value) == expected
+            assert leak_marker not in str(exc_info.value)
+            assert exc_info.value.__cause__ is None
+            assert exc_info.value.__suppress_context__ is True
+            monkeypatch.undo()

@@ -7,7 +7,7 @@ import threading
 import time
 import numpy as np
 import pytest
-from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QObject, QPoint, QPointF, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QEventLoop, QObject, QPoint, QPointF, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QCloseEvent, QKeySequence, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QLabel,
     QLineEdit,
+    QMenu,
     QProgressBar,
     QPushButton,
     QVBoxLayout,
@@ -94,12 +95,17 @@ class FakeTranscriber:
         usage: TokenUsage | None = None,
         error: str | None = None,
         model: str = DEFAULT_MODEL,
+        proofread_text: str = "texto revisado com sucesso",
+        proofread_error: str | None = None,
     ) -> None:
         self.text = text
         self.usage = usage
         self.error = error
         self.model = model
+        self.proofread_text = proofread_text
+        self.proofread_error = proofread_error
         self.calls: list[bytes] = []
+        self.proofread_calls: list[str] = []
         self._debug: TranscriptionDebug | None = None
 
     def transcribe(self, wav_bytes: bytes) -> str:
@@ -109,8 +115,74 @@ class FakeTranscriber:
             raise TranscriptionError(self.error)
         return self.text
 
+    def proofread(self, text: str) -> str:
+        self.proofread_calls.append(text)
+        self._debug = TranscriptionDebug(
+            model=self.model,
+            prompt="prompt de revisão",
+            audio_bytes=len(text.encode("utf-8")),
+            audio_mime_type="",
+            audio_base64_length=0,
+            audio_base64_preview="",
+            response_text=self.proofread_text,
+            error=self.proofread_error,
+            usage=self.usage,
+        )
+        if self.proofread_error:
+            raise TranscriptionError(self.proofread_error)
+        return self.proofread_text
+
     def last_debug(self) -> TranscriptionDebug | None:
         return self._debug
+
+
+class FakeSpellChecker:
+    def __init__(
+        self,
+        *,
+        available: bool = True,
+        valid_words: tuple[str, ...] = ("palavra", "aqui", "texto", "correto"),
+        suggestions: dict[str, list[str]] | None = None,
+        ignored_words: list[str] | None = None,
+    ) -> None:
+        self._available = available
+        self._valid_words = set(valid_words)
+        self._suggestions = suggestions or {
+            "errado": ["correto", "erado", "errada"],
+        }
+        self._ignored: set[str] = set(ignored_words or [])
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def check(self, word: str) -> bool:
+        clean = word.strip().lower()
+        if clean in self._ignored:
+            return True
+        return clean in self._valid_words
+
+    def suggest(self, word: str, limit: int = 5) -> list[str]:
+        clean = word.strip().lower()
+        sugs = self._suggestions.get(clean, ["sugestão1", "sugestão2"])
+        return sugs[:limit]
+
+    def ignore_word(self, word: str) -> None:
+        clean = word.strip().lower()
+        if clean:
+            self._ignored.add(clean)
+
+    def is_ignored(self, word: str) -> bool:
+        return word.strip().lower() in self._ignored
+
+    def ignored_words(self) -> set[str]:
+        return set(self._ignored)
+
+    def tokenize(self, text: str) -> list[tuple[int, int, str]]:
+        import re
+        tokens = []
+        for m in re.finditer(r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:-[A-Za-zÀ-ÖØ-öø-ÿ]+)*", text):
+            tokens.append((m.start(), m.end(), m.group(0)))
+        return tokens
 class FakeInputShortcutBridge(QObject):
     mouse_binding_ready = Signal(int, str)
     mouse_activated = Signal(int, str)
@@ -266,6 +338,9 @@ class FakeLocalStore:
         self.mouse_button: str | None = None
         self.keyboard_shortcut: str | None = None
         self.gemini_model: str | None = None
+        self.spellcheck_enabled: bool = True
+        self.spellcheck_ignored_words: list[str] = []
+        self.fail_spellcheck_save = False
         self.closed = False
         self.close_order_log = order_log if order_log is not None else []
     def get_last_microphone_identity(self) -> str | None:
@@ -372,6 +447,22 @@ class FakeLocalStore:
             for i, (m, u, o) in enumerate(self.records)
         ]
         return tuple(history[-limit:])
+    def get_spellcheck_enabled(self) -> bool:
+        return self.spellcheck_enabled
+
+    def save_spellcheck_enabled(self, enabled: bool) -> None:
+        if self.fail_spellcheck_save:
+            raise LocalStoreError("erro ao salvar corretor")
+        self.spellcheck_enabled = bool(enabled)
+
+    def get_spellcheck_ignored_words(self) -> list[str]:
+        return list(self.spellcheck_ignored_words)
+
+    def add_spellcheck_ignored_word(self, word: str) -> None:
+        clean = word.strip().lower()
+        if clean and clean not in self.spellcheck_ignored_words:
+            self.spellcheck_ignored_words.append(clean)
+
     def close(self) -> None:
         if self.fail_close:
             raise LocalStoreError("erro ao fechar")
@@ -523,6 +614,7 @@ def make_window(
     input_shortcut_bridge=None,
     shortcut_service_installer=None,
     homebrew_update_controller=None,
+    spell_checker=None,
 ):
     media_player = media_player or FakeMediaPlayer()
     resolved_terminal = (
@@ -546,15 +638,22 @@ def make_window(
             shortcut_service_installer or FakeShortcutInstaller()
         ),
         homebrew_update_controller=homebrew_update_controller,
+        spell_checker=spell_checker,
     )
     window.show()
     qapp.processEvents()
     return window, media_player
 
-
 def wait_for_worker(qapp, window) -> None:
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline and window._thread is not None:
+        qapp.processEvents()
+        time.sleep(0.01)
+    qapp.processEvents()
+
+def wait_for_proofreading_worker(qapp, window) -> None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and window._proofreading_thread is not None:
         qapp.processEvents()
         time.sleep(0.01)
     qapp.processEvents()
@@ -2210,6 +2309,7 @@ def test_main_window_layout_settings_fullscreen_and_grabs(qapp) -> None:
             window.apply_model_button.parent(),
             window.configure_mouse_button.parent(),
             window.configure_keyboard_button.parent(),
+            window.spellcheck_checkbox.parent(),
             window.install_update_button.parent(),
         ]
         dialog.reject()
@@ -2221,6 +2321,7 @@ def test_main_window_layout_settings_fullscreen_and_grabs(qapp) -> None:
         "Modelo Gemini",
         "Atalho do mouse",
         "Atalho do teclado",
+        "Corretor ortográfico",
         "Atualizações",
     ]
     assert all(isinstance(parent, QGroupBox) for parent in observed["parents"])
@@ -2351,6 +2452,7 @@ def test_settings_dialog_five_groups_order_and_widgets(qapp) -> None:
         "Modelo Gemini",
         "Atalho do mouse",
         "Atalho do teclado",
+        "Corretor ortográfico",
         "Atualizações",
     ]
     window.close()
@@ -2643,4 +2745,609 @@ def test_settings_dialog_closed_during_running_receives_signals_and_reopening_re
     )
     assert observed["progress_visible"] is False
     assert observed["button_enabled"] is True
+    window.close()
+
+
+def test_review_button_states_and_enablement(qapp) -> None:
+    transcriber = FakeTranscriber()
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="valid-key"),
+        transcriber=transcriber,
+    )
+    # Editor vazio -> desabilitado
+    window.editor.setPlainText("")
+    assert window.review_button.isEnabled() is False
+
+    # Com texto, chave e transcritor -> habilitado
+    window.editor.setPlainText("Texto a revisar")
+    assert window.review_button.isEnabled() is True
+
+    # Sem chave API -> desabilitado
+    window.settings = Settings(api_key=None)
+    window._update_actions()
+    assert window.review_button.isEnabled() is False
+
+    # Sem transcritor -> desabilitado
+    window.settings = Settings(api_key="valid-key")
+    window.transcriber = None
+    window._update_actions()
+    assert window.review_button.isEnabled() is False
+
+    # Durante gravação -> desabilitado
+    window.transcriber = transcriber
+    window.state = AppState.RECORDING
+    window._update_actions()
+    assert window.review_button.isEnabled() is False
+
+    # Durante transcrição -> desabilitado
+    window.state = AppState.TRANSCRIBING
+    window._update_actions()
+    assert window.review_button.isEnabled() is False
+
+    # Durante revisão -> desabilitado
+    window.state = AppState.IDLE
+    window._is_reviewing = True
+    window._update_actions()
+    assert window.review_button.isEnabled() is False
+
+    window._is_reviewing = False
+    window._update_actions()
+    assert window.review_button.isEnabled() is True
+    window.close()
+
+
+def test_review_button_success_flow(qapp) -> None:
+    transcriber = FakeTranscriber(
+        proofread_text="Texto corrigido e revisado com sucesso.",
+        usage=TokenUsage(input_tokens=15, output_tokens=12, total_tokens=27),
+    )
+    store = FakeLocalStore()
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="valid-key"),
+        transcriber=transcriber,
+        local_store=store,
+    )
+    window.editor.setPlainText("Texto com eror")
+    assert window.review_button.isEnabled() is True
+
+    window.review_button.click()
+    qapp.processEvents()
+    wait_for_proofreading_worker(qapp, window)
+
+    assert window.editor.toPlainText() == "Texto corrigido e revisado com sucesso."
+    assert window.editor.textCursor().hasSelection() is True
+    assert window.status_label.text() == "Texto revisado com sucesso pelo Gemini."
+    assert window._is_reviewing is False
+    assert window.review_button.isEnabled() is True
+
+    # Tokens registrados
+    assert len(store.records) == 1
+    assert store.records[0][2] == "success"
+
+    # Debug renderizado com bytes de texto e sem MIME de áudio
+    expected_bytes = len("Texto com eror".encode("utf-8"))
+    payload_debug_text = window.payload_debug.toPlainText()
+    assert f"Texto: {expected_bytes} bytes" in payload_debug_text
+    assert "MIME:" not in payload_debug_text
+    assert "Áudio:" not in payload_debug_text
+    window.close()
+
+
+def test_review_button_error_flow(qapp) -> None:
+    transcriber = FakeTranscriber(
+        proofread_error="Falha de conexão com a API do Gemini.",
+        usage=TokenUsage(input_tokens=10, output_tokens=0, total_tokens=10),
+    )
+    store = FakeLocalStore()
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="valid-key"),
+        transcriber=transcriber,
+        local_store=store,
+    )
+    window.editor.setPlainText("Texto original que deve ser mantido")
+    assert window.review_button.isEnabled() is True
+
+    window.review_button.click()
+    qapp.processEvents()
+    wait_for_proofreading_worker(qapp, window)
+
+    assert window.editor.toPlainText() == "Texto original que deve ser mantido"
+    assert window.status_label.text() == "Falha de conexão com a API do Gemini."
+    assert window._is_reviewing is False
+    assert window.review_button.isEnabled() is True
+
+    # Registro de erro no store
+    assert len(store.records) == 1
+    assert store.records[0][2] == "error"
+    window.close()
+
+
+def test_spellcheck_settings_toggle_and_persistence(qapp) -> None:
+    store = FakeLocalStore()
+    checker = FakeSpellChecker(available=True)
+    window, _ = make_window(
+        qapp,
+        local_store=store,
+        spell_checker=checker,
+    )
+    assert window.highlighter.enabled is True
+
+    def inspect_and_toggle() -> None:
+        dialog = window._settings_dialog
+        assert dialog is not None
+        assert "Instalado" in window.spellcheck_status_label.text()
+        assert window.spellcheck_checkbox.isChecked() is True
+        assert window.spellcheck_checkbox.isEnabled() is True
+
+        # Desativa o sublinhado
+        window.spellcheck_checkbox.setChecked(False)
+        assert window.highlighter.enabled is False
+        assert store.get_spellcheck_enabled() is False
+
+        # Reativa o sublinhado
+        window.spellcheck_checkbox.setChecked(True)
+        assert window.highlighter.enabled is True
+        assert store.get_spellcheck_enabled() is True
+        dialog.reject()
+
+    QTimer.singleShot(0, inspect_and_toggle)
+    window._open_settings_dialog()
+    window.close()
+
+    # Cenário com corretor indisponível
+    checker_unavailable = FakeSpellChecker(available=False)
+    window2, _ = make_window(
+        qapp,
+        local_store=store,
+        spell_checker=checker_unavailable,
+    )
+    assert window2.highlighter.enabled is False
+
+    def inspect_unavailable() -> None:
+        dialog = window2._settings_dialog
+        assert dialog is not None
+        assert "Não instalado" in window2.spellcheck_status_label.text()
+        assert window2.spellcheck_checkbox.isEnabled() is False
+        dialog.reject()
+
+    QTimer.singleShot(0, inspect_unavailable)
+    window2._open_settings_dialog()
+    window2.close()
+
+
+def test_editor_context_menu_suggestions_and_ignore(qapp, monkeypatch) -> None:
+    store = FakeLocalStore()
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto", "acertado"]},
+    )
+    window, _ = make_window(
+        qapp,
+        local_store=store,
+        spell_checker=checker,
+    )
+    window.editor.setPlainText("palavra errado aqui")
+
+    # Posiciona o cursor na palavra "errado"
+    cursor = window.editor.textCursor()
+    cursor.setPosition(10)  # dentro de 'errado'
+    window.editor.setTextCursor(cursor)
+    pos = window.editor.cursorRect(cursor).center()
+
+    captured_menus: list[QMenu] = []
+    orig_create = window.editor.createStandardContextMenu
+
+    def intercepted_create(*args, **kwargs):
+        m = orig_create(*args, **kwargs)
+        if m is None:
+            m = QMenu(window.editor)
+        m.exec = lambda *a, **kw: captured_menus.append(m)
+        m.exec_ = lambda *a, **kw: captured_menus.append(m)
+        return m
+
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", intercepted_create)
+    window._show_editor_context_menu(pos)
+    assert len(captured_menus) == 1
+    menu = captured_menus[0]
+
+    action_texts = [a.text() for a in menu.actions()]
+    assert "correto" in action_texts
+    assert "acertado" in action_texts
+    assert 'Ignorar "errado"' in action_texts
+
+    # Clica na sugestão 'correto'
+    suggestion_action = next(a for a in menu.actions() if a.text() == "correto")
+    suggestion_action.trigger()
+    assert "palavra correto aqui" in window.editor.toPlainText()
+
+    # Testa 'Ignorar'
+    window.editor.setPlainText("palavra errado aqui")
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    pos = window.editor.cursorRect(cursor).center()
+
+    captured_menus.clear()
+    window._show_editor_context_menu(pos)
+    menu2 = captured_menus[0]
+    ignore_action = next(a for a in menu2.actions() if a.text() == 'Ignorar "errado"')
+    ignore_action.trigger()
+
+    assert checker.is_ignored("errado") is True
+    assert "errado" in store.get_spellcheck_ignored_words()
+    window.close()
+
+
+def test_init_with_store_raising_on_spellcheck_preferences_is_fail_soft(qapp) -> None:
+    class FailingSpellcheckStore(FakeLocalStore):
+        def get_spellcheck_ignored_words(self) -> list[str]:
+            raise LocalStoreError("falha ao ler palavras ignoradas")
+
+        def get_spellcheck_enabled(self) -> bool:
+            raise LocalStoreError("falha ao ler estado do corretor")
+
+    store = FailingSpellcheckStore()
+    window, _ = make_window(qapp, local_store=store)
+    assert window.spell_checker is not None
+    assert window.highlighter is not None
+    if window.spell_checker.is_available():
+        assert window.highlighter.enabled is True
+    window.close()
+
+
+def test_recording_shortcuts_ignored_during_review(qapp) -> None:
+    transcriber = FakeTranscriber()
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="valid-key"),
+        transcriber=transcriber,
+    )
+    window._is_reviewing = True
+    # 1. Ativação via atalho global
+    window._activate_recording_shortcut()
+    assert window.state is AppState.IDLE
+    assert window.recorder.recording is False
+
+    # 2. Ativação via _toggle_recording (botão ou espaço)
+    window._toggle_recording()
+    assert window.state is AppState.IDLE
+    assert window.recorder.recording is False
+
+    # 3. Início direto de gravação
+    window._start_recording()
+    assert window.state is AppState.IDLE
+    assert window.recorder.recording is False
+    window.close()
+
+
+def test_editor_is_read_only_during_review_and_restored(qapp) -> None:
+    transcriber = FakeTranscriber(
+        proofread_text="Texto revisado com IA.",
+        usage=TokenUsage(input_tokens=10, output_tokens=8, total_tokens=18),
+    )
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="valid-key"),
+        transcriber=transcriber,
+    )
+    window.editor.setPlainText("Texto original para teste.")
+    assert window.editor.isReadOnly() is False
+
+    # Inicia a revisão com sucesso
+    window.review_button.click()
+    assert window._is_reviewing is True
+    assert window.editor.isReadOnly() is True
+
+    # Aguarda a conclusão da thread e restauração
+    wait_for_proofreading_worker(qapp, window)
+    assert window._is_reviewing is False
+    assert window.editor.isReadOnly() is False
+    assert window.editor.toPlainText() == "Texto revisado com IA."
+
+    # Testa com erro na revisão
+    window.transcriber = FakeTranscriber(
+        proofread_error="Falha simulada na API.",
+    )
+    window.review_button.click()
+    assert window._is_reviewing is True
+    assert window.editor.isReadOnly() is True
+
+    wait_for_proofreading_worker(qapp, window)
+    assert window._is_reviewing is False
+    assert window.editor.isReadOnly() is False
+    assert window.editor.toPlainText() == "Texto revisado com IA."
+    window.close()
+
+
+def test_editor_context_menu_with_hyphenated_compound_word(qapp, monkeypatch) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("comprar", "hoje"),
+        suggestions={"guarda-chuva": ["sombrinha", "capa-de-chuva"]},
+    )
+    window, _ = make_window(
+        qapp,
+        spell_checker=checker,
+    )
+    window.editor.setPlainText("comprar guarda-chuva hoje")
+
+    # Posiciona o cursor no meio do composto hifenizado (offset 12)
+    cursor = window.editor.textCursor()
+    cursor.setPosition(12)
+    window.editor.setTextCursor(cursor)
+    pos = window.editor.cursorRect(cursor).center()
+
+    captured_menus: list[QMenu] = []
+    orig_create = window.editor.createStandardContextMenu
+
+    def intercepted_create(*args, **kwargs):
+        m = orig_create(*args, **kwargs)
+        if m is None:
+            m = QMenu(window.editor)
+        m.exec = lambda *a, **kw: captured_menus.append(m)
+        m.exec_ = lambda *a, **kw: captured_menus.append(m)
+        return m
+
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", intercepted_create)
+    window._show_editor_context_menu(pos)
+
+    assert len(captured_menus) == 1
+    menu = captured_menus[0]
+    action_texts = [a.text() for a in menu.actions()]
+    assert "sombrinha" in action_texts
+    assert "capa-de-chuva" in action_texts
+    assert 'Ignorar "guarda-chuva"' in action_texts
+
+    # Substituição deve trocar o composto inteiro
+    suggestion_action = next(a for a in menu.actions() if a.text() == "sombrinha")
+    suggestion_action.trigger()
+    assert window.editor.toPlainText() == "comprar sombrinha hoje"
+    window.close()
+
+
+def test_editor_context_menu_with_emoji_prefix_replaces_accurately(
+    qapp, monkeypatch
+) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui", "final", "ok"),
+        suggestions={"errrrooo": ["correto"]},
+    )
+    window, _ = make_window(
+        qapp,
+        spell_checker=checker,
+    )
+
+    captured_menus: list[QMenu] = []
+    orig_create = window.editor.createStandardContextMenu
+
+    def intercepted_create(*args, **kwargs):
+        m = orig_create(*args, **kwargs)
+        if m is None:
+            m = QMenu(window.editor)
+        m.exec = lambda *a, **kw: captured_menus.append(m)
+        m.exec_ = lambda *a, **kw: captured_menus.append(m)
+        return m
+
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", intercepted_create)
+
+    # Texto com emoji não-BMP antes da palavra incorreta:
+    # Em UTF-16: '😀' ocupa índices 0 e 1, ' ' ocupa 2, e 'errrrooo' ocupa 3..10 (tamanho 8).
+    # Em Python: '😀' len 1, ' ' len 1, 'errrrooo' índices 2..10.
+    # O clique em qualquer posição da palavra (início=3, meio=6, fim=10) deve selecionar
+    # exatamente 'errrrooo' e substituir sem resíduos.
+    for test_pos in (3, 6, 10):
+        window.editor.setPlainText("😀 errrrooo final")
+        cursor = window.editor.textCursor()
+        cursor.setPosition(test_pos)
+        window.editor.setTextCursor(cursor)
+        pos = window.editor.cursorRect(cursor).center()
+
+        captured_menus.clear()
+        window._show_editor_context_menu(pos)
+
+        assert len(captured_menus) == 1
+        menu = captured_menus[0]
+        action_texts = [a.text() for a in menu.actions()]
+        assert "correto" in action_texts
+
+        suggestion_action = next(a for a in menu.actions() if a.text() == "correto")
+        suggestion_action.trigger()
+
+        # Substituição exata: sem comer espaço antes e sem sobrar letras depois
+        assert window.editor.toPlainText() == "😀 correto final"
+
+    # Teste adicional com múltiplos emojis e caracteres não-BMP:
+    # '🚀🎉' (4 unidades UTF-16) + ' ' (1 unidade) -> 'errrrooo' começa na unidade 5
+    for test_pos in (5, 8, 12):
+        window.editor.setPlainText("🚀🎉 errrrooo ok")
+        cursor = window.editor.textCursor()
+        cursor.setPosition(test_pos)
+        window.editor.setTextCursor(cursor)
+        pos = window.editor.cursorRect(cursor).center()
+
+        captured_menus.clear()
+        window._show_editor_context_menu(pos)
+
+        assert len(captured_menus) == 1
+        menu = captured_menus[0]
+        suggestion_action = next(a for a in menu.actions() if a.text() == "correto")
+        suggestion_action.trigger()
+
+        assert window.editor.toPlainText() == "🚀🎉 correto ok"
+
+    window.close()
+
+def test_editor_context_menu_skips_spellcheck_actions_during_review_and_readonly(
+    qapp, monkeypatch
+) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto"]},
+    )
+    window, _ = make_window(
+        qapp,
+        spell_checker=checker,
+    )
+    window.editor.setPlainText("palavra errado aqui")
+
+    cursor = window.editor.textCursor()
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    pos = window.editor.cursorRect(cursor).center()
+
+    captured_menus: list[QMenu] = []
+    orig_create = window.editor.createStandardContextMenu
+
+    def intercepted_create(*args, **kwargs):
+        m = orig_create(*args, **kwargs)
+        if m is None:
+            m = QMenu(window.editor)
+        m.exec = lambda *a, **kw: captured_menus.append(m)
+        m.exec_ = lambda *a, **kw: captured_menus.append(m)
+        return m
+
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", intercepted_create)
+
+    # 1. Durante _is_reviewing: sem sugestões nem ação de ignorar
+    window._is_reviewing = True
+    window._show_editor_context_menu(pos)
+    assert len(captured_menus) == 1
+    actions_during_review = [a.text() for a in captured_menus[0].actions()]
+    assert "correto" not in actions_during_review
+    assert 'Ignorar "errado"' not in actions_during_review
+
+    # 2. Quando editor isReadOnly(): sem sugestões nem ação de ignorar
+    window._is_reviewing = False
+    window.editor.setReadOnly(True)
+    captured_menus.clear()
+    window._show_editor_context_menu(pos)
+    assert len(captured_menus) == 1
+    actions_during_readonly = [a.text() for a in captured_menus[0].actions()]
+    assert "correto" not in actions_during_readonly
+    assert 'Ignorar "errado"' not in actions_during_readonly
+
+    # 3. Em estado normal editável: sugestões e ignorar presentes
+    window.editor.setReadOnly(False)
+    captured_menus.clear()
+    window._show_editor_context_menu(pos)
+    assert len(captured_menus) == 1
+    actions_normal = [a.text() for a in captured_menus[0].actions()]
+    assert "correto" in actions_normal
+    assert 'Ignorar "errado"' in actions_normal
+
+    window.close()
+
+
+def test_editor_context_menu_at_token_end_boundary_has_no_spellcheck_actions(
+    qapp, monkeypatch
+) -> None:
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto"]},
+    )
+    window, _ = make_window(
+        qapp,
+        spell_checker=checker,
+    )
+    window.editor.setPlainText("palavra errado, aqui")
+
+    captured_menus: list[QMenu] = []
+    orig_create = window.editor.createStandardContextMenu
+
+    def intercepted_create(*args, **kwargs):
+        m = orig_create(*args, **kwargs)
+        if m is None:
+            m = QMenu(window.editor)
+        m.exec = lambda *a, **kw: captured_menus.append(m)
+        m.exec_ = lambda *a, **kw: captured_menus.append(m)
+        return m
+
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", intercepted_create)
+
+    # Token "errado" vai do índice 8 ao 14.
+    # 1. Posição 13 (dentro de "errado"): deve conter sugestões e opção "Ignorar"
+    cursor = window.editor.textCursor()
+    cursor.setPosition(13)
+    window.editor.setTextCursor(cursor)
+    pos_inside = window.editor.cursorRect(cursor).center()
+    window._show_editor_context_menu(pos_inside)
+    assert len(captured_menus) == 1
+    actions_inside = [a.text() for a in captured_menus[0].actions()]
+    assert "correto" in actions_inside
+    assert 'Ignorar "errado"' in actions_inside
+
+    # 2. Posição 14 (exatamente em token_end, sobre a vírgula ','): não deve conter ações de spellcheck
+    captured_menus.clear()
+    cursor.setPosition(14)
+    window.editor.setTextCursor(cursor)
+    pos_at_comma = window.editor.cursorRect(cursor).center()
+    window._show_editor_context_menu(pos_at_comma)
+    assert len(captured_menus) == 1
+    actions_at_comma = [a.text() for a in captured_menus[0].actions()]
+    assert "correto" not in actions_at_comma
+    assert 'Ignorar "errado"' not in actions_at_comma
+
+    # 3. Posição 14 em texto com espaço logo após token_end ("palavra errado aqui"): não deve conter ações
+    window.editor.setPlainText("palavra errado aqui")
+    captured_menus.clear()
+    cursor.setPosition(14)  # sobre o caractere de espaço após "errado"
+    window.editor.setTextCursor(cursor)
+    pos_at_space = window.editor.cursorRect(cursor).center()
+    window._show_editor_context_menu(pos_at_space)
+    assert len(captured_menus) == 1
+    actions_at_space = [a.text() for a in captured_menus[0].actions()]
+    assert "correto" not in actions_at_space
+    assert 'Ignorar "errado"' not in actions_at_space
+
+    window.close()
+
+
+def test_editor_context_menu_does_not_leak_qmenu_on_repeated_invocations(
+    qapp, monkeypatch
+) -> None:
+    store = FakeLocalStore()
+    checker = FakeSpellChecker(
+        available=True,
+        valid_words=("palavra", "aqui"),
+        suggestions={"errado": ["correto"]},
+    )
+    window, _ = make_window(
+        qapp,
+        local_store=store,
+        spell_checker=checker,
+    )
+    window.editor.setPlainText("palavra errado aqui")
+
+    orig_create = window.editor.createStandardContextMenu
+
+    def non_blocking_create(*args, **kwargs):
+        m = orig_create(*args, **kwargs)
+        if m is not None:
+            m.exec = lambda *a, **kw: None
+            m.exec_ = lambda *a, **kw: None
+        return m
+
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", non_blocking_create)
+
+    cursor = window.editor.textCursor()
+    cursor.setPosition(10)
+    window.editor.setTextCursor(cursor)
+    pos = window.editor.cursorRect(cursor).center()
+
+    # Abre o menu repetidas vezes
+    for _ in range(5):
+        window._show_editor_context_menu(pos)
+
+    # Processa os eventos DeferredDelete postados por deleteLater()
+    for child in window.editor.findChildren(QMenu):
+        QApplication.sendPostedEvents(child, QEvent.Type.DeferredDelete)
+
+    # Nenhum QMenu deve permanecer retido como filho de self.editor
+    assert len(window.editor.findChildren(QMenu)) == 0
     window.close()
