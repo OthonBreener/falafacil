@@ -6,8 +6,9 @@ from falafacil.config import DEFAULT_MODEL, MODEL_CHOICES, Settings
 def test_default_model_and_choices() -> None:
     assert DEFAULT_MODEL == "gemini-3.5-flash-lite"
     assert MODEL_CHOICES == (
-        ("gemini-3.5-flash-lite", "Mais recente — Gemini 3.5 Flash-Lite"),
-        ("gemini-3.7-flash", "Mais capaz — Gemini 3.7 Flash"),
+        ("gemini-3.5-flash-lite", "Econômico e rápido — Gemini 3.5 Flash-Lite"),
+        ("gemini-3.7-flash", "Qualidade — Gemini 3.7 Flash"),
+        ("gemini-3.8-flash", "Mais capaz — Gemini 3.8 Flash"),
     )
 
 
@@ -51,6 +52,13 @@ def test_settings_uses_persisted_fallback_when_environment_is_absent(monkeypatch
     assert settings.model_from_environment is False
     assert settings.api_key == "persisted-token"
     assert settings.has_api_key
+
+
+def test_settings_uses_persisted_fallback_model_gemini_3_8_flash(monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    settings = Settings.from_env(fallback_model="gemini-3.8-flash")
+    assert settings.model == "gemini-3.8-flash"
+    assert settings.model_from_environment is False
 
 
 def test_settings_empty_environment_model_falls_back(monkeypatch) -> None:

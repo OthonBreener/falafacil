@@ -60,7 +60,8 @@ def test_transcriber_sends_inline_wav_and_returns_trimmed_text() -> None:
     assert result == "Olá, terminal!"
     assert len(client.interactions.calls) == 1
     call = client.interactions.calls[0]
-    assert set(call.keys()) == {"model", "input"}
+    assert set(call.keys()) == {"model", "input", "store"}
+    assert call["store"] is False
     assert "cached_content" not in call
     assert "previous_interaction_id" not in call
     assert "file" not in call
@@ -84,6 +85,7 @@ def test_transcriber_sends_inline_wav_and_returns_trimmed_text() -> None:
     assert debug.audio_base64_preview == audio_part["data"]
     assert debug.response_text == "Olá, terminal!"
     assert debug.error is None
+
 
 
 def test_transcription_prompt_contract() -> None:

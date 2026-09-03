@@ -355,9 +355,24 @@ def test_recorder_stop_failure_omits_raw_exception_and_secret_and_closes_stream(
             closed_called = True
             super().close()
 
-    stream = FailingStopStream()
-    recorder = AudioRecorder(stream_factory=lambda **kwargs: stream)
+    stream: FailingStopStream | None = None
+
+    def factory(**kwargs):
+        nonlocal stream
+        stream = FailingStopStream(**kwargs)
+        return stream
+
+    recorder = AudioRecorder(stream_factory=factory)
     recorder.start()
+    assert stream is not None
+    samples = np.array([[1000], [-1000]], dtype=np.int16)
+    pcm = samples.tobytes()
+    stream.callback(
+        samples,
+        2,
+        None,
+        None,
+    )
 
     with pytest.raises(AudioRecorderError) as exc_info:
         recorder.stop()
@@ -368,7 +383,13 @@ def test_recorder_stop_failure_omits_raw_exception_and_secret_and_closes_stream(
     assert "RuntimeError" not in message
     assert closed_called is True
     assert stream.closed is True
-
+    last_cap = recorder.last_capture()
+    assert last_cap is not None
+    assert last_cap.pcm_bytes == pcm
+    assert last_cap.wav_bytes == serialize_wav(pcm)
+    assert last_cap.frames == 2
+    assert last_cap.rms >= MIN_RMS_LEVEL
+    assert last_cap.wav_bytes.startswith(b"RIFF")
 
 def test_recorder_close_failure_omits_raw_exception_and_secret() -> None:
     secret = "secret-token-mic-close-9012"
@@ -377,10 +398,23 @@ def test_recorder_close_failure_omits_raw_exception_and_secret() -> None:
         def close(self):
             raise RuntimeError(f"ALSA close fault with {secret}")
 
-    stream = FailingCloseStream()
-    recorder = AudioRecorder(stream_factory=lambda **kwargs: stream)
-    recorder.start()
+    stream: FailingCloseStream | None = None
 
+    def factory(**kwargs):
+        nonlocal stream
+        stream = FailingCloseStream(**kwargs)
+        return stream
+
+    recorder = AudioRecorder(stream_factory=factory)
+    recorder.start()
+    samples = np.array([[1000], [-1000]], dtype=np.int16)
+    pcm = samples.tobytes()
+    stream.callback(
+        samples,
+        2,
+        None,
+        None,
+    )
     with pytest.raises(AudioRecorderError) as exc_info:
         recorder.stop()
 
@@ -388,7 +422,13 @@ def test_recorder_close_failure_omits_raw_exception_and_secret() -> None:
     assert message == "Não foi possível fechar o microfone."
     assert secret not in message
     assert "RuntimeError" not in message
-
+    last_cap = recorder.last_capture()
+    assert last_cap is not None
+    assert last_cap.pcm_bytes == pcm
+    assert last_cap.wav_bytes == serialize_wav(pcm)
+    assert last_cap.frames == 2
+    assert last_cap.rms >= MIN_RMS_LEVEL
+    assert last_cap.wav_bytes.startswith(b"RIFF")
 
 def test_recorder_both_stop_and_close_failure_preserves_order_and_omits_secret() -> None:
     stop_secret = "secret-token-mic-both-stop-1111"
@@ -403,11 +443,23 @@ def test_recorder_both_stop_and_close_failure_preserves_order_and_omits_secret()
         def close(self):
             calls.append("close")
             raise RuntimeError(f"close fault with {close_secret}")
+    stream: FailingBothStream | None = None
 
-    stream = FailingBothStream()
-    recorder = AudioRecorder(stream_factory=lambda **kwargs: stream)
+    def factory(**kwargs):
+        nonlocal stream
+        stream = FailingBothStream(**kwargs)
+        return stream
+
+    recorder = AudioRecorder(stream_factory=factory)
     recorder.start()
-
+    samples = np.array([[1000], [-1000]], dtype=np.int16)
+    pcm = samples.tobytes()
+    stream.callback(
+        samples,
+        2,
+        None,
+        None,
+    )
     with pytest.raises(AudioRecorderError) as exc_info:
         recorder.stop()
 
@@ -416,3 +468,120 @@ def test_recorder_both_stop_and_close_failure_preserves_order_and_omits_secret()
     assert stop_secret not in message
     assert close_secret not in message
     assert calls == ["stop", "close"]
+    last_cap = recorder.last_capture()
+    assert last_cap is not None
+    assert last_cap.pcm_bytes == pcm
+    assert last_cap.wav_bytes == serialize_wav(pcm)
+    assert last_cap.frames == 2
+
+def test_recorder_callback_status_raises_lost_segments_and_retains_capture() -> None:
+    status_secret = "secret-raw-portaudio-status-input-overflow-7777"
+    stream: FakeStream | None = None
+
+    def factory(**kwargs):
+        nonlocal stream
+        stream = FakeStream(**kwargs)
+        return stream
+
+    recorder = AudioRecorder(stream_factory=factory)
+    recorder.start()
+    assert stream is not None
+    stream.callback(
+        np.array([[1200], [-1200]], dtype=np.int16),
+        2,
+        None,
+        status_secret,
+    )
+
+    with pytest.raises(AudioRecorderError) as exc_info:
+        recorder.stop()
+
+    message = str(exc_info.value)
+    assert message == "O áudio perdeu trechos durante a captura. Grave novamente."
+    assert status_secret not in message
+    assert recorder.last_status() == status_secret
+    last_cap = recorder.last_capture()
+    assert last_cap is not None
+    assert last_cap.frames == 2
+    assert last_cap.rms >= MIN_RMS_LEVEL
+
+
+def test_recorder_error_precedence_empty_over_low_status_and_stream_failure() -> None:
+    # 1. Empty PCM has precedence over callback status and stop failure
+    class FailingStopStream(FakeStream):
+        def stop(self):
+            raise RuntimeError("stop failure")
+
+    stream1: FailingStopStream | None = None
+
+    def factory1(**kwargs):
+        nonlocal stream1
+        stream1 = FailingStopStream(**kwargs)
+        return stream1
+
+    rec1 = AudioRecorder(stream_factory=factory1)
+    rec1.start()
+    assert stream1 is not None
+    stream1.callback(
+        np.empty((0, 1), dtype=np.int16),
+        0,
+        None,
+        "input-overflow",
+    )
+    with pytest.raises(AudioRecorderError) as exc_info:
+        rec1.stop()
+    assert str(exc_info.value) == "Nenhum áudio foi capturado."
+    assert rec1.last_capture() is not None
+    assert rec1.last_capture().frames == 0
+
+    # 2. Low RMS (< MIN_RMS_LEVEL) has precedence over callback status and stop failure
+    stream2: FailingStopStream | None = None
+
+    def factory2(**kwargs):
+        nonlocal stream2
+        stream2 = FailingStopStream(**kwargs)
+        return stream2
+
+    rec2 = AudioRecorder(stream_factory=factory2)
+    rec2.start()
+    assert stream2 is not None
+    stream2.callback(
+        np.array([[1], [-1]], dtype=np.int16),
+        2,
+        None,
+        "input-overflow",
+    )
+    with pytest.raises(AudioRecorderError) as exc_info:
+        rec2.stop()
+    assert (
+        str(exc_info.value)
+        == "O áudio capturado está muito baixo. Verifique o microfone e tente novamente."
+    )
+    assert rec2.last_capture() is not None
+    assert rec2.last_capture().rms < MIN_RMS_LEVEL
+
+    # 3. Non-empty callback status has precedence over stop failure
+    stream3: FailingStopStream | None = None
+
+    def factory3(**kwargs):
+        nonlocal stream3
+        stream3 = FailingStopStream(**kwargs)
+        return stream3
+
+    rec3 = AudioRecorder(stream_factory=factory3)
+    rec3.start()
+    assert stream3 is not None
+    stream3.callback(
+        np.array([[1000], [-1000]], dtype=np.int16),
+        2,
+        None,
+        "input-overflow",
+    )
+    with pytest.raises(AudioRecorderError) as exc_info:
+        rec3.stop()
+    assert (
+        str(exc_info.value)
+        == "O áudio perdeu trechos durante a captura. Grave novamente."
+    )
+    assert rec3.last_capture() is not None
+    assert rec3.last_capture().rms >= MIN_RMS_LEVEL

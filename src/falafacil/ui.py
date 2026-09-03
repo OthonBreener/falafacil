@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from enum import Enum, auto
+import time
 from typing import Callable, Sequence
-
 import numpy as np
 from PySide6.QtCore import (
     QByteArray,
@@ -30,6 +30,7 @@ from PySide6.QtGui import (
     QFont,
     QGuiApplication,
     QIcon,
+    QKeyEvent,
     QKeySequence,
     QPainter,
     QPaintEvent,
@@ -57,12 +58,14 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStyle,
     QTabWidget,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 from . import __version__
 from .audio import (
+    MIN_RMS_LEVEL,
     AudioCapture,
     AudioDevice,
     AudioRecorder,
@@ -82,7 +85,7 @@ from .shortcuts import (
     normalize_keyboard_shortcut,
     normalize_mouse_button_name,
 )
-from .terminal import TerminalBridge, TerminalBridgeError
+from .terminal import TerminalBridge, TerminalBridgeError, TerminalTarget
 from .spell_highlighter import SpellHighlighter
 from .spellcheck import LocalSpellChecker, utf16_code_unit_offsets
 from .transcription import (
@@ -106,6 +109,7 @@ MediaPlayerFactory = Callable[[QWidget], tuple[QMediaPlayer, QAudioOutput]]
 
 CAPTURE_WAITING_TEXT = "Aguardando entrada…"
 CAPTURE_HINT_DELAY_MS = 8000
+GLOBAL_SHORTCUT_DEBOUNCE_SECONDS = 0.35
 
 
 def _default_media_player_factory(parent: QWidget) -> tuple[QMediaPlayer, QAudioOutput]:
@@ -640,6 +644,7 @@ class MainWindow(QMainWindow):
         shortcut_service_installer: ShortcutServiceInstaller | None = None,
         homebrew_update_controller: HomebrewUpdateController | None = None,
         spell_checker: LocalSpellChecker | None = None,
+        startup_message: str | None = None,
     ) -> None:
         super().__init__()
         self.homebrew_update_controller = homebrew_update_controller
@@ -663,11 +668,22 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: TranscriptionWorker | None = None
         self._pending_capture: AudioCapture | None = None
+        self._preserved_capture: AudioCapture | None = None
         self._audio_buffer: QBuffer | None = None
         self._audio_byte_array: QByteArray | None = None
         self._microphone_refreshing = False
         self._microphone_available = False
         self._is_closing = False
+        self._close_pending = False
+        self._final_close_scheduled = False
+        self._origin_terminal_target: TerminalTarget | None = None
+        self._last_global_activation_time: float | None = None
+        self._active_recording_globally_initiated: bool = False
+        self._is_playing_audio: bool = False
+        self._playback_generation: int = 0
+        self._active_playback_generation: int | None = None
+        self._media_adapters: tuple[Callable, ...] = ()
+        self._spell_popup: SpellSuggestionPopup | None = None
         if spell_checker is not None:
             self.spell_checker = spell_checker
         else:
@@ -745,7 +761,6 @@ class MainWindow(QMainWindow):
         self.resize(1120, 700)
         self.setMinimumSize(760, 560)
         self._media_player, self._audio_output = self._media_player_factory(self)
-        self._connect_media_signals()
         self._build_ui()
         spellcheck_enabled = True
         if self.local_store:
@@ -754,13 +769,13 @@ class MainWindow(QMainWindow):
             except Exception:
                 spellcheck_enabled = True
         self.highlighter = SpellHighlighter(
-            self.editor.document(),
+            self.last_message_editor.document(),
             spell_checker=self.spell_checker,
             enabled=bool(spellcheck_enabled and self.spell_checker.is_available()),
         )
-        self.editor.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.editor.customContextMenuRequested.connect(self._show_editor_context_menu)
-        self._spell_popup = SpellSuggestionPopup(self.editor)
+        self.last_message_editor.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.last_message_editor.customContextMenuRequested.connect(self._show_editor_context_menu)
+        self._spell_popup = SpellSuggestionPopup(self.last_message_editor)
         self._spell_popup.suggestion_selected.connect(
             self._on_popup_suggestion_selected
         )
@@ -777,29 +792,84 @@ class MainWindow(QMainWindow):
             self._on_popup_dismiss_timer_timeout
         )
         self._last_hover_pos: QPoint | None = None
-        self.editor.cursorPositionChanged.connect(
+        self.last_message_editor.cursorPositionChanged.connect(
             self._on_editor_cursor_position_changed
         )
-        self.editor.viewport().installEventFilter(self)
-        self.editor.installEventFilter(self)
-        self.editor.viewport().setMouseTracking(True)
-        self.editor.verticalScrollBar().valueChanged.connect(self._hide_spell_popup)
-        self.editor.horizontalScrollBar().valueChanged.connect(self._hide_spell_popup)
+        self.transcription_editor.viewport().installEventFilter(self)
+        self.transcription_editor.installEventFilter(self)
+        self.last_message_editor.viewport().installEventFilter(self)
+        self.last_message_editor.installEventFilter(self)
+        self.last_message_editor.viewport().setMouseTracking(True)
+        self.last_message_editor.verticalScrollBar().valueChanged.connect(self._hide_spell_popup)
+        self.last_message_editor.horizontalScrollBar().valueChanged.connect(self._hide_spell_popup)
         self._restore_shortcuts()
         self._refresh_microphones()
         self._refresh_token_usage_chart()
         self._update_actions()
         if self._startup_shortcut_diagnostic is not None:
             self.status_label.setText(self._startup_shortcut_diagnostic)
-    def _connect_media_signals(self) -> None:
-        for signal_name, slot in (
-            ("mediaStatusChanged", self._on_media_status_changed),
-            ("playbackStateChanged", self._on_playback_state_changed),
-            ("errorOccurred", self._on_media_error),
-        ):
-            signal = getattr(self._media_player, signal_name, None)
-            if signal is not None:
-                signal.connect(slot)
+        if startup_message is not None:
+            self.status_label.setText(startup_message)
+        if QApplication.instance() is not None:
+            QApplication.instance().installEventFilter(self)
+    def _connect_media_adapters(self, generation: int) -> None:
+        self._disconnect_media_adapters()
+
+        def on_status(status: object, gen: int = generation) -> None:
+            self._on_media_status_changed(status, gen)
+
+        def on_state(state: object, gen: int = generation) -> None:
+            self._on_playback_state_changed(state, gen)
+
+        def on_error(
+            error: object, error_string: str = "", gen: int = generation
+        ) -> None:
+            self._on_media_error(error, error_string, gen)
+
+        self._media_adapters = (on_status, on_state, on_error)
+
+        status_sig = getattr(self._media_player, "mediaStatusChanged", None)
+        if status_sig is not None:
+            try:
+                status_sig.connect(on_status)
+            except Exception:
+                pass
+        state_sig = getattr(self._media_player, "playbackStateChanged", None)
+        if state_sig is not None:
+            try:
+                state_sig.connect(on_state)
+            except Exception:
+                pass
+        error_sig = getattr(self._media_player, "errorOccurred", None)
+        if error_sig is not None:
+            try:
+                error_sig.connect(on_error)
+            except Exception:
+                pass
+
+    def _disconnect_media_adapters(self) -> None:
+        if not hasattr(self, "_media_adapters") or not self._media_adapters:
+            return
+        on_status, on_state, on_error = self._media_adapters
+        status_sig = getattr(self._media_player, "mediaStatusChanged", None)
+        if status_sig is not None:
+            try:
+                status_sig.disconnect(on_status)
+            except Exception:
+                pass
+        state_sig = getattr(self._media_player, "playbackStateChanged", None)
+        if state_sig is not None:
+            try:
+                state_sig.disconnect(on_state)
+            except Exception:
+                pass
+        error_sig = getattr(self._media_player, "errorOccurred", None)
+        if error_sig is not None:
+            try:
+                error_sig.disconnect(on_error)
+            except Exception:
+                pass
+        self._media_adapters = ()
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -876,54 +946,94 @@ class MainWindow(QMainWindow):
         microphone_row.addWidget(self.refresh_microphones_button)
         left_layout.addLayout(microphone_row)
 
-        left_layout.addWidget(QLabel("Transcrição", left_panel))
-        self.editor = QPlainTextEdit(left_panel)
-        self.editor.setPlaceholderText(
-            "A transcrição aparecerá aqui. Você também pode corrigir o texto antes de copiar."
+        self.message_splitter = QSplitter(Qt.Orientation.Vertical, left_panel)
+        self.message_splitter.setChildrenCollapsible(False)
+
+        # Bloco superior: Transcrição atual
+        current_block = QWidget(self.message_splitter)
+        current_layout = QVBoxLayout(current_block)
+        current_layout.setContentsMargins(0, 0, 0, 0)
+        current_layout.setSpacing(8)
+
+        current_layout.addWidget(QLabel("Transcrição atual", current_block))
+        self.transcription_editor = QPlainTextEdit(current_block)
+        self.transcription_editor.setPlaceholderText(
+            "A transcrição aparecerá aqui antes de ser copiada e movida para Última mensagem."
         )
-        self.editor.setTabChangesFocus(False)
-        self.editor.setMinimumHeight(120)
-        self.editor.setMaximumHeight(190)
-        self.editor.textChanged.connect(self._update_actions)
-        left_layout.addWidget(self.editor)
+        self.transcription_editor.setTabChangesFocus(False)
+        self.transcription_editor.textChanged.connect(self._update_actions)
+        current_layout.addWidget(self.transcription_editor, stretch=1)
 
-        review_actions = QHBoxLayout()
-        self.record_button = QPushButton("Gravar", left_panel)
-        self.record_button.setToolTip("Começa ou para a gravação do microfone")
-        self.record_button.setShortcut(QKeySequence("Space"))
-        self.record_button.clicked.connect(self._toggle_recording)
-        review_actions.addWidget(self.record_button)
-        self.play_audio_button = QPushButton("Reproduzir áudio", left_panel)
-        self.play_audio_button.clicked.connect(self._play_pending_audio)
-        review_actions.addWidget(self.play_audio_button)
-        self.send_to_gemini_button = QPushButton("Enviar para Gemini", left_panel)
-        self.send_to_gemini_button.clicked.connect(self._send_pending_audio)
-        review_actions.addWidget(self.send_to_gemini_button)
-        left_layout.addLayout(review_actions)
+        current_actions = QHBoxLayout()
+        self.record_button = QPushButton("Gravar", current_block)
+        self.record_button.setToolTip("Ação principal: grava, pausa para revisar ou envia áudio")
+        self.record_button.clicked.connect(self._perform_primary_action)
+        current_actions.addWidget(self.record_button)
 
-        output_actions = QHBoxLayout()
-        self.copy_button = QPushButton("Copiar texto", left_panel)
-        self.copy_button.setToolTip("Copia o texto para a área de transferência")
-        self.copy_button.clicked.connect(self.copy_text)
-        output_actions.addWidget(self.copy_button)
-        self.review_button = QPushButton("Revisar com IA", left_panel)
+        self.record_again_button = QPushButton("Descartar e gravar novamente", current_block)
+        self.record_again_button.setToolTip("Descarta o áudio gravado e inicia uma nova gravação")
+        self.record_again_button.clicked.connect(self._start_replacement_recording)
+        current_actions.addWidget(self.record_again_button)
+
+        self.play_audio_button = QPushButton("Reproduzir áudio", current_block)
+        self.play_audio_button.setToolTip("Reproduz ou para o áudio capturado para revisão")
+        self.play_audio_button.clicked.connect(self._toggle_playback)
+        current_actions.addWidget(self.play_audio_button)
+
+        self.copy_and_archive_button = QPushButton("Copiar e arquivar", current_block)
+        self.copy_and_archive_button.setToolTip("Copia o texto atual e move para Última mensagem")
+        self.copy_and_archive_button.clicked.connect(self._copy_and_archive_current_transcription)
+        current_actions.addWidget(self.copy_and_archive_button)
+
+        current_layout.addLayout(current_actions)
+        self.message_splitter.addWidget(current_block)
+
+        # Bloco inferior: Última mensagem — somente nesta sessão
+        last_block = QWidget(self.message_splitter)
+        last_layout = QVBoxLayout(last_block)
+        last_layout.setContentsMargins(0, 0, 0, 0)
+        last_layout.setSpacing(8)
+
+        last_layout.addWidget(QLabel("Última mensagem — somente nesta sessão", last_block))
+        self.last_message_editor = QPlainTextEdit(last_block)
+        self.last_message_editor.setPlaceholderText(
+            "O último texto copiado fica aqui para revisão com IA, nova cópia ou envio ao terminal."
+        )
+        self.last_message_editor.setTabChangesFocus(False)
+        self.last_message_editor.textChanged.connect(self._update_actions)
+        last_layout.addWidget(self.last_message_editor, stretch=1)
+
+        last_actions = QHBoxLayout()
+        self.review_button = QPushButton("Revisar com IA", last_block)
         self.review_button.setToolTip(
             "Revisa gramática, concordância, crase e pontuação com o Gemini"
         )
         self.review_button.clicked.connect(self._review_text_with_ai)
-        output_actions.addWidget(self.review_button)
-        self.clear_text_button = QPushButton("Apagar texto", left_panel)
-        self.clear_text_button.setToolTip("Apaga o texto do editor")
-        self.clear_text_button.clicked.connect(self.clear_text)
-        output_actions.addWidget(self.clear_text_button)
-        self.terminal_button = QPushButton("Enviar ao terminal", left_panel)
+        last_actions.addWidget(self.review_button)
+
+        self.copy_last_button = QPushButton("Copiar novamente", last_block)
+        self.copy_last_button.setToolTip("Copia novamente o texto para a área de transferência")
+        self.copy_last_button.clicked.connect(self.copy_last_message)
+        last_actions.addWidget(self.copy_last_button)
+
+        self.terminal_button = QPushButton("Enviar ao terminal", last_block)
         self.terminal_button.setToolTip(
             "Cola o texto no terminal X11 atualmente ativo, sem pressionar Enter"
         )
         self.terminal_button.clicked.connect(self.send_to_terminal)
-        output_actions.addWidget(self.terminal_button)
-        left_layout.addLayout(output_actions)
-        left_layout.addStretch(1)
+        last_actions.addWidget(self.terminal_button)
+
+        self.clear_last_button = QPushButton("Apagar", last_block)
+        self.clear_last_button.setToolTip("Apaga o texto da última mensagem")
+        self.clear_last_button.clicked.connect(self.clear_last_message)
+        last_actions.addWidget(self.clear_last_button)
+
+        last_layout.addLayout(last_actions)
+        self.message_splitter.addWidget(last_block)
+
+        self.message_splitter.setSizes([200, 200])
+        left_layout.addWidget(self.message_splitter, stretch=1)
+
         self.status_label = QLabel(left_panel)
         self.status_label.setWordWrap(True)
         left_layout.addWidget(self.status_label)
@@ -972,7 +1082,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.copy_shortcut = QShortcut(QKeySequence("Ctrl+Shift+C"), self)
-        self.copy_shortcut.activated.connect(self.copy_text)
+        self.copy_shortcut.activated.connect(self.copy_last_message)
+
+        self.space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self.space_shortcut.activated.connect(self._on_space_shortcut_activated)
+
         self.record_button.setFocus()
         self._sync_fullscreen_button()
 
@@ -1380,7 +1494,7 @@ class MainWindow(QMainWindow):
         except AudioRecorderError as exc:
             self._set_error(str(exc))
 
-    def _acquire_api_key(self) -> tuple[str, bool]:
+    def _create_api_key_dialog(self) -> tuple[QDialog, QLineEdit]:
         dialog = QDialog(self._settings_dialog or self)
         dialog.setWindowTitle("Configurar chave API")
         layout = QVBoxLayout(dialog)
@@ -1404,10 +1518,12 @@ class MainWindow(QMainWindow):
         dialog_buttons.accepted.connect(dialog.accept)
         dialog_buttons.rejected.connect(dialog.reject)
         layout.addWidget(dialog_buttons)
+        return dialog, key_input
 
+    def _acquire_api_key(self) -> tuple[str, bool]:
+        dialog, key_input = self._create_api_key_dialog()
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         return key_input.text(), accepted
-
     @Slot()
     def _configure_api_key(self) -> None:
         api_key, accepted = self._acquire_api_key()
@@ -1488,12 +1604,22 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText("Modelo Gemini configurado com sucesso.")
     def _update_shortcut_indicator(self) -> None:
-        count = int(self._active_mouse_button is not None) + int(
-            self._active_keyboard_shortcut is not None
-        )
-        self.shortcut_indicator_label.setText(
-            f"Atalhos globais: {count} {'ativo' if count == 1 else 'ativos'}"
-        )
+        if not self.input_shortcut_bridge.ready:
+            count = int(self._active_mouse_button is not None) + int(
+                self._active_keyboard_shortcut is not None
+            )
+            self.shortcut_indicator_label.setText(
+                f"Atalhos globais: reconectando ({count} configurados)"
+            )
+        elif self._pending_bindings:
+            self.shortcut_indicator_label.setText("Atalhos globais: ativando…")
+        else:
+            count = int(self._active_mouse_button is not None) + int(
+                self._active_keyboard_shortcut is not None
+            )
+            self.shortcut_indicator_label.setText(
+                f"Atalhos globais: {count} {'ativo' if count == 1 else 'ativos'}"
+            )
         self.shortcut_indicator_label.setToolTip(
             f"Mouse: {_format_mouse_button_label(self._active_mouse_button)}\n"
             f"Teclado: {_format_keyboard_shortcut_label(self._active_keyboard_shortcut)}"
@@ -1599,17 +1725,36 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def _on_shortcut_service_ready(self, ready: bool) -> None:
-        if self._is_closing or not ready:
+        if self._is_closing:
+            return
+        if not ready:
+            self._update_shortcut_indicator()
             return
         pending_authorization = self._pending_authorization_kind
         self._pending_authorization_kind = None
+        for kind in tuple(self._pending_stops.keys()):
+            self._deactivate_shortcut(kind)
         for kind, (_generation, trigger, persist) in tuple(
             self._pending_bindings.items()
         ):
             self._activate_shortcut(kind, trigger, persist=persist)
+        if (
+            self._active_mouse_button is not None
+            and "mouse" not in self._pending_bindings
+            and "mouse" not in self._pending_stops
+        ):
+            self._activate_shortcut("mouse", self._active_mouse_button, persist=False)
+        if (
+            self._active_keyboard_shortcut is not None
+            and "keyboard" not in self._pending_bindings
+            and "keyboard" not in self._pending_stops
+        ):
+            self._activate_shortcut(
+                "keyboard", self._active_keyboard_shortcut, persist=False
+            )
+        self._update_shortcut_indicator()
         if pending_authorization is not None:
             QTimer.singleShot(0, lambda: self._capture_shortcut(pending_authorization))
-
     def _capture_shortcut(self, kind: str) -> None:
         previous = (
             self._active_mouse_button
@@ -1721,6 +1866,7 @@ class MainWindow(QMainWindow):
         self._capture_dialog.accept()
 
     def _activate_shortcut(self, kind: str, trigger: str, *, persist: bool) -> None:
+        self._pending_stops.pop(kind, None)
         if kind == "mouse":
             canonical = normalize_mouse_button_name(trigger)
             if canonical is None:
@@ -1778,6 +1924,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Atalho global configurado.")
 
     def _deactivate_shortcut(self, kind: str) -> None:
+        self._pending_bindings.pop(kind, None)
         expected = (
             self.input_shortcut_bridge.mouse_generation + 1
             if kind == "mouse"
@@ -1838,23 +1985,90 @@ class MainWindow(QMainWindow):
     def _activate_recording_shortcut(self) -> None:
         if (
             self._is_closing
+            or self._capture_dialog is not None
             or self.state is AppState.TRANSCRIBING
             or self._is_reviewing
+            or self._thread is not None
+            or self._worker is not None
+            or self._proofreading_thread is not None
+            or self._proofreading_worker is not None
         ):
             return
-        self._raise_to_front()
-        self._toggle_recording()
+
+        now = time.monotonic()
+        if self._last_global_activation_time is not None:
+            if (now - self._last_global_activation_time) < GLOBAL_SHORTCUT_DEBOUNCE_SECONDS:
+                return
+
+        if self.state is AppState.RECORDING:
+            self._last_global_activation_time = now
+            globally_initiated = self._active_recording_globally_initiated
+            self._finish_recording()
+            if globally_initiated:
+                self._raise_to_front()
+                if self.state is AppState.AUDIO_READY:
+                    self._focus_if_workflow_active(self.play_audio_button)
+        elif self.state is AppState.AUDIO_READY:
+            if self._send_pending_audio():
+                self._last_global_activation_time = now
+        else:
+            try:
+                origin_target = self.terminal_bridge.detect_active_terminal()
+            except Exception:
+                origin_target = None
+            self._origin_terminal_target = origin_target
+            self._active_recording_globally_initiated = True
+            if self._start_recording(initiated_globally=True):
+                self._last_global_activation_time = now
+            if self.state is AppState.ERROR:
+                self._active_recording_globally_initiated = False
+                self._raise_to_front()
 
     def _raise_to_front(self) -> None:
         """Show the window above other applications, restoring it if minimized."""
         if not self.isVisible():
             self.show()
-        self.setWindowState(
-            (self.windowState() & ~Qt.WindowState.WindowMinimized)
-            | Qt.WindowState.WindowActive
-        )
+        current_state = self.windowState()
+        is_fullscreen = bool(current_state & Qt.WindowState.WindowFullScreen)
+        new_state = (current_state & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive
+        if is_fullscreen:
+            new_state |= Qt.WindowState.WindowFullScreen
+        self.setWindowState(new_state)
         self.raise_()
         self.activateWindow()
+    @Slot()
+    def _on_space_shortcut_activated(self) -> None:
+        if self._is_text_input_focused():
+            return
+        self._perform_primary_action()
+
+    def _is_text_input_widget(self, watched: QObject | None) -> bool:
+        if watched is None:
+            return False
+        try:
+            if isinstance(watched, (QPlainTextEdit, QTextEdit, QLineEdit)):
+                return True
+            parent = watched.parent()
+            if parent is not None and isinstance(parent, (QPlainTextEdit, QTextEdit, QLineEdit)):
+                return True
+        except (RuntimeError, SystemError):
+            return False
+        return False
+
+    def _is_text_input_focused(self) -> bool:
+        focus_widget = QApplication.focusWidget()
+        return self._is_text_input_widget(focus_widget)
+
+    def _focus_if_workflow_active(self, widget: QWidget) -> None:
+        if self._is_closing:
+            return
+        if not (self.isActiveWindow() or QApplication.activeWindow() is self or bool(self.windowState() & Qt.WindowState.WindowActive)):
+            return
+        if self._settings_dialog is not None and self._settings_dialog.isVisible():
+            return
+        if self._capture_dialog is not None and self._capture_dialog.isVisible():
+            return
+        widget.setFocus()
 
     @Slot(str, int, str)
     def _on_shortcut_failed(self, kind: str, generation: int, message: str) -> None:
@@ -1888,86 +2102,183 @@ class MainWindow(QMainWindow):
         ):
             self._capture_dialog.reject()
         self.status_label.setText(message or BACKEND_FAILURE_MESSAGE)
+
     @Slot()
-    def _toggle_recording(self) -> None:
-        if self._is_reviewing:
+    def _perform_primary_action(self) -> None:
+        if self._is_reviewing or self.state is AppState.TRANSCRIBING:
             return
         if self.state is AppState.RECORDING:
             self._finish_recording()
-        elif self.state is not AppState.TRANSCRIBING:
-            self._start_recording()
+        elif self.state is AppState.AUDIO_READY:
+            self._send_pending_audio()
+        else:
+            self._active_recording_globally_initiated = False
+            self._start_recording(initiated_globally=False)
 
-    def _start_recording(self) -> None:
-        if self._is_reviewing:
-            return
+    def _start_replacement_recording(self) -> None:
+        self._active_recording_globally_initiated = False
+        self._start_recording(preserve_pending=True)
+    def _persist_selected_microphone(self) -> bool:
+        if self.local_store is None:
+            return True
+        current_idx = self.microphone_combo.currentIndex()
+        if current_idx < 0:
+            return True
+        device = self.microphone_combo.itemData(
+            current_idx, Qt.ItemDataRole.UserRole + 1
+        )
+        if isinstance(device, AudioDevice):
+            identity = device.identity
+        elif isinstance(device, str):
+            identity = device
+        else:
+            return True
+        try:
+            self.local_store.save_last_microphone_identity(identity)
+            return True
+        except Exception:
+            return False
+    def _start_recording(
+        self,
+        initiated_globally: bool = False,
+        preserve_pending: bool = False,
+    ) -> bool:
+        if self._is_reviewing or self._thread is not None or self._worker is not None:
+            return False
         if not self.settings.has_api_key or self.transcriber is None:
+            if preserve_pending and self._pending_capture is not None:
+                self.state = AppState.AUDIO_READY
+                self.status_label.setText(self.settings.missing_api_key_message)
+                self._update_actions()
+                return True
             self._set_error(self.settings.missing_api_key_message)
-            return
+            return True
         if not self._microphone_available or self.microphone_combo.currentData() is None:
+            if preserve_pending and self._pending_capture is not None:
+                self.state = AppState.AUDIO_READY
+                self.status_label.setText("Nenhum microfone de entrada foi detectado.")
+                self._update_actions()
+                return True
             self._set_error("Nenhum microfone de entrada foi detectado.")
-            return
-        self._pending_capture = None
-        self._release_audio_source()
-        self.audio_debug.setPlainText("Capturando áudio…\nO WAV ainda não foi enviado.")
+            return True
+
+        if self._is_playing_audio or self._audio_buffer is not None:
+            if not self._stop_playback():
+                return False
+
+        if not initiated_globally:
+            self._origin_terminal_target = None
+            self._active_recording_globally_initiated = False
+
+        if not preserve_pending:
+            self._pending_capture = None
+            self._preserved_capture = None
+        else:
+            self._preserved_capture = self._pending_capture
         self.payload_debug.clear()
         self.return_debug.clear()
         self.usage_debug.clear()
         try:
             self.recorder.start()
+            self.state = AppState.RECORDING
+            if self._persist_selected_microphone():
+                self.status_label.setText("Gravando áudio…")
+            else:
+                self.status_label.setText(
+                    "Gravando… não foi possível atualizar a memória do microfone."
+                )
         except AudioRecorderError as exc:
+            if preserve_pending and self._preserved_capture is not None:
+                self._pending_capture = self._preserved_capture
+                self.state = AppState.AUDIO_READY
+                self.status_label.setText(str(exc))
+                self._update_actions()
+                return True
             self._set_error(str(exc))
-            return
-
-        current_idx = self.microphone_combo.currentIndex()
-        selected_device = self.microphone_combo.itemData(
-            current_idx, Qt.ItemDataRole.UserRole + 1
-        )
-        selected_identity: str | None = None
-        if isinstance(selected_device, AudioDevice):
-            selected_identity = selected_device.identity
-        elif isinstance(selected_device, str):
-            selected_identity = selected_device
-
-        persistence_failed = False
-        if selected_identity and self.local_store is not None:
-            try:
-                self.local_store.save_last_microphone_identity(selected_identity)
-            except Exception:
-                persistence_failed = True
-
-        self.state = AppState.RECORDING
-        self.record_button.setText("Parar e revisar áudio")
-        if persistence_failed:
-            self.status_label.setText(
-                "Gravando… não foi possível atualizar a memória do microfone."
-            )
-        else:
-            self.status_label.setText("Gravando… fale em português e clique para parar.")
+            return True
+        except Exception:
+            if preserve_pending and self._preserved_capture is not None:
+                self._pending_capture = self._preserved_capture
+                self.state = AppState.AUDIO_READY
+                self.status_label.setText("Não foi possível iniciar a gravação do áudio.")
+                self._update_actions()
+                return True
+            self._set_error("Não foi possível iniciar a gravação do áudio.")
+            return True
         self._update_actions()
+        return True
+
     def _finish_recording(self) -> None:
+        stop_exc: AudioRecorderError | None = None
         try:
             capture = self.recorder.stop()
         except AudioRecorderError as exc:
+            stop_exc = exc
             capture = self.recorder.last_capture()
+
+        has_callback_status = bool(self.recorder.last_status())
+        is_usable = (
+            capture is not None
+            and bool(capture.wav_bytes)
+            and bool(capture.pcm_bytes)
+            and capture.rms >= MIN_RMS_LEVEL
+            and not has_callback_status
+        )
+
+        if self._preserved_capture is not None and (stop_exc is not None or not is_usable):
+            self._pending_capture = self._preserved_capture
+            self._preserved_capture = None
             if capture is not None:
-                self._render_audio_debug(capture, error=str(exc))
-            self._set_error(str(exc))
+                self._render_audio_debug(capture, error=str(stop_exc))
+            self.state = AppState.AUDIO_READY
+            self.status_label.setText(str(stop_exc))
+            self._update_actions()
+            self._focus_if_workflow_active(self.play_audio_button)
             return
 
-        self._pending_capture = capture
-        self._render_audio_debug(capture)
-        self.state = AppState.AUDIO_READY
-        self.record_button.setText("Gravar")
-        self.status_label.setText(
-            "Áudio pronto. Reproduza para revisar ou envie explicitamente ao Gemini."
-        )
-        self._update_actions()
+        if is_usable:
+            assert capture is not None
+            self._preserved_capture = None
+            self._pending_capture = capture
+            self._render_audio_debug(capture, error=str(stop_exc) if stop_exc else None)
+            self.state = AppState.AUDIO_READY
+            if stop_exc is not None:
+                self.status_label.setText(
+                    f"{stop_exc} Áudio pronto para envio ou reprodução."
+                )
+            else:
+                self.status_label.setText(
+                    "Áudio pronto. Reproduza para revisar ou envie explicitamente ao Gemini."
+                )
+            self._update_actions()
+            self._focus_if_workflow_active(self.play_audio_button)
+            return
+
+        self._pending_capture = None
+        if capture is not None:
+            self._render_audio_debug(capture, error=str(stop_exc))
+        self._set_error(str(stop_exc))
+
+    @Slot()
+    def _toggle_playback(self) -> None:
+        if self._is_playing_audio:
+            if self._stop_playback():
+                self.status_label.setText("Reprodução parada.")
+        else:
+            self._play_pending_audio()
 
     def _play_pending_audio(self) -> None:
         capture = self._pending_capture
-        if self.state is not AppState.AUDIO_READY or capture is None:
+        if (
+            self.state is not AppState.AUDIO_READY
+            or capture is None
+            or self._thread is not None
+            or self._worker is not None
+        ):
             return
-        self._release_audio_source()
+        if self._is_playing_audio or self._audio_buffer is not None:
+            if not self._stop_playback():
+                return
         self._audio_byte_array = QByteArray(capture.wav_bytes)
         self._audio_buffer = QBuffer(self)
         self._audio_buffer.setData(self._audio_byte_array)
@@ -1975,23 +2286,104 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Não foi possível preparar a reprodução do áudio.")
             self._release_audio_source()
             return
+        self._playback_generation += 1
+        current_gen = self._playback_generation
+        self._active_playback_generation = current_gen
+        self._is_playing_audio = True
+        self.play_audio_button.setText("Parar reprodução")
+        self.status_label.setText("Reproduzindo o áudio capturado.")
+        self._connect_media_adapters(current_gen)
         try:
             self._media_player.setAudioOutput(self._audio_output)
             self._media_player.setSourceDevice(self._audio_buffer, QUrl("audio.wav"))
             self._media_player.play()
-            self.status_label.setText("Reproduzindo o áudio capturado.")
         except Exception:
+            if not self._stop_playback():
+                return
             self.status_label.setText("Não foi possível reproduzir o áudio.")
-            self._release_audio_source()
+    def _stop_playback(self) -> bool:
+        if (
+            not self._is_playing_audio
+            and self._audio_buffer is None
+            and not self._media_adapters
+        ):
+            return True
+        if not self._release_audio_source():
+            self._is_playing_audio = True
+            if hasattr(self, "play_audio_button") and self.play_audio_button is not None:
+                self.play_audio_button.setText("Parar reprodução")
+            self.status_label.setText("Não foi possível parar a reprodução do áudio.")
+            self._update_actions()
+            return False
+        self._playback_generation += 1
+        self._active_playback_generation = None
+        self._is_playing_audio = False
+        if hasattr(self, "play_audio_button") and self.play_audio_button is not None:
+            self.play_audio_button.setText("Reproduzir áudio")
+        self._update_actions()
+        return True
 
-    def _send_pending_audio(self) -> None:
+    def _release_audio_source(self) -> bool:
+        if (
+            not self._is_playing_audio
+            and self._audio_buffer is None
+            and not self._media_adapters
+        ):
+            return True
+        detached = False
+        if self._media_player is not None:
+            try:
+                self._media_player.stop()
+            except Exception:
+                pass
+            if hasattr(self._media_player, "setSourceDevice"):
+                try:
+                    self._media_player.setSourceDevice(None)
+                    detached = True
+                except Exception:
+                    pass
+            if hasattr(self._media_player, "setSource"):
+                try:
+                    self._media_player.setSource(QUrl())
+                    detached = True
+                except Exception:
+                    pass
+        else:
+            detached = True
+        if detached:
+            self._disconnect_media_adapters()
+            if self._audio_buffer is not None:
+                try:
+                    self._audio_buffer.close()
+                except Exception:
+                    pass
+                self._audio_buffer.setParent(None)
+                self._audio_buffer.deleteLater()
+                self._audio_buffer = None
+            self._audio_byte_array = None
+            return True
+        return False
+
+    def _send_pending_audio(self) -> bool:
         if self.state is not AppState.AUDIO_READY or self._pending_capture is None:
-            return
+            return False
+        if self._thread is not None or self._worker is not None:
+            return False
         if self.transcriber is None or not self.settings.has_api_key:
             self._set_error(self.settings.missing_api_key_message)
-            return
+            return False
 
+        if bool(self.transcription_editor.toPlainText().strip()):
+            self.status_label.setText(
+                "Copie e arquive a transcrição atual antes de enviar outro áudio."
+            )
+            return False
+
+        if self._is_playing_audio or self._audio_buffer is not None:
+            if not self._stop_playback():
+                return False
         self.state = AppState.TRANSCRIBING
+        self.transcription_editor.setReadOnly(True)
         self.status_label.setText("Transcrevendo com Gemini…")
         self._update_actions()
 
@@ -2010,6 +2402,7 @@ class MainWindow(QMainWindow):
         self._worker.failed.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._on_thread_finished)
         self._thread.start()
+        return True
 
     @Slot(str, object)
     def _on_transcription_finished(
@@ -2017,55 +2410,125 @@ class MainWindow(QMainWindow):
         text: str,
         debug: TranscriptionDebug | None,
     ) -> None:
-        self.editor.setPlainText(text)
-        self.editor.selectAll()
+        if self._is_closing:
+            return
+        self.transcription_editor.setPlainText(text)
         self._render_transcription_debug(debug, text=text)
         self._record_and_render_usage(debug, "success")
-        self.state = AppState.READY
-        self.status_label.setText("Transcrição pronta. Revise, copie ou envie ao terminal.")
+        self._copy_and_archive_current_transcription(from_transcription=True)
 
+    @Slot()
+    def _copy_and_archive_current_transcription(
+        self,
+        *,
+        from_transcription: bool = False,
+    ) -> None:
+        text = self.transcription_editor.toPlainText()
+        if not text.strip():
+            self.status_label.setText("Não há texto para copiar e arquivar.")
+            return
+        QApplication.clipboard().setText(text)
+        self.last_message_editor.setPlainText(text)
+        self.transcription_editor.clear()
+
+        if from_transcription:
+            self._pending_capture = None
+            self._stop_playback()
+            self.state = AppState.READY
+        elif self.state not in (AppState.AUDIO_READY, AppState.RECORDING):
+            self.state = AppState.READY
+
+        self.status_label.setText("Texto copiado e movido para Última mensagem.")
+        cursor = self.last_message_editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.last_message_editor.setTextCursor(cursor)
+        self._focus_if_workflow_active(self.last_message_editor)
+        self._update_actions()
     @Slot(str, object)
     def _on_transcription_failed(
         self,
         message: str,
         debug: TranscriptionDebug | None,
     ) -> None:
+        if self._is_closing:
+            return
         self._render_transcription_debug(debug, error=message)
         self._record_and_render_usage(debug, "error")
-        self._set_error(message)
+        if self._pending_capture is not None:
+            self.state = AppState.AUDIO_READY
+            self.status_label.setText(message)
+        else:
+            self._set_error(message)
+
+    def _clear_transcription_worker(self) -> None:
+        if self._thread is not None:
+            try:
+                self._thread.deleteLater()
+            except Exception:
+                pass
+            self._thread = None
+        self._worker = None
+
     @Slot()
     def _on_thread_finished(self) -> None:
-        if self._thread is not None:
-            self._thread.deleteLater()
-        self._worker = None
-        self._thread = None
+        self._clear_transcription_worker()
+
+        if self._is_closing:
+            self._finish_deferred_close_if_ready()
+            return
+        self.transcription_editor.setReadOnly(False)
         if self.state is AppState.TRANSCRIBING:
             self.state = AppState.IDLE
         self._update_actions()
 
     @Slot(object)
-    def _on_media_status_changed(self, status: object) -> None:
+    def _on_media_status_changed(
+        self, status: object, generation: int | None = None
+    ) -> None:
+        if self._is_closing or self.state is not AppState.AUDIO_READY or not self._is_playing_audio:
+            return
+        if self._active_playback_generation is None:
+            return
+        if generation is None or generation != self._active_playback_generation:
+            return
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self._release_audio_source()
-            self.status_label.setText("Reprodução concluída.")
+            if self._stop_playback():
+                self.status_label.setText("Reprodução concluída.")
+                self._focus_if_workflow_active(self.record_button)
         elif status == QMediaPlayer.MediaStatus.InvalidMedia:
-            self.status_label.setText("Não foi possível reproduzir o áudio capturado.")
-
+            if self._stop_playback():
+                self.status_label.setText("Não foi possível reproduzir o áudio capturado.")
     @Slot(object)
-    def _on_playback_state_changed(self, state: object) -> None:
-        if state == QMediaPlayer.PlaybackState.StoppedState and self._audio_buffer is not None:
-            self._release_audio_source()
+    def _on_playback_state_changed(
+        self, state: object, generation: int | None = None
+    ) -> None:
+        if self._is_closing or self.state is not AppState.AUDIO_READY:
+            return
+        if self._active_playback_generation is None:
+            return
+        if generation is None or generation != self._active_playback_generation:
+            return
+        if state == QMediaPlayer.PlaybackState.StoppedState:
+            if self._is_playing_audio:
+                self._stop_playback()
 
     @Slot(object, str)
-    def _on_media_error(self, error: object, error_string: str = "") -> None:
+    def _on_media_error(
+        self, error: object, error_string: str = "", generation: int | None = None
+    ) -> None:
         del error, error_string
-        self.status_label.setText("Não foi possível reproduzir o áudio capturado.")
-
-    def _release_audio_source(self) -> None:
-        if self._audio_buffer is not None:
-            self._audio_buffer.close()
-        self._audio_buffer = None
-        self._audio_byte_array = None
+        if self._is_closing or self.state in (
+            AppState.RECORDING,
+            AppState.TRANSCRIBING,
+            AppState.READY,
+        ):
+            return
+        if self._active_playback_generation is None:
+            return
+        if generation is None or generation != self._active_playback_generation:
+            return
+        if self._stop_playback():
+            self.status_label.setText("Não foi possível reproduzir o áudio capturado.")
 
     def _render_audio_debug(
         self,
@@ -2222,8 +2685,8 @@ class MainWindow(QMainWindow):
         else:
             self.usage_chart.set_history(history, status_message="")
     @Slot()
-    def copy_text(self) -> None:
-        text = self.editor.toPlainText()
+    def copy_last_message(self) -> None:
+        text = self.last_message_editor.toPlainText()
         if not text.strip():
             self.status_label.setText("Não há texto para copiar.")
             return
@@ -2231,69 +2694,103 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Texto copiado.")
 
     @Slot()
-    def clear_text(self) -> None:
-        if not self.editor.toPlainText().strip():
+    def clear_last_message(self) -> None:
+        if not self.last_message_editor.toPlainText().strip():
             self.status_label.setText("Não há texto para apagar.")
             return
         self._hide_spell_popup()
-        self.editor.clear()
+        self.last_message_editor.clear()
+        if self.state is AppState.READY and self._pending_capture is None:
+            self.state = AppState.IDLE
+        self._update_actions()
         self.status_label.setText("Texto apagado.")
 
     @Slot()
     def send_to_terminal(self) -> None:
-        text = self.editor.toPlainText()
+        text = self.last_message_editor.toPlainText()
         try:
             self.terminal_bridge.send_text(
                 text,
                 lambda value: QApplication.clipboard().setText(value),
+                target=self._origin_terminal_target,
             )
         except TerminalBridgeError as exc:
             self.status_label.setText(str(exc))
             return
+        self._origin_terminal_target = None
         self.status_label.setText("Texto colado no terminal ativo, sem pressionar Enter.")
 
     def _update_actions(self) -> None:
-        busy = self.state is AppState.TRANSCRIBING
+        worker_busy = self._thread is not None or self._worker is not None
+        busy = self.state is AppState.TRANSCRIBING or worker_busy
         recording = self.state is AppState.RECORDING
-        audio_ready = self.state is AppState.AUDIO_READY
-        has_text = bool(self.editor.toPlainText().strip())
+        audio_ready = self.state is AppState.AUDIO_READY and not worker_busy
+        has_transcription = bool(self.transcription_editor.toPlainText().strip())
+        has_last_message = bool(self.last_message_editor.toPlainText().strip())
         reviewing = self._is_reviewing
+
+        if recording:
+            primary_text = "Parar e revisar áudio"
+        elif audio_ready:
+            primary_text = "Enviar para Gemini"
+        elif busy:
+            primary_text = "Transcrevendo…"
+        else:
+            primary_text = "Gravar"
+        self.record_button.setText(primary_text)
         self.record_button.setEnabled(
-            not busy and not reviewing and self.settings.has_api_key and self._microphone_available
+            not busy
+            and not reviewing
+            and self.settings.has_api_key
+            and self.transcriber is not None
+            and (self._microphone_available or audio_ready)
         )
-        self.record_button.setText("Parar e revisar áudio" if recording else "Gravar")
+
+        self.record_again_button.setEnabled(
+            audio_ready
+            and not reviewing
+            and self._microphone_available
+            and self.settings.has_api_key
+            and self.transcriber is not None
+        )
         self.play_audio_button.setEnabled(audio_ready and not reviewing)
-        self.send_to_gemini_button.setEnabled(
-            audio_ready and not reviewing and self.settings.has_api_key and self.transcriber is not None
+        self.copy_and_archive_button.setEnabled(
+            not busy and not reviewing and has_transcription
         )
-        self.microphone_combo.setEnabled(not busy and not recording and not reviewing)
-        self.refresh_microphones_button.setEnabled(not busy and not recording and not reviewing)
-        self.copy_button.setEnabled(not busy and not reviewing and has_text)
+        self.copy_last_button.setEnabled(
+            not busy and not reviewing and has_last_message
+        )
         self.review_button.setEnabled(
             not busy
             and not recording
             and self.settings.has_api_key
             and self.transcriber is not None
-            and has_text
+            and has_last_message
             and not reviewing
         )
-        self.clear_text_button.setEnabled(not busy and not reviewing and has_text)
-        self.terminal_button.setEnabled(not busy and not reviewing and has_text)
+        self.clear_last_button.setEnabled(
+            not busy and not reviewing and has_last_message
+        )
+        self.terminal_button.setEnabled(
+            not busy and not reviewing and has_last_message
+        )
+        self.microphone_combo.setEnabled(not busy and not recording and not reviewing)
+        self.refresh_microphones_button.setEnabled(not busy and not recording and not reviewing)
         self.settings_button.setEnabled(True)
         self._update_settings_dialog()
         if not self.settings.has_api_key and self.state is AppState.IDLE:
             self.status_label.setText(self.settings.missing_api_key_message)
 
     def _show_editor_context_menu(self, pos: QPoint) -> None:
-        menu = self.editor.createStandardContextMenu()
+        menu = self.last_message_editor.createStandardContextMenu()
         if menu is None:
-            menu = QMenu(self.editor)
+            menu = QMenu(self.last_message_editor)
         try:
-            cursor = self.editor.cursorForPosition(pos)
+            cursor = self.last_message_editor.cursorForPosition(pos)
 
             if (
                 not self._is_reviewing
-                and not self.editor.isReadOnly()
+                and not self.last_message_editor.isReadOnly()
                 and self.highlighter.enabled
                 and self.spell_checker.is_available()
             ):
@@ -2338,7 +2835,7 @@ class MainWindow(QMainWindow):
                         menu.insertAction(first_action, ignore_act)
                         menu.insertSeparator(first_action)
 
-            menu.exec(self.editor.mapToGlobal(pos))
+            menu.exec(self.last_message_editor.mapToGlobal(pos))
         finally:
             menu.deleteLater()
 
@@ -2373,12 +2870,12 @@ class MainWindow(QMainWindow):
         self._hide_spell_popup()
 
     def _on_editor_cursor_position_changed(self) -> None:
-        self._check_spell_under_cursor(self.editor.textCursor(), source="cursor")
+        self._check_spell_under_cursor(self.last_message_editor.textCursor(), source="cursor")
 
     def _on_hover_spell_timer_timeout(self) -> None:
         if self._last_hover_pos is None:
             return
-        cursor = self.editor.cursorForPosition(self._last_hover_pos)
+        cursor = self.last_message_editor.cursorForPosition(self._last_hover_pos)
         self._check_spell_under_cursor(cursor, source="hover")
 
     def _check_spell_under_cursor(
@@ -2387,7 +2884,7 @@ class MainWindow(QMainWindow):
         del source
         if (
             self._is_reviewing
-            or self.editor.isReadOnly()
+            or self.last_message_editor.isReadOnly()
             or not self.highlighter.enabled
             or not self.spell_checker.is_available()
             or self._spell_popup is None
@@ -2434,8 +2931,8 @@ class MainWindow(QMainWindow):
         word_cursor = QTextCursor(cursor)
         word_cursor.setPosition(global_start)
         word_cursor.setPosition(global_end, QTextCursor.MoveMode.KeepAnchor)
-        cursor_rect = self.editor.cursorRect(word_cursor)
-        global_top_left = self.editor.viewport().mapToGlobal(cursor_rect.topLeft())
+        cursor_rect = self.last_message_editor.cursorRect(word_cursor)
+        global_top_left = self.last_message_editor.viewport().mapToGlobal(cursor_rect.topLeft())
         target_rect = QRect(global_top_left, cursor_rect.size())
 
         self._spell_popup.show_suggestions(word, suggestions, target_rect)
@@ -2444,25 +2941,25 @@ class MainWindow(QMainWindow):
         if self._active_spell_token is None:
             return
         start, end, _word = self._active_spell_token
-        cursor = self.editor.textCursor()
+        cursor = self.last_message_editor.textCursor()
         cursor.beginEditBlock()
         cursor.setPosition(start)
         cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
         cursor.insertText(replacement)
         cursor.endEditBlock()
-        self.editor.setTextCursor(cursor)
-        self.editor.setFocus()
+        self.last_message_editor.setTextCursor(cursor)
+        self.last_message_editor.setFocus()
         self._hide_spell_popup()
 
     def _on_popup_ignore_selected(self, word: str) -> None:
         self._ignore_spellcheck_word(word)
-        self.editor.setFocus()
+        self.last_message_editor.setFocus()
         self._hide_spell_popup()
 
     @Slot()
     def _review_text_with_ai(self) -> None:
-        text = self.editor.toPlainText().strip()
-        if not text:
+        text = self.last_message_editor.toPlainText()
+        if not text.strip():
             self.status_label.setText("Não há texto para revisar.")
             return
         if not self.settings.has_api_key or self.transcriber is None:
@@ -2475,7 +2972,7 @@ class MainWindow(QMainWindow):
 
         self._hide_spell_popup()
         self._is_reviewing = True
-        self.editor.setReadOnly(True)
+        self.last_message_editor.setReadOnly(True)
         self.status_label.setText("Revisando texto com IA...")
         self._update_actions()
 
@@ -2501,11 +2998,21 @@ class MainWindow(QMainWindow):
     ) -> None:
         if self._is_closing:
             return
-        self.editor.setPlainText(revised_text)
-        self.editor.selectAll()
+        cursor = self.last_message_editor.textCursor()
+        cursor.beginEditBlock()
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.insertText(revised_text)
+        cursor.endEditBlock()
+
+        QApplication.clipboard().setText(revised_text)
+
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.last_message_editor.setTextCursor(cursor)
+
         self._render_transcription_debug(debug, text=revised_text)
         self._record_and_render_usage(debug, "success")
-        self.status_label.setText("Texto revisado com sucesso pelo Gemini.")
+        self.status_label.setText("Texto revisado e copiado.")
+        self._focus_if_workflow_active(self.last_message_editor)
 
     @Slot(str, object)
     def _on_proofreading_failed(
@@ -2519,14 +3026,24 @@ class MainWindow(QMainWindow):
         self._record_and_render_usage(debug, "error")
         self.status_label.setText(message)
 
+    def _clear_proofreading_worker(self) -> None:
+        if self._proofreading_thread is not None:
+            try:
+                self._proofreading_thread.deleteLater()
+            except Exception:
+                pass
+            self._proofreading_thread = None
+        self._proofreading_worker = None
+
     @Slot()
     def _on_proofreading_thread_finished(self) -> None:
-        self.editor.setReadOnly(False)
+        self._clear_proofreading_worker()
+
+        if self._is_closing:
+            self._finish_deferred_close_if_ready()
+            return
+        self.last_message_editor.setReadOnly(False)
         self._is_reviewing = False
-        if self._proofreading_thread is not None:
-            self._proofreading_thread.deleteLater()
-        self._proofreading_worker = None
-        self._proofreading_thread = None
         self._update_actions()
     def _set_error(self, message: str) -> None:
         self.state = AppState.ERROR
@@ -2541,9 +3058,33 @@ class MainWindow(QMainWindow):
         super().moveEvent(event)
         self._hide_spell_popup()
 
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.ShortcutOverride:
+            if isinstance(event, QKeyEvent) and event.key() == Qt.Key.Key_Space:
+                if self._is_text_input_focused():
+                    event.accept()
+                    return True
+        return super().event(event)
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self.editor.viewport():
+        try:
             event_type = event.type()
+        except (RuntimeError, SystemError):
+            return False
+
+        if event_type == QEvent.Type.ShortcutOverride:
+            if isinstance(event, QKeyEvent) and event.key() == Qt.Key.Key_Space:
+                if self._is_text_input_widget(watched) or self._is_text_input_focused():
+                    event.accept()
+                    return True
+        if not hasattr(self, "last_message_editor") or self.last_message_editor is None:
+            return super().eventFilter(watched, event)
+        try:
+            is_viewport = watched is self.last_message_editor.viewport()
+        except (RuntimeError, SystemError):
+            is_viewport = False
+
+        if is_viewport:
             if event_type == QEvent.Type.MouseMove:
                 if (
                     hasattr(self, "_popup_dismiss_timer")
@@ -2572,8 +3113,7 @@ class MainWindow(QMainWindow):
                 ):
                     self._hover_spell_timer.stop()
                 self._hide_spell_popup()
-        elif watched is self._spell_popup:
-            event_type = event.type()
+        elif hasattr(self, "_spell_popup") and self._spell_popup is not None and watched is self._spell_popup:
             if event_type in (QEvent.Type.Enter, QEvent.Type.MouseMove):
                 self._is_mouse_over_popup = True
                 if (
@@ -2584,21 +3124,21 @@ class MainWindow(QMainWindow):
             elif event_type == QEvent.Type.Leave:
                 self._is_mouse_over_popup = False
                 cursor_pos = QCursor.pos()
-                viewport = self.editor.viewport()
+                viewport = self.last_message_editor.viewport()
                 vp_pos = viewport.mapFromGlobal(cursor_pos)
                 is_over_token = False
                 if (
                     viewport.rect().contains(vp_pos)
                     and self._active_spell_token is not None
                 ):
-                    text_cursor = self.editor.cursorForPosition(vp_pos)
+                    text_cursor = self.last_message_editor.cursorForPosition(vp_pos)
                     start, end, _word = self._active_spell_token
                     pos = text_cursor.position()
                     if start <= pos <= end:
                         is_over_token = True
                 if not is_over_token:
                     self._hide_spell_popup()
-        elif watched is self.editor:
+        elif hasattr(self, "last_message_editor") and self.last_message_editor is not None and watched is self.last_message_editor:
             event_type = event.type()
             if event_type == QEvent.Type.KeyPress:
                 if event.key() == Qt.Key.Key_Escape:
@@ -2608,6 +3148,20 @@ class MainWindow(QMainWindow):
             elif event_type in (QEvent.Type.Resize, QEvent.Type.Move):
                 self._hide_spell_popup()
         return super().eventFilter(watched, event)
+    def _finish_deferred_close_if_ready(self) -> None:
+        if not self._is_closing or not self._close_pending:
+            return
+        if (
+            self._thread is not None
+            or self._worker is not None
+            or self._proofreading_thread is not None
+            or self._proofreading_worker is not None
+        ):
+            return
+        self._close_pending = False
+        if not self._final_close_scheduled:
+            self._final_close_scheduled = True
+            QTimer.singleShot(0, self.close)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if (
@@ -2617,6 +3171,49 @@ class MainWindow(QMainWindow):
             self.status_label.setText(
                 "A atualização pelo Homebrew está em andamento. Aguarde a conclusão."
             )
+            event.ignore()
+            return
+        if self._is_closing:
+            had_deferred_work = (
+                self._close_pending
+                or self._thread is not None
+                or self._worker is not None
+                or self._proofreading_thread is not None
+                or self._proofreading_worker is not None
+            )
+            if self._thread is not None and not self._thread.isRunning():
+                self._clear_transcription_worker()
+            elif self._thread is None and self._worker is not None:
+                self._clear_transcription_worker()
+
+            if (
+                self._proofreading_thread is not None
+                and not self._proofreading_thread.isRunning()
+            ):
+                self._clear_proofreading_worker()
+            elif (
+                self._proofreading_thread is None
+                and self._proofreading_worker is not None
+            ):
+                self._clear_proofreading_worker()
+
+            if self._close_pending:
+                self._finish_deferred_close_if_ready()
+
+            if (
+                had_deferred_work
+                or self._close_pending
+                or self._thread is not None
+                or self._worker is not None
+                or self._proofreading_thread is not None
+                or self._proofreading_worker is not None
+            ):
+                event.ignore()
+                return
+            event.accept()
+            return
+        if not self._stop_playback():
+            self.status_label.setText("Não foi possível parar a reprodução do áudio.")
             event.ignore()
             return
         self._is_closing = True
@@ -2646,30 +3243,51 @@ class MainWindow(QMainWindow):
         if self.recorder.is_recording():
             try:
                 self.recorder.stop()
-            except AudioRecorderError:
-                pass
-        try:
-            self._media_player.stop()
-        except Exception:
-            pass
-        set_source = getattr(self._media_player, "setSource", None)
-        if set_source is not None:
-            set_source(QUrl())
-        self._release_audio_source()
-        self._pending_capture = None
-        thread = self._thread
-        if thread is not None and thread.isRunning():
-            thread.quit()
-            if not thread.wait(5000):
-                thread.wait()
-        proof_thread = self._proofreading_thread
-        if proof_thread is not None and proof_thread.isRunning():
-            proof_thread.quit()
-            if not proof_thread.wait(5000):
-                proof_thread.wait()
-        if self.local_store is not None:
-            try:
-                self.local_store.close()
             except Exception:
                 pass
+        if QApplication.instance() is not None:
+            try:
+                QApplication.instance().removeEventFilter(self)
+            except Exception:
+                pass
+        self._pending_capture = None
+        self._preserved_capture = None
+        self._origin_terminal_target = None
+        if self.local_store is not None:
+            store = self.local_store
+            self.local_store = None
+            try:
+                store.close()
+            except Exception:
+                pass
+
+        transcription_running = (
+            self._thread is not None and self._thread.isRunning()
+        )
+        proofreading_running = (
+            self._proofreading_thread is not None
+            and self._proofreading_thread.isRunning()
+        )
+        if transcription_running and self._thread is not None:
+            try:
+                self._thread.quit()
+            except Exception:
+                pass
+        else:
+            self._clear_transcription_worker()
+
+        if proofreading_running and self._proofreading_thread is not None:
+            try:
+                self._proofreading_thread.quit()
+            except Exception:
+                pass
+        else:
+            self._clear_proofreading_worker()
+
+        if transcription_running or proofreading_running:
+            self._close_pending = True
+            self.hide()
+            event.ignore()
+            return
+
         event.accept()

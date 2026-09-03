@@ -45,11 +45,16 @@ def main() -> int:
     def transcriber_factory(api_key: str, model: str) -> GeminiTranscriber:
         return GeminiTranscriber(api_key=api_key, model=model)
 
-    transcriber = (
-        transcriber_factory(settings.api_key, settings.model)
-        if settings.has_api_key and settings.api_key is not None
-        else None
-    )
+    startup_message: str | None = None
+    transcriber = None
+    if settings.has_api_key and settings.api_key is not None:
+        try:
+            transcriber = transcriber_factory(settings.api_key, settings.model)
+        except Exception:
+            transcriber = None
+            startup_message = (
+                "Não foi possível iniciar o Gemini. Revise a chave ou o modelo nas Configurações."
+            )
     homebrew_installation = None
     try:
         from .homebrew_update import detect_homebrew_installation
@@ -74,6 +79,7 @@ def main() -> int:
         transcriber_factory=transcriber_factory,
         local_store=local_store,
         homebrew_update_controller=homebrew_update_controller,
+        startup_message=startup_message,
     )
     if homebrew_installation is not None:
         try:

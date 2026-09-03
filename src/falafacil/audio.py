@@ -334,26 +334,31 @@ class AudioRecorder:
             close_error = AudioRecorderError(
                 "Não foi possível fechar o microfone."
             )
-        if stop_error is not None:
-            raise stop_error
-        if close_error is not None:
-            raise close_error
 
         with self._lock:
             pcm_bytes = b"".join(self._chunks)
             sample_rate = self._capture_sample_rate
+            status = self._status
 
         capture = _build_capture(pcm_bytes, sample_rate)
         with self._lock:
             self._last_capture = capture
+
         if not pcm_bytes:
             raise AudioRecorderError("Nenhum áudio foi capturado.")
         if capture.rms < MIN_RMS_LEVEL:
             raise AudioRecorderError(
                 "O áudio capturado está muito baixo. Verifique o microfone e tente novamente."
             )
+        if status:
+            raise AudioRecorderError(
+                "O áudio perdeu trechos durante a captura. Grave novamente."
+            )
+        if stop_error is not None:
+            raise stop_error
+        if close_error is not None:
+            raise close_error
         return capture
-
     def is_recording(self) -> bool:
         with self._lock:
             return self._stream is not None

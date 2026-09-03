@@ -31,12 +31,15 @@ class FakeEnchantCDLL:
         valid_words: Iterable[str] | None = None,
         suggestions: dict[str, list[str]] | None = None,
         dict_exists: bool = True,
+        check_map: dict[str, int] | None = None,
     ) -> None:
         self.valid_words = {
             w.lower() for w in (valid_words or ["computador", "correto", "teste"])
         }
         self.suggestions = suggestions or {"computadro": ["computador", "computadora"]}
         self._dict_exists_flag = dict_exists
+        self.check_map = check_map
+        self.checked_terms: list[str] = []
         self._keepalive: list[object] = []
 
         self.enchant_broker_init = MockCFunction(self._broker_init)
@@ -69,8 +72,10 @@ class FakeEnchantCDLL:
             if isinstance(word_bytes, bytes)
             else str(word_bytes)
         )
+        self.checked_terms.append(w)
+        if self.check_map is not None and w in self.check_map:
+            return self.check_map[w]
         return 0 if w.lower() in self.valid_words else 1
-
     def _dict_suggest(
         self, dict_handle: int, word_bytes: bytes, length: int, n_suggs_ptr: object
     ) -> object:
@@ -144,6 +149,110 @@ def test_spellcheck_deterministic_with_fake_enchant(
     checker.close()
     assert checker.is_available() is False
 
+
+
+def test_spellcheck_three_way_return_contract_and_fail_soft(
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 0 = correct, >0 = misspelled, <0 = native error (fail-soft -> returns True)
+    fake_lib = FakeEnchantCDLL(
+        valid_words=["correto", "valido"],
+        check_map={
+            "correto": 0,
+            "errado": 1,
+            "outro_erro": 2,
+            "falha_nativa": -1,
+            "falha_grave": -2,
+            "falhanativa": -1,
+            # Capitalized original negative (fail-soft with 1 native call, no lowercase retry)
+            "Falhacapital": -1,
+            # Capitalized original positive, lowercase retry zero
+            "Brasil": 1,
+            "brasil": 0,
+            # Capitalized original positive, lowercase retry negative (fail-soft)
+            "Falhanativa": 1,
+            # Capitalized original positive, lowercase retry positive (misspelled)
+            "Incorreto": 1,
+            "incorreto": 1,
+        },
+    )
+    monkeypatch.setattr(
+        "falafacil.spellcheck._load_enchant_library", lambda lib_path=None: fake_lib
+    )
+
+    checker = LocalSpellChecker()
+    try:
+        assert checker.is_available() is True
+        fake_lib.checked_terms.clear()
+
+        # 0 -> True
+        assert checker.check("correto") is True
+        assert fake_lib.checked_terms == ["correto"]
+
+        # positive -> False
+        fake_lib.checked_terms.clear()
+        assert checker.check("errado") is False
+        assert fake_lib.checked_terms == ["errado"]
+
+        fake_lib.checked_terms.clear()
+        assert checker.check("outro_erro") is False
+        assert fake_lib.checked_terms == ["outro_erro"]
+
+        # negative (native error) -> True (fail-soft)
+        fake_lib.checked_terms.clear()
+        assert checker.check("falha_nativa") is True
+        assert fake_lib.checked_terms == ["falha_nativa"]
+
+        fake_lib.checked_terms.clear()
+        assert checker.check("falha_grave") is True
+        assert fake_lib.checked_terms == ["falha_grave"]
+
+        # Capitalized original negative -> True (fail-soft with exactly one native call, NO lowercase retry)
+        fake_lib.checked_terms.clear()
+        assert checker.check("Falhacapital") is True
+        assert fake_lib.checked_terms == ["Falhacapital"]
+
+        # Capitalized: original positive, lowercase retry zero -> True (two native calls)
+        fake_lib.checked_terms.clear()
+        assert checker.check("Brasil") is True
+        assert fake_lib.checked_terms == ["Brasil", "brasil"]
+
+        # Capitalized: original positive, lowercase retry negative -> True (fail-soft, two native calls)
+        fake_lib.checked_terms.clear()
+        assert checker.check("Falhanativa") is True
+        assert fake_lib.checked_terms == ["Falhanativa", "falhanativa"]
+
+        # Capitalized: original positive, lowercase retry positive -> False (two native calls)
+        fake_lib.checked_terms.clear()
+        assert checker.check("Incorreto") is False
+        assert fake_lib.checked_terms == ["Incorreto", "incorreto"]
+
+        # Exercise SpellHighlighter for native-negative words and assert no underline format is created
+        doc = QTextDocument()
+        highlighter = SpellHighlighter(doc, spell_checker=checker, enabled=True)
+
+        # Document with native-negative words ("Falhacapital", "falhanativa"), valid words ("correto"), and misspelled ("errado")
+        doc.setPlainText("Falhacapital falhanativa correto errado")
+        highlighter.rehighlight()
+
+        block = doc.firstBlock()
+        formats = block.layout().formats()
+        assert len(formats) == 1
+        errado_idx = doc.toPlainText().index("errado")
+        assert formats[0].start == errado_idx
+        assert formats[0].length == len("errado")
+        assert (
+            formats[0].format.underlineStyle()
+            == QTextCharFormat.UnderlineStyle.SpellCheckUnderline
+        )
+
+        # Document containing ONLY native-negative words creates zero underline formats
+        doc.setPlainText("Falhacapital falhanativa")
+        highlighter.rehighlight()
+        assert len(doc.firstBlock().layout().formats()) == 0
+    finally:
+        checker.close()
 
 def test_spell_highlighter_deterministic_with_fake_enchant(
     qapp: QApplication, monkeypatch: pytest.MonkeyPatch

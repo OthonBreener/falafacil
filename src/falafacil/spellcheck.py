@@ -219,11 +219,13 @@ class LocalSpellChecker:
 
         try:
             res = self._lib.enchant_dict_check(self._dict, w.encode("utf-8"), -1)
-            if res == 0:
+            if res == 0 or res < 0:
                 return True
             if w[0].isupper() and not w.isupper():
-                res_lower = self._lib.enchant_dict_check(self._dict, w.lower().encode("utf-8"), -1)
-                if res_lower == 0:
+                res_lower = self._lib.enchant_dict_check(
+                    self._dict, w.lower().encode("utf-8"), -1
+                )
+                if res_lower == 0 or res_lower < 0:
                     return True
             return False
         except Exception:

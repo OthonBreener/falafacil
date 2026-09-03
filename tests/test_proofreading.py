@@ -89,12 +89,18 @@ def test_proofread_success_sends_prompt_and_returns_trimmed_text() -> None:
     assert result == "Texto corrigido e pontuado."
     assert len(client.interactions.calls) == 1
     call = client.interactions.calls[0]
+    assert set(call.keys()) == {"model", "input", "store"}
+    assert call["store"] is False
+    assert "cached_content" not in call
+    assert "previous_interaction_id" not in call
+    assert "file" not in call
+    assert "files" not in call
+    assert "batch" not in call
     assert call["model"] == "gemini-3.5-flash-lite"
     assert len(call["input"]) == 1
     assert call["input"][0]["type"] == "text"
     expected_prompt = f"{PROOFREADING_PROMPT}\n\nTexto:\n{input_text}"
     assert call["input"][0]["text"] == expected_prompt
-
     debug = transcriber.last_debug()
     assert debug is not None
     assert debug.model == "gemini-3.5-flash-lite"
@@ -111,6 +117,28 @@ def test_proofread_success_sends_prompt_and_returns_trimmed_text() -> None:
     assert debug.usage.cached_tokens == 5
     assert debug.usage.total_tokens == 55
 
+
+
+def test_proofread_preserves_exact_leading_trailing_whitespace_and_newlines_in_request() -> None:
+    interaction = FakeInteraction(output_text="  Texto corrigido sem espaços extras.  ")
+    client = FakeClient(interaction=interaction)
+    transcriber = GeminiTranscriber(client=client, model="gemini-3.7-flash")
+
+    raw_text = "  \n\tLinha 1 com acentuação: café e ação.\n\n   Linha 2 com espaços extras.   \n\t  "
+    expected_bytes = len(raw_text.encode("utf-8"))
+
+    result = transcriber.proofread(raw_text)
+
+    assert result == "Texto corrigido sem espaços extras."
+    assert len(client.interactions.calls) == 1
+    call = client.interactions.calls[0]
+    expected_prompt = f"{PROOFREADING_PROMPT}\n\nTexto:\n{raw_text}"
+    assert call["input"][0]["text"] == expected_prompt
+    assert call["input"][0]["text"].endswith(f"\n\nTexto:\n{raw_text}")
+    debug = transcriber.last_debug()
+    assert debug is not None
+    assert debug.audio_bytes == expected_bytes
+    assert debug.model == "gemini-3.7-flash"
 
 def test_proofread_records_exact_text_byte_count_including_utf8() -> None:
     interaction = FakeInteraction(output_text="Texto ok.")

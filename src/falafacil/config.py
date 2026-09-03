@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 MODEL_CHOICES: tuple[tuple[str, str], ...] = (
-    ("gemini-3.5-flash-lite", "Mais recente — Gemini 3.5 Flash-Lite"),
-    ("gemini-3.7-flash", "Mais capaz — Gemini 3.7 Flash"),
+    ("gemini-3.5-flash-lite", "Econômico e rápido — Gemini 3.5 Flash-Lite"),
+    ("gemini-3.7-flash", "Qualidade — Gemini 3.7 Flash"),
+    ("gemini-3.8-flash", "Mais capaz — Gemini 3.8 Flash"),
 )
 
 
