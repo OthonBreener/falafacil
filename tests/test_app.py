@@ -77,6 +77,7 @@ class FakeMainWindowForApp:
         transcriber_factory: Any,
         local_store: Any,
         homebrew_update_controller: Any = None,
+        startup_message: Any = None,
     ) -> None:
         self.settings = settings
         self.transcriber = transcriber
@@ -84,8 +85,8 @@ class FakeMainWindowForApp:
         self.transcriber_factory = transcriber_factory
         self.local_store = local_store
         self.homebrew_update_controller = homebrew_update_controller
+        self.startup_message = startup_message
         self.shown = False
-
     def show(self) -> None:
         self.shown = True
 
@@ -153,6 +154,54 @@ def test_main_startup_with_persisted_model_and_persisted_key(
     assert new_t.api_key == "new-key"
     assert new_t.model == "gemini-3.7-flash"
 
+
+
+def test_main_startup_with_persisted_gemini_3_8_flash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_app = FakeApp([])
+    monkeypatch.setattr(app_module, "QApplication", lambda argv: fake_app)
+
+    fake_store = FakeStoreForApp(model="gemini-3.8-flash")
+    monkeypatch.setattr(app_module, "resolve_storage_path", lambda: "synthetic.db")
+    monkeypatch.setattr(app_module, "LocalStore", lambda path: fake_store)
+
+    fake_key_store = FakeApiKeyStoreForApp(api_key="persisted-secret-key")
+    monkeypatch.setattr(app_module, "KeyringApiKeyStore", lambda: fake_key_store)
+
+    transcriber_creations: list[tuple[str, str]] = []
+
+    def fake_transcriber_init(api_key: str, model: str) -> FakeTranscriberForApp:
+        transcriber_creations.append((api_key, model))
+        return FakeTranscriberForApp(api_key=api_key, model=model)
+
+    monkeypatch.setattr(app_module, "GeminiTranscriber", fake_transcriber_init)
+
+    created_windows: list[FakeMainWindowForApp] = []
+    monkeypatch.setattr(
+        app_module,
+        "MainWindow",
+        lambda *args, **kwargs: (
+            created_windows.append(FakeMainWindowForApp(*args, **kwargs))
+            or created_windows[-1]
+        ),
+    )
+
+    monkeypatch.setattr(fake_app, "exec", lambda: 0)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+
+    ret = app_module.main()
+
+    assert ret == 0
+    assert len(created_windows) == 1
+    window = created_windows[0]
+    assert window.settings.model == "gemini-3.8-flash"
+    assert window.settings.model_from_environment is False
+    assert transcriber_creations == [("persisted-secret-key", "gemini-3.8-flash")]
+    assert window.transcriber is not None
+    assert window.transcriber.model == "gemini-3.8-flash"
 
 def test_main_startup_with_environment_override_precedes_persisted_model(
     monkeypatch: pytest.MonkeyPatch,
@@ -644,3 +693,55 @@ def test_main_startup_homebrew_controller_init_failure_is_fail_soft_and_register
     assert created_windows[0].shown is True
     assert created_windows[0].homebrew_update_controller is None
     assert created_windows[0].shown is True
+
+
+def test_main_startup_transcriber_init_failure_is_fail_soft_and_sanitizes_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_app = FakeApp([])
+    monkeypatch.setattr(app_module, "QApplication", lambda argv: fake_app)
+
+    synthetic_secret = "AIzaSyD-secret-synthetic-key-9999"
+    key_store = FakeApiKeyStoreForApp(api_key=synthetic_secret)
+    monkeypatch.setattr(app_module, "KeyringApiKeyStore", lambda: key_store)
+
+    store = FakeStoreForApp(model="gemini-3.7-flash")
+    monkeypatch.setattr(app_module, "LocalStore", lambda path: store)
+
+    class FailingTranscriber:
+        def __init__(self, api_key: str, model: str) -> None:
+            raise RuntimeError(f"SDK initialization failed for secret key: {api_key}")
+
+    monkeypatch.setattr(app_module, "GeminiTranscriber", FailingTranscriber)
+
+    created_windows: list[FakeMainWindowForApp] = []
+    monkeypatch.setattr(
+        app_module,
+        "MainWindow",
+        lambda **kwargs: created_windows.append(FakeMainWindowForApp(**kwargs))
+        or created_windows[-1],
+    )
+
+    exit_code = app_module.main()
+    assert exit_code == 0
+    assert len(created_windows) == 1
+    window = created_windows[0]
+    assert window.shown is True
+    assert window.transcriber is None
+    expected_message = (
+        "Não foi possível iniciar o Gemini. Revise a chave ou o modelo nas Configurações."
+    )
+    assert window.startup_message == expected_message
+    assert synthetic_secret not in window.startup_message
+    assert synthetic_secret not in repr(window.startup_message)
+
+    class WorkingTranscriber:
+        def __init__(self, api_key: str, model: str) -> None:
+            self.api_key = api_key
+            self.model = model
+
+    monkeypatch.setattr(app_module, "GeminiTranscriber", WorkingTranscriber)
+    recovered = window.transcriber_factory("new-recovered-key", "gemini-3.5-flash-lite")
+    assert isinstance(recovered, WorkingTranscriber)
+    assert recovered.api_key == "new-recovered-key"
+    assert recovered.model == "gemini-3.5-flash-lite"

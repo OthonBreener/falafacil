@@ -117,6 +117,7 @@ class GeminiTranscriber:
                         "mime_type": "audio/wav",
                     },
                 ],
+                store=False,
             )
         except Exception as exc:
             raise self._transcription_error(
@@ -143,8 +144,8 @@ class GeminiTranscriber:
         return text
 
     def proofread(self, text: str) -> str:
-        clean_text = text.strip() if isinstance(text, str) else ""
-        text_bytes = len(clean_text.encode("utf-8"))
+        is_empty = not isinstance(text, str) or not text.strip()
+        text_bytes = 0 if is_empty else len(text.encode("utf-8"))
         self._last_debug = TranscriptionDebug(
             model=self.model,
             prompt=PROOFREADING_PROMPT,
@@ -156,16 +157,17 @@ class GeminiTranscriber:
             error=None,
             usage=None,
         )
-        if not clean_text:
+        if is_empty:
             return self._raise_transcription_error(
                 "O texto para revisão está vazio."
             )
 
-        prompt = f"{PROOFREADING_PROMPT}\n\nTexto:\n{clean_text}"
+        prompt = f"{PROOFREADING_PROMPT}\n\nTexto:\n{text}"
         try:
             interaction = self.client.interactions.create(
                 model=self.model,
                 input=[{"type": "text", "text": prompt}],
+                store=False,
             )
         except Exception as exc:
             raise self._transcription_error(

@@ -113,13 +113,24 @@ def test_gemini_model_persistence_reopen_and_overwrite(tmp_path: Path) -> None:
         store.save_gemini_model("gemini-3.5-flash-lite")
         assert store.get_gemini_model() == "gemini-3.5-flash-lite"
 
-        # Overwrite
+        # Overwrite with gemini-3.7-flash
         store.save_gemini_model("gemini-3.7-flash")
         assert store.get_gemini_model() == "gemini-3.7-flash"
 
-    with LocalStore(db_path) as reopened:
-        assert reopened.get_gemini_model() == "gemini-3.7-flash"
+        # Overwrite with gemini-3.8-flash
+        store.save_gemini_model("gemini-3.8-flash")
+        assert store.get_gemini_model() == "gemini-3.8-flash"
 
+        # Verify schema version remains 1 (no schema bump)
+        cursor = store._conn.cursor()
+        cursor.execute("PRAGMA user_version;")
+        assert cursor.fetchone()[0] == 1
+
+    with LocalStore(db_path) as reopened:
+        assert reopened.get_gemini_model() == "gemini-3.8-flash"
+        cursor = reopened._conn.cursor()
+        cursor.execute("PRAGMA user_version;")
+        assert cursor.fetchone()[0] == 1
 
 def test_invalid_gemini_model_raises_error(tmp_path: Path) -> None:
     db_path = tmp_path / "falafacil.sqlite3"

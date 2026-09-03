@@ -4,12 +4,12 @@ import os
 import re
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtNetwork import QLocalSocket
 
 PROTOCOL_VERSION = 1
 MAX_PROTOCOL_LINE_BYTES = 128
-
+RECONNECT_DELAY_MS = 1000
 INTEGRATION_NOT_INSTALLED_MESSAGE = "Integração global não instalada."
 AUTHORIZATION_CANCELLED_MESSAGE = "A autorização foi cancelada."
 INPUT_ACCESS_MESSAGE = "O serviço global não conseguiu acessar os dispositivos de entrada."
@@ -125,8 +125,11 @@ class InputShortcutBridge(QObject):
         self._closed = False
         self._mouse_generation = 0
         self._keyboard_generation = 0
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.setInterval(RECONNECT_DELAY_MS)
+        self._reconnect_timer.timeout.connect(self._on_reconnect_timeout)
         self._connect_socket()
-
     @property
     def mouse_generation(self) -> int:
         return self._mouse_generation
@@ -144,10 +147,10 @@ class InputShortcutBridge(QObject):
         return self._version_incompatible
 
     def reconnect(self) -> None:
+        self._reconnect_timer.stop()
         self._closed = False
         self._disconnect_socket()
         self._connect_socket()
-
     def start_mouse(self, button: str) -> int:
         self._mouse_generation += 1
         generation = self._mouse_generation
@@ -200,10 +203,10 @@ class InputShortcutBridge(QObject):
 
     def close(self) -> None:
         self._closed = True
+        self._reconnect_timer.stop()
         self._mouse_generation += 1
         self._keyboard_generation += 1
         self._disconnect_socket()
-
     def _connect_socket(self) -> None:
         if self._closed:
             return
@@ -230,22 +233,32 @@ class InputShortcutBridge(QObject):
             self.ready_changed.emit(False)
 
     def _on_connected(self) -> None:
+        if self._closed or self._socket is None or self.sender() is not self._socket:
+            return
         self._write_line(f"HELLO {PROTOCOL_VERSION}")
+
+    def _schedule_reconnect(self) -> None:
+        if self._closed:
+            return
+        if not self._reconnect_timer.isActive():
+            self._reconnect_timer.start()
+
+    def _on_reconnect_timeout(self) -> None:
+        if self._closed:
+            return
+        self._connect_socket()
 
     def _on_disconnected(self) -> None:
         if self.sender() is not self._socket:
             return
-        if self._ready:
-            self._ready = False
-            self.ready_changed.emit(False)
+        self._disconnect_socket()
+        self._schedule_reconnect()
 
     def _on_socket_error(self, _error: object) -> None:
         if self.sender() is not self._socket or self._closed:
             return
-        if self._ready:
-            self._ready = False
-            self.ready_changed.emit(False)
-
+        self._disconnect_socket()
+        self._schedule_reconnect()
     def _on_ready_read(self) -> None:
         socket = self._socket
         if socket is None or self.sender() is not socket:
@@ -282,6 +295,7 @@ class InputShortcutBridge(QObject):
             if parts == ["READY", str(PROTOCOL_VERSION)]:
                 self._ready = True
                 self._version_incompatible = False
+                self._reconnect_timer.stop()
                 self.ready_changed.emit(True)
                 return True
             if len(parts) == 2 and parts[0] == "READY":
@@ -370,3 +384,4 @@ class InputShortcutBridge(QObject):
     def _protocol_failure(self) -> None:
         self.failed.emit("service", 0, BACKEND_FAILURE_MESSAGE)
         self._disconnect_socket()
+        self._schedule_reconnect()

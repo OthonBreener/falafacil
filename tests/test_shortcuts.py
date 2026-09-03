@@ -10,6 +10,7 @@ from falafacil.shortcuts import (
     InputShortcutBridge,
     MAX_PROTOCOL_LINE_BYTES,
     PRIMARY_MOUSE_BUTTON_MESSAGE,
+    RECONNECT_DELAY_MS,
     UNSUPPORTED_MOUSE_BUTTON_MESSAGE,
     normalize_keyboard_shortcut,
     normalize_mouse_button_name,
@@ -229,3 +230,167 @@ def test_bridge_translates_mouse_rejection_error_codes() -> None:
         ("mouse", generation, PRIMARY_MOUSE_BUTTON_MESSAGE),
         ("mouse", generation, UNSUPPORTED_MOUSE_BUTTON_MESSAGE),
     ]
+
+
+def test_bridge_reconnect_delay_constant_and_timer_property() -> None:
+    bridge, _socket = _bridge()
+    assert RECONNECT_DELAY_MS == 1000
+    assert bridge._reconnect_timer.isSingleShot() is True
+    assert bridge._reconnect_timer.interval() == 1000
+    bridge.close()
+
+
+def test_bridge_automatic_reconnect_with_fresh_socket_and_fresh_generation() -> None:
+    _qapp()
+    socket1 = FakeSocket()
+    socket2 = FakeSocket()
+    sockets = [socket1, socket2]
+
+    bridge = InputShortcutBridge(
+        server_name="test-shortcutd",
+        socket_factory=lambda: sockets.pop(0),
+    )
+    assert socket1.writes == [b"HELLO 1\n"]
+    socket1.server_send(b"READY 1\n")
+    assert bridge.ready is True
+
+    mouse_gen1 = bridge.start_mouse("x1")
+    assert socket1.writes == [b"HELLO 1\n", b"WATCH_MOUSE 1 x1\n"]
+
+    ready_events: list[bool] = []
+    bridge.ready_changed.connect(ready_events.append)
+
+    # Unexpected disconnect on socket 1
+    socket1.disconnected.emit()
+    assert bridge.ready is False
+    assert ready_events == [False]
+    assert bridge._reconnect_timer.isActive() is True
+
+    # Trigger reconnect timer without sleeping
+    bridge._reconnect_timer.timeout.emit()
+    assert len(sockets) == 0
+    assert socket2.writes == [b"HELLO 1\n"]
+    socket2.server_send(b"READY 1\n")
+    assert bridge.ready is True
+    assert ready_events == [False, True]
+    assert bridge._reconnect_timer.isActive() is False
+
+    # Fresh binding on socket 2 uses fresh generation
+    mouse_gen2 = bridge.start_mouse("x2")
+    assert mouse_gen2 > mouse_gen1
+    assert socket2.writes == [b"HELLO 1\n", f"WATCH_MOUSE {mouse_gen2} x2\n".encode()]
+
+    # Stale socket 1 frames and signals (including late connected) are ignored
+    activated: list[tuple[int, str]] = []
+    bridge.mouse_activated.connect(lambda g, b: activated.append((g, b)))
+    socket1.server_send(b"ACTIVATED_MOUSE 1 x1\n")
+    socket1.disconnected.emit()
+    socket1.errorOccurred.emit("some-error")
+    socket1.connected.emit()
+    assert activated == []
+    assert socket1.writes == [b"HELLO 1\n", b"WATCH_MOUSE 1 x1\n"]
+    assert socket2.writes == [b"HELLO 1\n", f"WATCH_MOUSE {mouse_gen2} x2\n".encode()]
+    assert bridge._socket is socket2
+    assert bridge.ready is True
+    bridge.close()
+    # Connected signal on closed bridge is ignored
+    socket2.connected.emit()
+    assert socket2.writes == [b"HELLO 1\n", f"WATCH_MOUSE {mouse_gen2} x2\n".encode()]
+
+def test_bridge_socket_error_and_protocol_failure_schedule_reconnect_and_cancel_on_handshake() -> None:
+    _qapp()
+    socket1 = FakeSocket()
+    socket2 = FakeSocket()
+    socket3 = FakeSocket()
+    sockets = [socket1, socket2, socket3]
+
+    bridge = InputShortcutBridge(
+        server_name="test-shortcutd",
+        socket_factory=lambda: sockets.pop(0),
+    )
+    socket1.server_send(b"READY 1\n")
+    assert bridge.ready is True
+
+    # Socket error schedules reconnect
+    socket1.errorOccurred.emit("ConnectionRefusedError")
+    assert bridge.ready is False
+    assert bridge._reconnect_timer.isActive() is True
+
+    # Repeated failure signals from current/stale socket maintain exactly one timer
+    socket1.disconnected.emit()
+    socket1.errorOccurred.emit("AnotherError")
+    assert bridge._reconnect_timer.isActive() is True
+
+    # Timer fires and connects socket 2
+    bridge._reconnect_timer.timeout.emit()
+    assert bridge._socket is socket2
+    assert socket2.writes == [b"HELLO 1\n"]
+
+    # Socket 2 fails before handshake; schedules reconnect again without tight loop
+    socket2.errorOccurred.emit("Socket2Error")
+    socket2.disconnected.emit()
+    assert bridge.ready is False
+    assert bridge._reconnect_timer.isActive() is True
+
+    # Timer fires and connects socket 3
+    bridge._reconnect_timer.timeout.emit()
+    assert bridge._socket is socket3
+    assert socket3.writes == [b"HELLO 1\n"]
+
+    # Successful handshake on socket 3 cancels timer
+    socket3.server_send(b"READY 1\n")
+    assert bridge.ready is True
+    assert bridge._reconnect_timer.isActive() is False
+
+    # Protocol failure schedules reconnect
+    socket3.server_send(b"INVALID_PROTOCOL_LINE\n")
+    assert bridge.ready is False
+    assert bridge._reconnect_timer.isActive() is True
+    bridge.close()
+
+def test_bridge_explicit_reconnect_cancels_delay_and_connects_immediately() -> None:
+    _qapp()
+    socket1 = FakeSocket()
+    socket2 = FakeSocket()
+    sockets = [socket1, socket2]
+
+    bridge = InputShortcutBridge(
+        server_name="test-shortcutd",
+        socket_factory=lambda: sockets.pop(0),
+    )
+    socket1.server_send(b"READY 1\n")
+    socket1.disconnected.emit()
+    assert bridge.ready is False
+    assert bridge._reconnect_timer.isActive() is True
+
+    # Explicit reconnect cancels timer and connects immediately
+    bridge.reconnect()
+    assert bridge._reconnect_timer.isActive() is False
+    assert bridge._socket is socket2
+    assert socket2.writes == [b"HELLO 1\n"]
+    bridge.close()
+
+
+def test_bridge_explicit_close_suppresses_reconnect_even_on_late_signals_or_timeout() -> None:
+    _qapp()
+    socket1 = FakeSocket()
+    bridge = InputShortcutBridge(
+        server_name="test-shortcutd",
+        socket_factory=lambda: socket1,
+    )
+    socket1.server_send(b"READY 1\n")
+    socket1.disconnected.emit()
+    assert bridge._reconnect_timer.isActive() is True
+
+    bridge.close()
+    assert bridge._closed is True
+    assert bridge._reconnect_timer.isActive() is False
+    assert bridge._socket is None
+
+    # Late timeout signal or socket event does not create a socket or reconnect
+    bridge._reconnect_timer.timeout.emit()
+    socket1.disconnected.emit()
+    socket1.errorOccurred.emit("late error")
+    assert bridge._socket is None
+    assert bridge._reconnect_timer.isActive() is False
+
