@@ -7,8 +7,9 @@ from PySide6.QtWidgets import QApplication
 from . import __version__
 from .config import Settings
 from .credentials import CredentialStoreError, KeyringApiKeyStore
+from .audio import PcmChunkQueue
 from .storage import LocalStore, resolve_storage_path
-from .transcription import GeminiTranscriber
+from .transcription import GeminiTranscriber, LiveTranscriptionWorker
 from .ui import MainWindow
 
 
@@ -80,6 +81,9 @@ def main() -> int:
         local_store=local_store,
         homebrew_update_controller=homebrew_update_controller,
         startup_message=startup_message,
+        live_worker_factory=lambda api_key, queue: LiveTranscriptionWorker(
+            api_key=api_key, audio_queue=queue
+        ),
     )
     if homebrew_installation is not None:
         try:

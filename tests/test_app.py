@@ -78,6 +78,7 @@ class FakeMainWindowForApp:
         local_store: Any,
         homebrew_update_controller: Any = None,
         startup_message: Any = None,
+        live_worker_factory: Any = None,
     ) -> None:
         self.settings = settings
         self.transcriber = transcriber
@@ -86,7 +87,9 @@ class FakeMainWindowForApp:
         self.local_store = local_store
         self.homebrew_update_controller = homebrew_update_controller
         self.startup_message = startup_message
+        self.live_worker_factory = live_worker_factory
         self.shown = False
+
     def show(self) -> None:
         self.shown = True
 
@@ -133,9 +136,10 @@ def test_main_startup_with_persisted_model_and_persisted_key(
     assert exit_code == 0
     assert fake_app.org_name == "FalaFácil"
     assert fake_app.app_name == "FalaFácil"
-    assert fake_app.app_version == "0.4.0"
+    assert fake_app.app_version == "0.5.0"
     assert len(created_windows) == 1
     window = created_windows[0]
+    assert window.live_worker_factory is not None
     assert window.shown is True
     assert window.local_store is fake_store
     assert window.api_key_store is fake_key_store

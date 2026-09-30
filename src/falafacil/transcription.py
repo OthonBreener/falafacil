@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from dataclasses import dataclass, replace
+import math
+import threading
 from typing import Any
 
 from google import genai
+from google.genai import types
+import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot
 
+from .audio import MIN_RMS_LEVEL, PcmChunkQueue
 from .config import DEFAULT_MODEL
-
 
 INLINE_LIMIT_BYTES = 20 * 1024 * 1024
 REQUEST_TIMEOUT_MS = 120_000
+LIVE_MODEL = "gemini-3.5-transcribe-live"
+LIVE_MIME_TYPE = "audio/pcm;rate=16000"
+LIVE_FINAL_TIMEOUT_MS = 10_000
+LIVE_LANGUAGE = "pt-BR"
+LIVE_MODE = "SMART"
 PROMPT = (
     "Transcreva o que foi falado neste áudio em português do Brasil com fidelidade ao sentido original. "
     "Faça correções sutis de fala: elimine hesitações, gaguejos, repetições involuntárias, cacoetes (como 'né', 'tipo') "
@@ -60,6 +70,386 @@ class TranscriptionDebug:
     response_text: str
     error: str | None
     usage: TokenUsage | None = None
+
+
+@dataclass(frozen=True)
+class LiveTranscriptionDebug:
+    model: str
+    language_code: str
+    mode: str
+    audio_bytes: int
+    response_text: str
+    error: str | None
+    usage: TokenUsage | None = None
+
+
+@dataclass(frozen=True)
+class LiveTranscriptionResult:
+    text: str
+    debug: LiveTranscriptionDebug
+
+
+class LiveTranscriptionWorker(QObject):
+    interim = Signal(str)
+    final = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str, object)
+
+    def __init__(
+        self,
+        api_key: str,
+        audio_queue: PcmChunkQueue,
+        *,
+        client: Any | None = None,
+        model: str = LIVE_MODEL,
+    ) -> None:
+        super().__init__()
+        self._api_key = api_key
+        self._audio_queue = audio_queue
+        self._client = client
+        self._model = model
+        self._stop_requested = False
+        self._force_cancelled = False
+        self._timed_out = False
+        self._lock = threading.RLock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._main_task: asyncio.Task[None] | None = None
+        self._sender_task: asyncio.Task[None] | None = None
+        self._receiver_task: asyncio.Task[None] | None = None
+        self._deadline_handle: asyncio.TimerHandle | None = None
+
+    def request_stop(self) -> None:
+        with self._lock:
+            self._stop_requested = True
+            loop = self._loop
+            if (
+                loop is not None
+                and not loop.is_closed()
+                and not self._force_cancelled
+                and self._deadline_handle is None
+            ):
+                loop.call_soon_threadsafe(self._arm_deadline_in_loop)
+
+    def cancel(self) -> None:
+        self.force_cancel()
+
+    def force_cancel(self) -> None:
+        with self._lock:
+            self._force_cancelled = True
+            loop = self._loop
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(self._cancel_all_tasks_in_loop)
+
+    def _arm_deadline_in_loop(self) -> None:
+        with self._lock:
+            if self._force_cancelled or self._deadline_handle is not None:
+                return
+            if self._loop is not None and not self._loop.is_closed():
+                self._deadline_handle = self._loop.call_later(
+                    LIVE_FINAL_TIMEOUT_MS / 1000.0,
+                    self._on_deadline_expired,
+                )
+
+    def _on_deadline_expired(self) -> None:
+        with self._lock:
+            self._timed_out = True
+            self._deadline_handle = None
+            if self._main_task is not None and not self._main_task.done():
+                self._main_task.cancel()
+            if self._sender_task is not None and not self._sender_task.done():
+                self._sender_task.cancel()
+            if self._receiver_task is not None and not self._receiver_task.done():
+                self._receiver_task.cancel()
+
+    def _cancel_all_tasks_in_loop(self) -> None:
+        with self._lock:
+            if self._deadline_handle is not None:
+                self._deadline_handle.cancel()
+                self._deadline_handle = None
+            if self._main_task is not None and not self._main_task.done():
+                self._main_task.cancel()
+            if self._sender_task is not None and not self._sender_task.done():
+                self._sender_task.cancel()
+            if self._receiver_task is not None and not self._receiver_task.done():
+                self._receiver_task.cancel()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            asyncio.run(self._async_run())
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            if not self._force_cancelled:
+                err = _friendly_api_error(exc, secret=self._api_key)
+                debug = LiveTranscriptionDebug(
+                    model=self._model,
+                    language_code=LIVE_LANGUAGE,
+                    mode=LIVE_MODE,
+                    audio_bytes=0,
+                    response_text="",
+                    error=err,
+                    usage=None,
+                )
+                self.failed.emit(err, debug)
+
+    async def _async_run(self) -> None:
+        loop = asyncio.get_running_loop()
+        main_task = asyncio.current_task(loop)
+        with self._lock:
+            self._loop = loop
+            self._main_task = main_task
+            if self._force_cancelled:
+                if main_task is not None:
+                    main_task.cancel()
+            elif self._stop_requested and self._deadline_handle is None:
+                self._arm_deadline_in_loop()
+
+        total_bytes_sent = 0
+        final_segments: list[str] = []
+        last_usage: TokenUsage | None = None
+        sent_stream_end = asyncio.Event()
+        stop_receiver = asyncio.Event()
+        receiver_done = asyncio.Event()
+
+        client = self._client
+        if client is None:
+            client = genai.Client(
+                api_key=self._api_key,
+                http_options={"timeout": REQUEST_TIMEOUT_MS},
+            )
+
+        config = types.LiveConnectConfig(
+            response_modalities=["TEXT"],
+            input_audio_transcription=types.AudioTranscriptionConfig(
+                language_codes=[LIVE_LANGUAGE],
+                mode=LIVE_MODE,
+            ),
+        )
+
+        gate_open = False
+        pending_chunks: list[bytes] = []
+        pending_sum_squares = 0.0
+        pending_sample_count = 0
+
+        async def process_chunk(chunk: bytes, session: Any) -> None:
+            nonlocal total_bytes_sent, gate_open, pending_sum_squares, pending_sample_count
+            if gate_open:
+                total_bytes_sent += len(chunk)
+                blob = types.Blob(data=chunk, mime_type=LIVE_MIME_TYPE)
+                await session.send_realtime_input(audio=blob)
+            else:
+                pending_chunks.append(chunk)
+                if chunk:
+                    try:
+                        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float64)
+                        if samples.size > 0:
+                            pending_sum_squares += float(np.sum(samples * samples))
+                            pending_sample_count += samples.size
+                    except (ValueError, TypeError):
+                        pass
+                if pending_sample_count > 0:
+                    current_rms = (
+                        math.sqrt(pending_sum_squares / pending_sample_count) / 32768.0
+                    )
+                    if current_rms >= MIN_RMS_LEVEL:
+                        gate_open = True
+                        for c in pending_chunks:
+                            total_bytes_sent += len(c)
+                            blob = types.Blob(data=c, mime_type=LIVE_MIME_TYPE)
+                            await session.send_realtime_input(audio=blob)
+                        pending_chunks.clear()
+                        pending_sum_squares = 0.0
+                        pending_sample_count = 0
+
+        async def sender(session: Any) -> None:
+            while not self._stop_requested:
+                if self._audio_queue.overflowed:
+                    raise TranscriptionError("O buffer de áudio ao vivo estourou.")
+                chunk = await asyncio.to_thread(self._audio_queue.get, 0.05)
+                if chunk is not None:
+                    await process_chunk(chunk, session)
+
+            while True:
+                if self._audio_queue.overflowed:
+                    raise TranscriptionError("O buffer de áudio ao vivo estourou.")
+                chunk = await asyncio.to_thread(self._audio_queue.get, 0.01)
+                if chunk is None:
+                    break
+                await process_chunk(chunk, session)
+
+            await session.send_realtime_input(audio_stream_end=True)
+            sent_stream_end.set()
+
+        async def receiver(session: Any) -> None:
+            nonlocal last_usage
+            while not stop_receiver.is_set():
+                try:
+                    had_messages = False
+                    post_stream_end_confirmed = False
+                    is_post_stream_end_cycle = sent_stream_end.is_set()
+                    stream_end_observed_during_cycle = False
+                    async for message in session.receive():
+                        had_messages = True
+                        if sent_stream_end.is_set():
+                            stream_end_observed_during_cycle = True
+                        is_post_end_message = (
+                            is_post_stream_end_cycle or stream_end_observed_during_cycle
+                        )
+
+                        server_content = _get_field(message, "server_content")
+                        if server_content is not None:
+                            interim_obj = _get_field(
+                                server_content, "interim_input_transcription"
+                            )
+                            if interim_obj is not None:
+                                interim_text = _get_field(interim_obj, "text")
+                                if interim_text:
+                                    self.interim.emit(str(interim_text))
+
+                            input_obj = _get_field(
+                                server_content, "input_transcription"
+                            )
+                            if input_obj is not None:
+                                finished_val = _get_field(input_obj, "finished")
+                                if finished_val is None or finished_val is True:
+                                    final_text = _get_field(input_obj, "text")
+                                    if final_text:
+                                        text_str = str(final_text).strip()
+                                        if text_str:
+                                            if is_post_end_message:
+                                                post_stream_end_confirmed = True
+                                            if (
+                                                not final_segments
+                                                or final_segments[-1] != text_str
+                                            ):
+                                                final_segments.append(text_str)
+                                                self.final.emit(text_str)
+
+                        usage_meta = _get_field(message, "usage_metadata")
+                        if usage_meta is not None:
+                            extracted = _extract_live_usage(usage_meta)
+                            if extracted is not None:
+                                last_usage = extracted
+
+                    if post_stream_end_confirmed:
+                        receiver_done.set()
+                        return
+                    if not had_messages:
+                        await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    raise
+
+        sender_task: asyncio.Task[None] | None = None
+        receiver_task: asyncio.Task[None] | None = None
+
+        try:
+            async with client.aio.live.connect(
+                model=self._model, config=config
+            ) as session:
+                sender_task = asyncio.create_task(sender(session))
+                receiver_task = asyncio.create_task(receiver(session))
+                with self._lock:
+                    self._sender_task = sender_task
+                    self._receiver_task = receiver_task
+
+                try:
+                    done, pending = await asyncio.wait(
+                        [sender_task, receiver_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done:
+                        if task.exception() is not None:
+                            raise task.exception()
+
+                    if sender_task.done() and receiver_task in pending:
+                        await receiver_task
+                    elif receiver_task.done() and sender_task in pending:
+                        sender_task.cancel()
+                        try:
+                            await sender_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                finally:
+                    stop_receiver.set()
+                    for task in (sender_task, receiver_task):
+                        if task is not None and not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+
+            if self._audio_queue.overflowed:
+                raise TranscriptionError("O buffer de áudio ao vivo estourou.")
+
+            final_text = " ".join(s for s in final_segments if s.strip()).strip()
+            if not final_text:
+                raise TranscriptionError(
+                    "O Gemini não retornou texto para este áudio."
+                )
+
+            debug = LiveTranscriptionDebug(
+                model=self._model,
+                language_code=LIVE_LANGUAGE,
+                mode=LIVE_MODE,
+                audio_bytes=total_bytes_sent,
+                response_text=final_text,
+                error=None,
+                usage=last_usage,
+            )
+            if not self._force_cancelled and not self._timed_out:
+                self.finished.emit(
+                    LiveTranscriptionResult(text=final_text, debug=debug)
+                )
+
+        except asyncio.CancelledError:
+            if self._force_cancelled:
+                return
+            if self._timed_out:
+                err_msg = "O Gemini não respondeu dentro do tempo limite."
+            else:
+                err_msg = "A transcrição ao vivo foi cancelada."
+            final_text = " ".join(s for s in final_segments if s.strip()).strip()
+            debug = LiveTranscriptionDebug(
+                model=self._model,
+                language_code=LIVE_LANGUAGE,
+                mode=LIVE_MODE,
+                audio_bytes=total_bytes_sent,
+                response_text=final_text,
+                error=err_msg,
+                usage=last_usage,
+            )
+            self.failed.emit(err_msg, debug)
+        except Exception as exc:
+            if self._force_cancelled:
+                return
+            if self._timed_out or isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                err_msg = "O Gemini não respondeu dentro do tempo limite."
+            else:
+                err_msg = _friendly_api_error(exc, secret=self._api_key)
+            final_text = " ".join(s for s in final_segments if s.strip()).strip()
+            debug = LiveTranscriptionDebug(
+                model=self._model,
+                language_code=LIVE_LANGUAGE,
+                mode=LIVE_MODE,
+                audio_bytes=total_bytes_sent,
+                response_text=final_text,
+                error=err_msg,
+                usage=last_usage,
+            )
+            self.failed.emit(err_msg, debug)
+        finally:
+            with self._lock:
+                if self._deadline_handle is not None:
+                    self._deadline_handle.cancel()
+                    self._deadline_handle = None
+                self._sender_task = None
+                self._receiver_task = None
+                self._main_task = None
+                self._loop = None
 
 class GeminiTranscriber:
     def __init__(
@@ -290,16 +680,40 @@ def _get_field(raw: Any, key: str) -> Any:
     return getattr(raw, key, None)
 
 
-def _extract_usage(raw_usage: Any) -> TokenUsage | None:
+def _extract_live_usage(raw_usage: Any) -> TokenUsage | None:
     if raw_usage is None:
         return None
 
-    input_tokens = _to_int(_get_field(raw_usage, "total_input_tokens"))
-    output_tokens = _to_int(_get_field(raw_usage, "total_output_tokens"))
-    thought_tokens = _to_int(_get_field(raw_usage, "total_thought_tokens"))
-    cached_tokens = _to_int(_get_field(raw_usage, "total_cached_tokens"))
-    tool_use_tokens = _to_int(_get_field(raw_usage, "total_tool_use_tokens"))
-    total_tokens = _to_int(_get_field(raw_usage, "total_tokens"))
+    input_tokens = _to_int(
+        _get_field(raw_usage, "prompt_token_count")
+        if _get_field(raw_usage, "prompt_token_count") is not None
+        else _get_field(raw_usage, "total_input_tokens")
+    )
+    output_tokens = _to_int(
+        _get_field(raw_usage, "response_token_count")
+        if _get_field(raw_usage, "response_token_count") is not None
+        else _get_field(raw_usage, "total_output_tokens")
+    )
+    thought_tokens = _to_int(
+        _get_field(raw_usage, "thoughts_token_count")
+        if _get_field(raw_usage, "thoughts_token_count") is not None
+        else _get_field(raw_usage, "total_thought_tokens")
+    )
+    cached_tokens = _to_int(
+        _get_field(raw_usage, "cached_content_token_count")
+        if _get_field(raw_usage, "cached_content_token_count") is not None
+        else _get_field(raw_usage, "total_cached_tokens")
+    )
+    tool_use_tokens = _to_int(
+        _get_field(raw_usage, "tool_use_prompt_token_count")
+        if _get_field(raw_usage, "tool_use_prompt_token_count") is not None
+        else _get_field(raw_usage, "total_tool_use_tokens")
+    )
+    total_tokens = _to_int(
+        _get_field(raw_usage, "total_token_count")
+        if _get_field(raw_usage, "total_token_count") is not None
+        else _get_field(raw_usage, "total_tokens")
+    )
 
     if all(
         v is None
@@ -323,7 +737,12 @@ def _extract_usage(raw_usage: Any) -> TokenUsage | None:
         total_tokens=total_tokens,
     )
 
+
+def _extract_usage(raw_usage: Any) -> TokenUsage | None:
+    return _extract_live_usage(raw_usage)
 def _friendly_api_error(exc: Exception, *, secret: str = "") -> str:
+    if isinstance(exc, TranscriptionError):
+        return str(exc)
     text = str(exc).strip() or exc.__class__.__name__
     if secret:
         text = text.replace(secret, "[segredo omitido]")

@@ -13,6 +13,7 @@ from falafacil.audio import (
     AudioRecorder,
     AudioRecorderError,
     MIN_RMS_LEVEL,
+    PcmChunkQueue,
     serialize_wav,
 )
 
@@ -33,6 +34,10 @@ class FakeStream:
     def close(self):
         self.closed = True
 
+    def emit_pcm(self, pcm_bytes: bytes) -> None:
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if self.callback is not None:
+            self.callback(samples, samples.size, None, None)
 
 def test_serialize_wav_has_expected_audio_format() -> None:
     pcm = b"\x01\x00\x02\x00"
@@ -585,3 +590,174 @@ def test_recorder_error_precedence_empty_over_low_status_and_stream_failure() ->
     )
     assert rec3.last_capture() is not None
     assert rec3.last_capture().rms >= MIN_RMS_LEVEL
+
+
+def test_pcm_chunk_queue_enqueue_drain_and_finish() -> None:
+    q = PcmChunkQueue(maxsize=10)
+    assert not q.overflowed
+    q.enqueue(b"chunk1")
+    q.enqueue(b"chunk2")
+    q.finish()
+    # Enqueuing after finish is ignored
+    q.enqueue(b"chunk3")
+
+    assert q.get(timeout=0.05) == b"chunk1"
+    assert q.get(timeout=0.05) == b"chunk2"
+    assert q.get(timeout=0.05) is None
+    assert q.get(timeout=0.05) is None
+    assert not q.overflowed
+
+
+def test_pcm_chunk_queue_overflow_drops_chunk_and_marks_flag() -> None:
+    q = PcmChunkQueue(maxsize=2)
+    q.enqueue(b"c1")
+    q.enqueue(b"c2")
+    assert not q.overflowed
+    # 3rd chunk causes overflow without blocking
+    q.enqueue(b"c3")
+    assert q.overflowed
+    assert q.get(timeout=0.05) == b"c1"
+    assert q.get(timeout=0.05) == b"c2"
+    q.finish()
+    assert q.get(timeout=0.05) is None
+
+
+def test_recorder_with_pcm_sink_and_blocksize() -> None:
+    received_sink_chunks: list[bytes] = []
+    streams: list[FakeStream] = []
+
+    def stream_factory(**kwargs):
+        st = FakeStream(**kwargs)
+        streams.append(st)
+        return st
+
+    recorder = AudioRecorder(stream_factory=stream_factory)
+    recorder.start(
+        pcm_sink=received_sink_chunks.append,
+        require_sample_rate=16000,
+        blocksize=1600,
+    )
+    assert recorder.is_recording()
+    assert len(streams) == 1
+    assert streams[0].kwargs.get("blocksize") == 1600
+    assert streams[0].kwargs.get("samplerate") == 16000
+
+    chunk = (np.ones(1600, dtype=np.int16) * 1000).tobytes()
+    streams[0].emit_pcm(chunk)
+    assert len(received_sink_chunks) == 1
+    assert received_sink_chunks[0] == chunk
+
+    capture = recorder.stop()
+    assert not recorder.is_recording()
+    assert capture.pcm_bytes == chunk
+    assert recorder._pcm_sink is None
+
+
+def test_recorder_stop_delivers_final_callback_to_sink_and_wav_and_cleans_sink() -> None:
+    received_sink_chunks: list[bytes] = []
+    chunk1 = (np.ones(1600, dtype=np.int16) * 1000).tobytes()
+    chunk2 = (np.ones(1600, dtype=np.int16) * 2000).tobytes()
+
+    class FinalCallbackStream(FakeStream):
+        def stop(self):
+            # Simula o PortAudio executando o callback uma última vez durante stop() antes de quiescer
+            self.emit_pcm(chunk2)
+            super().stop()
+
+    streams: list[FakeStream] = []
+
+    def stream_factory(**kwargs):
+        st = FinalCallbackStream(**kwargs)
+        streams.append(st)
+        return st
+
+    recorder = AudioRecorder(stream_factory=stream_factory)
+    recorder.start(
+        pcm_sink=received_sink_chunks.append,
+        require_sample_rate=16000,
+        blocksize=1600,
+    )
+    streams[0].emit_pcm(chunk1)
+    assert received_sink_chunks == [chunk1]
+
+    capture = recorder.stop()
+    assert not recorder.is_recording()
+    assert received_sink_chunks == [chunk1, chunk2]
+    assert capture.pcm_bytes == chunk1 + chunk2
+    assert b"".join(received_sink_chunks) == capture.pcm_bytes
+    assert recorder._pcm_sink is None
+
+
+def test_recorder_stop_failure_cleans_pcm_sink() -> None:
+    class FailingStopStream(FakeStream):
+        def stop(self):
+            raise RuntimeError("PortAudio stop error")
+
+    streams: list[FakeStream] = []
+
+    def stream_factory(**kwargs):
+        st = FailingStopStream(**kwargs)
+        streams.append(st)
+        return st
+
+    recorder = AudioRecorder(stream_factory=stream_factory)
+    recorder.start(pcm_sink=lambda _: None)
+    chunk = (np.ones(1600, dtype=np.int16) * 1000).tobytes()
+    streams[0].emit_pcm(chunk)
+    with pytest.raises(AudioRecorderError, match="Não foi possível parar o microfone"):
+        recorder.stop()
+    assert recorder._pcm_sink is None
+    assert not recorder.is_recording()
+
+
+def test_recorder_sink_exception_is_caught_and_does_not_break_callback() -> None:
+    streams: list[FakeStream] = []
+
+    def stream_factory(**kwargs):
+        st = FakeStream(**kwargs)
+        streams.append(st)
+        return st
+
+    def failing_sink(_data: bytes) -> None:
+        raise RuntimeError("sink failed")
+
+    recorder = AudioRecorder(stream_factory=stream_factory)
+    recorder.start(pcm_sink=failing_sink)
+    chunk = (np.ones(1600, dtype=np.int16) * 1000).tobytes()
+    streams[0].emit_pcm(chunk)
+    capture = recorder.stop()
+    assert capture.pcm_bytes == chunk
+
+
+def test_recorder_require_sample_rate_rejects_incompatible_rate(monkeypatch) -> None:
+    fake_sounddevice = types.SimpleNamespace(
+        check_input_settings=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Invalid sample rate")),
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sounddevice)
+    recorder = AudioRecorder(stream_factory=None)
+    with pytest.raises(AudioRecorderError) as exc_info:
+        recorder.start(require_sample_rate=16000)
+    assert "não aceita um formato de captura compatível" in str(exc_info.value)
+    assert "Invalid sample rate" not in str(exc_info.value)
+
+
+def test_recorder_start_cleans_pcm_sink_when_all_sample_rates_rejected(monkeypatch) -> None:
+    fake_sounddevice = types.SimpleNamespace(
+        query_devices=lambda device=None, kind=None: {"default_samplerate": 44100},
+        check_input_settings=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Rejected rate")),
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sounddevice)
+    recorder = AudioRecorder(stream_factory=None)
+
+    def dummy_sink(_chunk: bytes) -> None:
+        pass
+
+    # 1. Fallback without require_sample_rate, resolving candidates and rejecting all
+    with pytest.raises(AudioRecorderError, match="não aceita um formato de captura compatível"):
+        recorder.start(pcm_sink=dummy_sink)
+    assert recorder._pcm_sink is None
+
+    # 2. With require_sample_rate rejecting the explicit rate
+    with pytest.raises(AudioRecorderError, match="não aceita um formato de captura compatível"):
+        recorder.start(pcm_sink=dummy_sink, require_sample_rate=16000)
+    assert recorder._pcm_sink is None

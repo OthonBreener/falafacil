@@ -86,7 +86,7 @@ def test_wayland_does_not_call_xdotool() -> None:
 
     assert bridge.detect_active_terminal() is None
     assert runner.calls == []
-    assert bridge.last_reason == "A colagem automática requer uma sessão X11; use Copiar novamente ou Copiar e arquivar."
+    assert bridge.last_reason == "A colagem automática requer uma sessão X11; use Copiar."
 
 
 def test_detect_active_terminal_without_xdotool_rejects() -> None:
@@ -100,7 +100,7 @@ def test_detect_active_terminal_without_xdotool_rejects() -> None:
 
     assert bridge.detect_active_terminal() is None
     assert runner.calls == []
-    assert bridge.last_reason == "xdotool não está instalado; use Copiar novamente ou Copiar e arquivar."
+    assert bridge.last_reason == "xdotool não está instalado; use Copiar."
 
 
 def test_send_text_without_target_in_wayland_rejects() -> None:
@@ -116,7 +116,7 @@ def test_send_text_without_target_in_wayland_rejects() -> None:
     with pytest.raises(TerminalBridgeError) as exc_info:
         bridge.send_text("texto", clipboard.append)
 
-    assert str(exc_info.value) == "A colagem automática requer uma sessão X11; use Copiar novamente ou Copiar e arquivar."
+    assert str(exc_info.value) == "A colagem automática requer uma sessão X11; use Copiar."
     assert runner.calls == []
     assert clipboard == []
 
@@ -134,7 +134,7 @@ def test_send_text_without_target_without_xdotool_rejects() -> None:
     with pytest.raises(TerminalBridgeError) as exc_info:
         bridge.send_text("texto", clipboard.append)
 
-    assert str(exc_info.value) == "xdotool não está instalado; use Copiar novamente ou Copiar e arquivar."
+    assert str(exc_info.value) == "xdotool não está instalado; use Copiar."
     assert runner.calls == []
     assert clipboard == []
 
@@ -467,7 +467,7 @@ def test_send_text_with_saved_target_in_wayland_rejects() -> None:
     with pytest.raises(TerminalBridgeError) as exc_info:
         bridge.send_text("texto seguro", clipboard.append, target=target)
 
-    assert str(exc_info.value) == "A colagem automática requer uma sessão X11; use Copiar novamente ou Copiar e arquivar."
+    assert str(exc_info.value) == "A colagem automática requer uma sessão X11; use Copiar."
     assert calls == []
     assert clipboard == []
 
@@ -491,7 +491,7 @@ def test_send_text_with_saved_target_without_xdotool_rejects() -> None:
     with pytest.raises(TerminalBridgeError) as exc_info:
         bridge.send_text("texto seguro", clipboard.append, target=target)
 
-    assert str(exc_info.value) == "xdotool não está instalado; use Copiar novamente ou Copiar e arquivar."
+    assert str(exc_info.value) == "xdotool não está instalado; use Copiar."
     assert calls == []
     assert clipboard == []
 

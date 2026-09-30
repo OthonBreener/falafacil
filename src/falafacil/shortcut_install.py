@@ -11,7 +11,7 @@ import sys
 import tempfile
 from typing import Callable
 
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 
 from .shortcuts import (
     AUTHORIZATION_CANCELLED_MESSAGE,
@@ -152,20 +152,25 @@ class ShortcutServiceInstaller(QObject):
         process.start()
         return True
 
-    def cancel(self) -> None:
+    def cancel(self, *, kill_grace_ms: int = 1000) -> None:
         process = self._process
         if process is None:
             return
         self._cancel_requested = True
-        process.terminate()
-        if not process.waitForFinished(1000):
-            process.kill()
-            process.waitForFinished(1000)
-        if self._process is process:
-            self._process = None
-            process.deleteLater()
-            self.finished.emit(False, AUTHORIZATION_CANCELLED_MESSAGE)
+        try:
+            process.terminate()
+        except Exception:
+            pass
 
+        def _kill_if_still_running() -> None:
+            if self._process is process:
+                try:
+                    if process.state() != QProcess.ProcessState.NotRunning:
+                        process.kill()
+                except Exception:
+                    pass
+
+        QTimer.singleShot(kill_grace_ms, _kill_if_still_running)
     def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
         process = self.sender()
         if process is not self._process:
@@ -186,7 +191,10 @@ class ShortcutServiceInstaller(QObject):
         if process.state() == QProcess.ProcessState.NotRunning:
             self._process = None
             process.deleteLater()
-            self.finished.emit(False, BACKEND_FAILURE_MESSAGE)
+            if self._cancel_requested:
+                self.finished.emit(False, AUTHORIZATION_CANCELLED_MESSAGE)
+            else:
+                self.finished.emit(False, BACKEND_FAILURE_MESSAGE)
 
 
 def _resolve_self_executable() -> Path:

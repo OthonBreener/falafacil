@@ -54,12 +54,12 @@ class TerminalBridge:
 
     def detect_active_terminal(self) -> TerminalTarget | None:
         if self._env.get("XDG_SESSION_TYPE", "").lower() != "x11":
-            self._reason = "A colagem automática requer uma sessão X11; use Copiar novamente ou Copiar e arquivar."
+            self._reason = "A colagem automática requer uma sessão X11; use Copiar."
             return None
 
         self._xdotool = self._which("xdotool")
         if not self._xdotool:
-            self._reason = "xdotool não está instalado; use Copiar novamente ou Copiar e arquivar."
+            self._reason = "xdotool não está instalado; use Copiar."
             return None
 
         try:
@@ -114,12 +114,12 @@ class TerminalBridge:
             return
 
         if self._env.get("XDG_SESSION_TYPE", "").lower() != "x11":
-            self._reason = "A colagem automática requer uma sessão X11; use Copiar novamente ou Copiar e arquivar."
+            self._reason = "A colagem automática requer uma sessão X11; use Copiar."
             raise TerminalBridgeError(self._reason)
 
         self._xdotool = self._which("xdotool")
         if not self._xdotool:
-            self._reason = "xdotool não está instalado; use Copiar novamente ou Copiar e arquivar."
+            self._reason = "xdotool não está instalado; use Copiar."
             raise TerminalBridgeError(self._reason)
 
         try:

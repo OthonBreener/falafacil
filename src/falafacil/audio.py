@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import io
+import queue
 import re
 import threading
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 import unicodedata
 import wave
+
 
 import numpy as np
 
@@ -16,6 +18,58 @@ CHANNELS = 1
 SAMPLE_WIDTH = 2
 MIN_RMS_LEVEL = 0.005
 _SAMPLE_RATE_CANDIDATES = (SAMPLE_RATE, 48_000, 44_100, 32_000, 22_050, 8_000)
+_CHUNK_QUEUE_SENTINEL = object()
+
+
+class PcmChunkQueue:
+    """Fila não bloqueante em memória para entrega de chunks PCM à transcrição ao vivo."""
+
+    def __init__(self, maxsize: int = 200) -> None:
+        self._queue: queue.Queue[bytes | object] = queue.Queue(maxsize=maxsize)
+        self._overflowed = False
+        self._finished = False
+        self._lock = threading.Lock()
+
+    @property
+    def overflowed(self) -> bool:
+        with self._lock:
+            return self._overflowed
+
+    def enqueue(self, chunk: bytes) -> None:
+        with self._lock:
+            if self._finished:
+                return
+            try:
+                self._queue.put_nowait(chunk)
+            except queue.Full:
+                self._overflowed = True
+
+    def finish(self) -> None:
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+            try:
+                self._queue.put_nowait(_CHUNK_QUEUE_SENTINEL)
+            except queue.Full:
+                pass
+
+    def get(self, timeout: float = 0.1) -> bytes | None:
+        try:
+            item = self._queue.get(timeout=timeout)
+            if item is _CHUNK_QUEUE_SENTINEL:
+                try:
+                    self._queue.put_nowait(_CHUNK_QUEUE_SENTINEL)
+                except queue.Full:
+                    pass
+                return None
+            return item  # type: ignore[return-value]
+        except queue.Empty:
+            with self._lock:
+                if self._finished and self._queue.empty():
+                    return None
+            return None
+
 
 
 def _normalize_identifier(text: str) -> str:
@@ -261,6 +315,7 @@ class AudioRecorder:
         self._chunks: list[bytes] = []
         self._status: str | None = None
         self._last_capture: AudioCapture | None = None
+        self._pcm_sink: Callable[[bytes], None] | None = None
         self._lock = threading.Lock()
 
     def set_device(self, device: int | str | None) -> None:
@@ -271,69 +326,100 @@ class AudioRecorder:
                 )
             self._device = device
 
-    def start(self) -> None:
+    def start(
+        self,
+        *,
+        pcm_sink: Callable[[bytes], None] | None = None,
+        require_sample_rate: int | None = None,
+        blocksize: int | None = None,
+    ) -> None:
         with self._lock:
             if self._stream is not None:
                 raise AudioRecorderError("Já existe uma gravação em andamento.")
             self._chunks = []
             self._status = None
             self._last_capture = None
+            self._pcm_sink = pcm_sink
             device = self._device
-
-        sample_rate = SAMPLE_RATE
-        if self._uses_default_stream_factory:
-            try:
-                import sounddevice as sd
-            except (ImportError, OSError) as exc:
-                raise AudioRecorderError(
-                    "PortAudio não está disponível. Instale o runtime libportaudio2."
-                ) from exc
-            sample_rate = _resolve_sample_rate(sd, device)
 
         stream = None
         try:
-            stream = self._stream_factory(
-                device=device,
-                samplerate=sample_rate,
-                channels=CHANNELS,
-                dtype="int16",
-                callback=self._callback,
-            )
+            sample_rate = SAMPLE_RATE
+            if self._uses_default_stream_factory:
+                try:
+                    import sounddevice as sd
+                except (ImportError, OSError) as exc:
+                    raise AudioRecorderError(
+                        "PortAudio não está disponível. Instale o runtime libportaudio2."
+                    ) from exc
+                if require_sample_rate is not None:
+                    try:
+                        sd.check_input_settings(
+                            device=device,
+                            samplerate=require_sample_rate,
+                            channels=CHANNELS,
+                            dtype="int16",
+                        )
+                    except Exception as exc:
+                        raise AudioRecorderError(
+                            "O microfone selecionado não aceita um formato de captura compatível."
+                        ) from exc
+                    sample_rate = require_sample_rate
+                else:
+                    sample_rate = _resolve_sample_rate(sd, device)
+            elif require_sample_rate is not None:
+                sample_rate = require_sample_rate
+
+            stream_kwargs: dict[str, Any] = {
+                "device": device,
+                "samplerate": sample_rate,
+                "channels": CHANNELS,
+                "dtype": "int16",
+                "callback": self._callback,
+            }
+            if blocksize is not None:
+                stream_kwargs["blocksize"] = blocksize
+            stream = self._stream_factory(**stream_kwargs)
             stream.start()
         except Exception as exc:
+            with self._lock:
+                self._pcm_sink = None
             if stream is not None:
                 try:
                     stream.close()
                 except Exception:
                     pass
+            if isinstance(exc, AudioRecorderError):
+                raise exc
             raise AudioRecorderError("Não foi possível acessar o microfone.") from exc
-
         with self._lock:
             self._capture_sample_rate = sample_rate
             self._stream = stream
-
     def stop(self) -> AudioCapture:
         with self._lock:
             stream = self._stream
-            self._stream = None
-
-        if stream is None:
-            raise AudioRecorderError("Nenhuma gravação está em andamento.")
+            if stream is None:
+                raise AudioRecorderError("Nenhuma gravação está em andamento.")
 
         stop_error: AudioRecorderError | None = None
-        try:
-            stream.stop()
-        except Exception:
-            stop_error = AudioRecorderError(
-                "Não foi possível parar o microfone."
-            )
         close_error: AudioRecorderError | None = None
         try:
-            stream.close()
-        except Exception:
-            close_error = AudioRecorderError(
-                "Não foi possível fechar o microfone."
-            )
+            try:
+                stream.stop()
+            except Exception:
+                stop_error = AudioRecorderError(
+                    "Não foi possível parar o microfone."
+                )
+            try:
+                stream.close()
+            except Exception:
+                close_error = AudioRecorderError(
+                    "Não foi possível fechar o microfone."
+                )
+        finally:
+            with self._lock:
+                self._stream = None
+                self._pcm_sink = None
 
         with self._lock:
             pcm_bytes = b"".join(self._chunks)
@@ -379,7 +465,12 @@ class AudioRecorder:
             if status_text:
                 self._status = status_text
             self._chunks.append(chunk)
-
+            sink = self._pcm_sink
+        if sink is not None:
+            try:
+                sink(chunk)
+            except Exception:
+                pass
 
 def _resample_pcm(pcm_bytes: bytes, source_rate: int) -> bytes:
     if source_rate == SAMPLE_RATE:

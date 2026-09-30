@@ -7,7 +7,7 @@ import threading
 import time
 import numpy as np
 import pytest
-from PySide6.QtCore import QBuffer, QByteArray, QCoreApplication, QEvent, QEventLoop, QIODevice, QObject, QPoint, QPointF, QRect, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QCoreApplication, QEvent, QEventLoop, QIODevice, QObject, QPoint, QPointF, QRect, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QCursor, QGuiApplication, QKeyEvent, QKeySequence, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -34,7 +34,13 @@ from falafacil.shortcuts import (
     UNSUPPORTED_MOUSE_BUTTON_MESSAGE,
 )
 from falafacil.terminal import TerminalBridgeError, TerminalTarget
-from falafacil.transcription import TokenUsage, TranscriptionDebug, TranscriptionError
+from falafacil.transcription import (
+    LiveTranscriptionDebug,
+    LiveTranscriptionResult,
+    TokenUsage,
+    TranscriptionDebug,
+    TranscriptionError,
+)
 from falafacil.ui import (
     CAPTURE_WAITING_TEXT,
     GLOBAL_SHORTCUT_DEBOUNCE_SECONDS,
@@ -54,6 +60,7 @@ class FakeRecorder:
         fail_stop_error: Exception | None = None,
         status: str | None = None,
         order_log: list[str] | None = None,
+        reject_require_sample_rate: bool = False,
     ) -> None:
         self.recording = False
         self.stop_count = 0
@@ -69,13 +76,35 @@ class FakeRecorder:
         self.fail_start = fail_start
         self.fail_stop_error = fail_stop_error
         self.status = status
+        self.reject_require_sample_rate = reject_require_sample_rate
+        self.start_calls: list[dict[str, Any]] = []
         self._last_capture: AudioCapture | None = None
+
     def set_device(self, device: int | str | None) -> None:
         self.selected_devices.append(device)
 
-    def start(self, device: int | str | None = None) -> None:
+    def start(
+        self,
+        device: int | str | None = None,
+        *,
+        pcm_sink: Any = None,
+        require_sample_rate: int | None = None,
+        blocksize: int | None = None,
+    ) -> None:
+        self.start_calls.append(
+            {
+                "device": device,
+                "pcm_sink": pcm_sink,
+                "require_sample_rate": require_sample_rate,
+                "blocksize": blocksize,
+            }
+        )
         if self.fail_start:
             raise AudioRecorderError("Não foi possível acessar o microfone.")
+        if self.reject_require_sample_rate and require_sample_rate is not None:
+            raise AudioRecorderError(
+                "O microfone selecionado não aceita um formato de captura compatível."
+            )
         self.recording = True
 
     def stop(self) -> AudioCapture:
@@ -99,6 +128,129 @@ class FakeRecorder:
     def is_recording(self) -> bool:
         return self.recording
 
+
+class FakeLiveWorker(QObject):
+    interim = Signal(str)
+    final = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str, object)
+
+    def __init__(
+        self,
+        api_key: str,
+        queue: Any,
+        *,
+        final_text: str = "Transcrição ao vivo concluída.",
+        usage: TokenUsage | None = None,
+        error: str | None = None,
+        model: str = "gemini-3.5-transcribe-live",
+        interim_sequence: Sequence[str] = (),
+        final_sequence: Sequence[str] = (),
+        auto_emit_on_run: bool = True,
+    ) -> None:
+        super().__init__()
+        self.api_key = api_key
+        self.queue = queue
+        self.final_text = final_text
+        self.usage = usage
+        self.error = error
+        self.model = model
+        self.interim_sequence = list(interim_sequence)
+        self.final_sequence = list(final_sequence)
+        self.auto_emit_on_run = auto_emit_on_run
+        self.stop_requested = False
+        self.force_cancelled = False
+        self.run_called = False
+        self.received_chunks: list[bytes] = []
+
+    def request_stop(self) -> None:
+        self.stop_requested = True
+        if self.queue is not None:
+            self.queue.finish()
+
+    def cancel(self) -> None:
+        self.force_cancel()
+
+    def force_cancel(self) -> None:
+        self.stop_requested = True
+        self.force_cancelled = True
+        if self.queue is not None:
+            self.queue.finish()
+
+    def drain_queue(self) -> int:
+        total = 0
+        if self.queue is not None:
+            while True:
+                chunk = self.queue.get(timeout=0.001)
+                if chunk is None:
+                    break
+                self.received_chunks.append(chunk)
+                total += len(chunk)
+        return total
+
+    def emit_result(self) -> None:
+        self._emit_result()
+
+    def _emit_result(self) -> None:
+        self.drain_queue()
+        for item in self.interim_sequence:
+            self.interim.emit(item)
+        for item in self.final_sequence:
+            self.final.emit(item)
+        audio_bytes = sum(len(c) for c in self.received_chunks) or 1600
+        if self.error:
+            debug = LiveTranscriptionDebug(
+                model=self.model,
+                language_code="pt-BR",
+                mode="SMART",
+                audio_bytes=audio_bytes,
+                response_text="",
+                error=self.error,
+                usage=self.usage,
+            )
+            self.failed.emit(self.error, debug)
+        else:
+            debug = LiveTranscriptionDebug(
+                model=self.model,
+                language_code="pt-BR",
+                mode="SMART",
+                audio_bytes=audio_bytes,
+                response_text=self.final_text,
+                error=None,
+                usage=self.usage,
+            )
+            self.finished.emit(LiveTranscriptionResult(text=self.final_text, debug=debug))
+
+    @Slot()
+    def run(self) -> None:
+        self.run_called = True
+        if self.auto_emit_on_run:
+            self._emit_result()
+
+
+class FakeRunningThread:
+    def __init__(self, *, timeout_first: bool = False) -> None:
+        self.timeout_first = timeout_first
+        self.quit_called = False
+        self.terminate_called = False
+        self.wait_calls: list[int | None] = []
+        self._running = True
+
+    def isRunning(self) -> bool:
+        return self._running
+
+    def quit(self) -> None:
+        self.quit_called = True
+
+    def terminate(self) -> None:
+        self.terminate_called = True
+
+    def wait(self, msecs: int | None = None) -> bool:
+        self.wait_calls.append(msecs)
+        if msecs is not None and self.timeout_first and len(self.wait_calls) == 1:
+            return False
+        self._running = False
+        return True
 
 class FakeTerminal:
     def __init__(
@@ -313,17 +465,30 @@ class FakeInputShortcutBridge(QObject):
 class FakeShortcutInstaller(QObject):
     finished = Signal(bool, str)
 
-    def __init__(self, *, order_log: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        order_log: list[str] | None = None,
+        running: bool = False,
+    ) -> None:
         super().__init__()
         self.install_count = 0
         self.cancel_count = 0
         self.order_log = order_log
+        self._running = running
 
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    @running.setter
+    def running(self, value: bool) -> None:
+        self._running = value
     def install(self) -> bool:
         self.install_count += 1
         return True
 
-    def cancel(self) -> None:
+    def cancel(self, *, kill_grace_ms: int = 1000) -> None:
         self.cancel_count += 1
         if self.order_log is not None:
             self.order_log.append("installer")
@@ -684,7 +849,6 @@ class FakeHomebrewUpdateController(QObject):
     def restart(self) -> bool:
         self.restart_calls += 1
         return self.restart_result
-
 def make_window(
     qapp,
     *,
@@ -703,6 +867,7 @@ def make_window(
     homebrew_update_controller=None,
     spell_checker=None,
     startup_message=None,
+    live_worker_factory=None,
 ):
     media_player = media_player or FakeMediaPlayer()
     resolved_terminal = (
@@ -728,6 +893,7 @@ def make_window(
         homebrew_update_controller=homebrew_update_controller,
         spell_checker=spell_checker,
         startup_message=startup_message,
+        live_worker_factory=live_worker_factory,
     )
     window.show()
     qapp.processEvents()
@@ -1124,11 +1290,15 @@ def test_apply_model_preference_locked_when_busy(qapp) -> None:
         assert window.model_combo.isEnabled() is False
         assert window.apply_model_button.isEnabled() is False
 
-        window.state = AppState.TRANSCRIBING
+        window.state = AppState.LIVE_FINALIZING
         window._update_actions()
         assert window.model_combo.isEnabled() is False
         assert window.apply_model_button.isEnabled() is False
 
+        window.state = AppState.TRANSCRIBING
+        window._update_actions()
+        assert window.model_combo.isEnabled() is False
+        assert window.apply_model_button.isEnabled() is False
         window.state = AppState.IDLE
         window._update_actions()
         assert window.model_combo.isEnabled() is True
@@ -1157,31 +1327,55 @@ def test_update_actions_tracks_key_text_and_busy_state(qapp) -> None:
 
     assert window.record_button.isEnabled()
     assert window.record_button.text() == "Gravar"
-    assert not window.copy_last_button.isEnabled()
-    assert not window.clear_last_button.isEnabled()
+    assert not window.copy_button.isEnabled()
+    assert not window.clear_button.isEnabled()
     assert not window.terminal_button.isEnabled()
-    assert not window.copy_and_archive_button.isEnabled()
+    assert not window.review_button.isEnabled()
     assert window.settings_button.isEnabled()
 
-    window.last_message_editor.setPlainText("texto sintético")
+    # Backup com texto, mas editor vazio -> NÃO habilita ações
+    window.last_message_editor.setPlainText("backup text")
     window._update_actions()
-    assert window.copy_last_button.isEnabled()
-    assert window.clear_last_button.isEnabled()
+    assert not window.copy_button.isEnabled()
+    assert not window.clear_button.isEnabled()
+    assert not window.terminal_button.isEnabled()
+    assert not window.review_button.isEnabled()
+
+    # Editor atual com texto -> habilita ações
+    window.editor.setPlainText("texto sintético")
+    window._update_actions()
+    assert window.copy_button.isEnabled()
+    assert window.clear_button.isEnabled()
     assert window.terminal_button.isEnabled()
+    assert window.review_button.isEnabled()
 
     window.state = AppState.RECORDING
     window._update_actions()
     assert window.settings_button.isEnabled()
     assert window.record_button.isEnabled()
     assert window.record_button.text() == "Parar e revisar áudio"
+    assert not window.copy_button.isEnabled()
+    assert not window.clear_button.isEnabled()
+    assert not window.terminal_button.isEnabled()
+    assert not window.review_button.isEnabled()
+
+    window.state = AppState.LIVE_FINALIZING
+    window._update_actions()
+    assert not window.record_button.isEnabled()
+    assert window.record_button.text() == "Finalizando transcrição ao vivo…"
+    assert not window.copy_button.isEnabled()
+    assert not window.clear_button.isEnabled()
+    assert not window.terminal_button.isEnabled()
+    assert not window.review_button.isEnabled()
 
     window.state = AppState.TRANSCRIBING
     window._update_actions()
     assert not window.record_button.isEnabled()
     assert window.record_button.text() == "Transcrevendo…"
-    assert not window.copy_last_button.isEnabled()
-    assert not window.clear_last_button.isEnabled()
+    assert not window.copy_button.isEnabled()
+    assert not window.clear_button.isEnabled()
     assert not window.terminal_button.isEnabled()
+    assert not window.review_button.isEnabled()
     assert window.settings_button.isEnabled()
     window.close()
 
@@ -1216,25 +1410,35 @@ def test_send_after_settings_dialog_closes_does_not_use_deleted_widgets(qapp) ->
     wait_for_worker(qapp, window)
 
     assert window.state is AppState.READY
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "synthetic transcript"
+    assert window.editor.toPlainText() == "synthetic transcript"
+    assert window.last_message_editor.toPlainText() == ""
     window.close()
 
 
-def test_clear_last_button_removes_last_message_editor_text(qapp) -> None:
+def test_clear_button_moves_editor_text_to_backup_and_subsequent_clear_is_noop(qapp) -> None:
     window, _ = make_window(qapp)
-    window.last_message_editor.setPlainText("texto para apagar")
+    window.editor.setPlainText("texto para apagar")
     window.state = AppState.READY
     window._update_actions()
+    assert window.clear_button.isEnabled()
 
-    window.clear_last_button.click()
+    window.clear_button.click()
 
-    assert window.last_message_editor.toPlainText() == ""
-    assert not window.clear_last_button.isEnabled()
-    assert window.status_label.text() == "Texto apagado."
+    assert window.editor.toPlainText() == ""
+    assert window.last_message_editor.toPlainText() == "texto para apagar"
+    assert not window.clear_button.isEnabled()
+    assert not window.copy_button.isEnabled()
+    assert not window.terminal_button.isEnabled()
+    assert not window.review_button.isEnabled()
+    assert window.status_label.text() == "Texto apagado; cópia mantida na última mensagem."
     assert window.state is AppState.IDLE
-    window.close()
 
+    # Segundo clear em editor vazio não altera o backup
+    window.clear_text()
+    assert window.editor.toPlainText() == ""
+    assert window.last_message_editor.toPlainText() == "texto para apagar"
+    assert window.status_label.text() == "Não há texto para apagar."
+    window.close()
 
 def test_stop_enters_audio_ready_without_network_call(qapp) -> None:
     transcriber = FakeTranscriber()
@@ -1284,8 +1488,8 @@ def test_play_then_send_uses_memory_wav_and_creates_worker(qapp) -> None:
     window._send_pending_audio()
     wait_for_worker(qapp, window)
     assert transcriber.calls == [saved_wav]
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "synthetic transcript"
+    assert window.editor.toPlainText() == "synthetic transcript"
+    assert window.last_message_editor.toPlainText() == ""
     window.close()
 
 
@@ -1770,9 +1974,9 @@ def test_usage_store_failure_displays_diagnostic_and_preserves_flow(qapp) -> Non
     window._on_transcription_finished("texto ok", debug)
 
     assert window.state is AppState.READY
-    assert window.status_label.text() == "Texto copiado e movido para Última mensagem."
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "texto ok"
+    assert "Transcrição pronta" in window.status_label.text()
+    assert window.editor.toPlainText() == "texto ok"
+    assert window.last_message_editor.toPlainText() == ""
     assert "Não foi possível persistir o consumo de tokens." in window.usage_debug.toPlainText()
     assert window.usage_chart.status_message == "Não foi possível persistir o consumo de tokens."
     window.close()
@@ -2204,7 +2408,7 @@ def test_close_deferred_transcription_thread_nonblocking_and_single_final_close(
 
     # 4. Late signals from worker do not mutate editors, diagnostics, clipboard, or status
     window._on_transcription_finished("late result", make_debug("late result"))
-    assert window.transcription_editor.toPlainText() == ""
+    assert window.editor.toPlainText() == ""
     assert window.last_message_editor.toPlainText() == ""
     assert "late result" not in window.status_label.text()
 
@@ -2234,7 +2438,7 @@ def test_close_deferred_proofreading_thread_nonblocking_and_single_final_close(
         qapp, local_store=store, settings=Settings(api_key="active-token")
     )
     event_rec = CloseEventRecorder(window, monkeypatch)
-    window.last_message_editor.setPlainText("Texto original")
+    window.editor.setPlainText("Texto original")
 
     thread = StrictNonblockingThread(window)
     window._proofreading_thread = thread  # type: ignore[assignment]
@@ -2260,7 +2464,7 @@ def test_close_deferred_proofreading_thread_nonblocking_and_single_final_close(
     window._on_proofreading_finished(
         "Texto modificado tardio", make_debug("Texto modificado tardio")
     )
-    assert window.last_message_editor.toPlainText() == "Texto original"
+    assert window.editor.toPlainText() == "Texto original"
     assert "Texto modificado tardio" not in window.status_label.text()
 
     window._on_proofreading_failed("Erro de revisão tardio", None)
@@ -2657,7 +2861,7 @@ def test_close_late_result_and_failure_inertness_preserves_all_widgets_clipboard
     )
 
     # 1. Seed initial states across all surfaces
-    window.transcription_editor.setPlainText("Seed Transcription Editor Text")
+    window.editor.setPlainText("Seed Transcription Editor Text")
     window.last_message_editor.setPlainText("Seed Last Message Editor Text")
     window.status_label.setText("Seed Status Label Text")
     QApplication.clipboard().setText("Seed Clipboard Text")
@@ -2671,7 +2875,7 @@ def test_close_late_result_and_failure_inertness_preserves_all_widgets_clipboard
     initial_chart_records = tuple(window.usage_chart.records)
     initial_store_records = list(store.records)
     # Snapshot all seeded values
-    snapshot_transcription = window.transcription_editor.toPlainText()
+    snapshot_transcription = window.editor.toPlainText()
     snapshot_last_message = window.last_message_editor.toPlainText()
     snapshot_status = window.status_label.text()
     snapshot_clipboard = QApplication.clipboard().text()
@@ -2710,7 +2914,7 @@ def test_close_late_result_and_failure_inertness_preserves_all_widgets_clipboard
     window._on_proofreading_failed("Late Proof Failed Message", late_debug_proof_failed)
 
     # 4. Assert byte-for-byte / identity-equivalent NO mutation
-    assert window.transcription_editor.toPlainText() == snapshot_transcription
+    assert window.editor.toPlainText() == snapshot_transcription
     assert window.last_message_editor.toPlainText() == snapshot_last_message
     assert window.status_label.text() == snapshot_status
     assert QApplication.clipboard().text() == snapshot_clipboard
@@ -2964,7 +3168,7 @@ def test_send_to_terminal_failure_omits_raw_exception_and_secret(qapp) -> None:
         transcriber=FakeTranscriber(),
         terminal=terminal,
     )
-    window.last_message_editor.setPlainText("Texto para colar")
+    window.editor.setPlainText("Texto para colar")
     window.state = AppState.READY
     window.send_to_terminal()
 
@@ -3043,7 +3247,7 @@ def test_global_start_then_global_stop_preserves_origin_terminal_target(qapp) ->
     assert window._origin_terminal_target == origin_target
     assert terminal.detect_calls == 1
     # 3. Send to terminal passes origin target and clears it
-    window.last_message_editor.setPlainText("comando enviado")
+    window.editor.setPlainText("comando enviado")
     window.send_to_terminal()
     assert terminal.send_calls == [("comando enviado", origin_target)]
     assert window._origin_terminal_target is None
@@ -3076,7 +3280,7 @@ def test_global_start_then_manual_stop_preserves_origin_terminal_target(qapp) ->
     assert window._origin_terminal_target == origin_target
     assert terminal.detect_calls == 1
     # 3. Send to terminal passes origin target and clears it
-    window.last_message_editor.setPlainText("comando manual stop")
+    window.editor.setPlainText("comando manual stop")
     window.send_to_terminal()
     assert terminal.send_calls == [("comando manual stop", origin_target)]
     assert window._origin_terminal_target is None
@@ -3134,7 +3338,7 @@ def test_send_to_terminal_passes_origin_target_and_clears_on_success(qapp) -> No
         terminal=terminal,
     )
     window._origin_terminal_target = origin_target
-    window.last_message_editor.setPlainText("git status")
+    window.editor.setPlainText("git status")
     window.state = AppState.READY
 
     window.send_to_terminal()
@@ -3161,7 +3365,7 @@ def test_send_to_terminal_failure_preserves_target_for_retry(qapp) -> None:
         terminal=terminal,
     )
     window._origin_terminal_target = origin_target
-    window.last_message_editor.setPlainText("git commit")
+    window.editor.setPlainText("git commit")
     window.state = AppState.READY
 
     window.send_to_terminal()
@@ -3611,8 +3815,7 @@ def test_main_window_layout_settings_fullscreen_and_grabs(qapp) -> None:
     assert window.size().height() == 700
     assert window.minimumWidth() == 760
     assert window.minimumHeight() == 560
-    assert not hasattr(window, "editor")
-    assert not hasattr(window, "send_to_gemini_button")
+    assert hasattr(window, "editor")
     assert not window.message_splitter.childrenCollapsible()
     assert not window.main_splitter.childrenCollapsible()
     assert not window.diagnostic_splitter.childrenCollapsible()
@@ -3621,7 +3824,7 @@ def test_main_window_layout_settings_fullscreen_and_grabs(qapp) -> None:
     assert not window.grab().isNull()
     window.resize(760, 560)
     qapp.processEvents()
-    assert window.transcription_editor.height() > 0
+    assert window.editor.height() > 0
     assert window.last_message_editor.height() > 0
     assert not window.grab().isNull()
 
@@ -3860,7 +4063,7 @@ def test_update_button_disabled_during_recording_and_transcribing(qapp) -> None:
     def inspect() -> None:
         dialog = window._settings_dialog
         assert dialog is not None
-        for busy_state in (AppState.RECORDING, AppState.TRANSCRIBING):
+        for busy_state in (AppState.RECORDING, AppState.TRANSCRIBING, AppState.LIVE_FINALIZING):
             window.state = busy_state
             window._update_actions()
             assert not window.install_update_button.isEnabled()
@@ -4091,11 +4294,16 @@ def test_review_button_states_and_enablement(qapp) -> None:
         transcriber=transcriber,
     )
     # Editor vazio -> desabilitado
-    window.last_message_editor.setPlainText("")
+    window.editor.setPlainText("")
     assert window.review_button.isEnabled() is False
 
-    # Com texto, chave e transcritor -> habilitado
-    window.last_message_editor.setPlainText("Texto a revisar")
+    # Backup com texto NÃO habilita revisão
+    window.last_message_editor.setPlainText("Texto backup")
+    window._update_actions()
+    assert window.review_button.isEnabled() is False
+
+    # Com texto no editor, chave e transcritor -> habilitado
+    window.editor.setPlainText("Texto a revisar")
     assert window.review_button.isEnabled() is True
 
     # Sem chave API -> desabilitado
@@ -4144,15 +4352,15 @@ def test_review_button_success_flow(qapp) -> None:
         transcriber=transcriber,
         local_store=store,
     )
-    window.last_message_editor.setPlainText("Texto com eror")
+    window.editor.setPlainText("Texto com eror")
     assert window.review_button.isEnabled() is True
 
     window.review_button.click()
     qapp.processEvents()
     wait_for_proofreading_worker(qapp, window)
 
-    assert window.last_message_editor.toPlainText() == "Texto corrigido e revisado com sucesso."
-    assert not window.last_message_editor.textCursor().hasSelection()
+    assert window.editor.toPlainText() == "Texto corrigido e revisado com sucesso."
+    assert not window.editor.textCursor().hasSelection()
     assert QApplication.clipboard().text() == "Texto corrigido e revisado com sucesso."
     assert window.status_label.text() == "Texto revisado e copiado."
     assert window._is_reviewing is False
@@ -4183,14 +4391,14 @@ def test_review_button_error_flow(qapp) -> None:
         transcriber=transcriber,
         local_store=store,
     )
-    window.last_message_editor.setPlainText("Texto original que deve ser mantido")
+    window.editor.setPlainText("Texto original que deve ser mantido")
     assert window.review_button.isEnabled() is True
 
     window.review_button.click()
     qapp.processEvents()
     wait_for_proofreading_worker(qapp, window)
 
-    assert window.last_message_editor.toPlainText() == "Texto original que deve ser mantido"
+    assert window.editor.toPlainText() == "Texto original que deve ser mantido"
     assert window.status_label.text() == "Falha de conexão com a API do Gemini."
     assert window._is_reviewing is False
     assert window.review_button.isEnabled() is True
@@ -4266,26 +4474,26 @@ def test_editor_context_menu_suggestions_and_ignore(qapp, monkeypatch) -> None:
         local_store=store,
         spell_checker=checker,
     )
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
 
     # Posiciona o cursor na palavra "errado"
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)  # dentro de 'errado'
-    window.last_message_editor.setTextCursor(cursor)
-    pos = window.last_message_editor.cursorRect(cursor).center()
+    window.editor.setTextCursor(cursor)
+    pos = window.editor.cursorRect(cursor).center()
 
     captured_menus: list[QMenu] = []
-    orig_create = window.last_message_editor.createStandardContextMenu
+    orig_create = window.editor.createStandardContextMenu
 
     def intercepted_create(*args, **kwargs):
         m = orig_create(*args, **kwargs)
         if m is None:
-            m = QMenu(window.last_message_editor)
+            m = QMenu(window.editor)
         m.exec = lambda *a, **kw: captured_menus.append(m)
         m.exec_ = lambda *a, **kw: captured_menus.append(m)
         return m
 
-    monkeypatch.setattr(window.last_message_editor, "createStandardContextMenu", intercepted_create)
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", intercepted_create)
     window._show_editor_context_menu(pos)
     assert len(captured_menus) == 1
     menu = captured_menus[0]
@@ -4298,13 +4506,13 @@ def test_editor_context_menu_suggestions_and_ignore(qapp, monkeypatch) -> None:
     # Clica na sugestão 'correto'
     suggestion_action = next(a for a in menu.actions() if a.text() == "correto")
     suggestion_action.trigger()
-    assert "palavra correto aqui" in window.last_message_editor.toPlainText()
+    assert "palavra correto aqui" in window.editor.toPlainText()
 
     # Testa 'Ignorar'
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
-    pos = window.last_message_editor.cursorRect(cursor).center()
+    window.editor.setTextCursor(cursor)
+    pos = window.editor.cursorRect(cursor).center()
 
     captured_menus.clear()
     window._show_editor_context_menu(pos)
@@ -4369,19 +4577,19 @@ def test_editor_is_read_only_during_review_and_restored(qapp) -> None:
         settings=Settings(api_key="valid-key"),
         transcriber=transcriber,
     )
-    window.last_message_editor.setPlainText("Texto original para teste.")
-    assert window.last_message_editor.isReadOnly() is False
+    window.editor.setPlainText("Texto original para teste.")
+    assert window.editor.isReadOnly() is False
 
     # Inicia a revisão com sucesso
     window.review_button.click()
     assert window._is_reviewing is True
-    assert window.last_message_editor.isReadOnly() is True
+    assert window.editor.isReadOnly() is True
 
     # Aguarda a conclusão da thread e restauração
     wait_for_proofreading_worker(qapp, window)
     assert window._is_reviewing is False
-    assert window.last_message_editor.isReadOnly() is False
-    assert window.last_message_editor.toPlainText() == "Texto revisado com IA."
+    assert window.editor.isReadOnly() is False
+    assert window.editor.toPlainText() == "Texto revisado com IA."
 
     # Testa com erro na revisão
     window.transcriber = FakeTranscriber(
@@ -4389,12 +4597,12 @@ def test_editor_is_read_only_during_review_and_restored(qapp) -> None:
     )
     window.review_button.click()
     assert window._is_reviewing is True
-    assert window.last_message_editor.isReadOnly() is True
+    assert window.editor.isReadOnly() is True
 
     wait_for_proofreading_worker(qapp, window)
     assert window._is_reviewing is False
-    assert window.last_message_editor.isReadOnly() is False
-    assert window.last_message_editor.toPlainText() == "Texto revisado com IA."
+    assert window.editor.isReadOnly() is False
+    assert window.editor.toPlainText() == "Texto revisado com IA."
     window.close()
 
 
@@ -4408,28 +4616,27 @@ def test_editor_context_menu_with_hyphenated_compound_word(qapp, monkeypatch) ->
         qapp,
         spell_checker=checker,
     )
-    window.last_message_editor.setPlainText("comprar guarda-chuva hoje")
+    window.editor.setPlainText("comprar guarda-chuva hoje")
 
     # Posiciona o cursor no meio do composto hifenizado (offset 12)
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(12)
-    window.last_message_editor.setTextCursor(cursor)
-    pos = window.last_message_editor.cursorRect(cursor).center()
+    window.editor.setTextCursor(cursor)
+    pos = window.editor.cursorRect(cursor).center()
 
     captured_menus: list[QMenu] = []
-    orig_create = window.last_message_editor.createStandardContextMenu
+    orig_create = window.editor.createStandardContextMenu
 
     def intercepted_create(*args, **kwargs):
         m = orig_create(*args, **kwargs)
         if m is None:
-            m = QMenu(window.last_message_editor)
+            m = QMenu(window.editor)
         m.exec = lambda *a, **kw: captured_menus.append(m)
         m.exec_ = lambda *a, **kw: captured_menus.append(m)
         return m
 
-    monkeypatch.setattr(window.last_message_editor, "createStandardContextMenu", intercepted_create)
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", intercepted_create)
     window._show_editor_context_menu(pos)
-
     assert len(captured_menus) == 1
     menu = captured_menus[0]
     action_texts = [a.text() for a in menu.actions()]
@@ -4440,7 +4647,7 @@ def test_editor_context_menu_with_hyphenated_compound_word(qapp, monkeypatch) ->
     # Substituição deve trocar o composto inteiro
     suggestion_action = next(a for a in menu.actions() if a.text() == "sombrinha")
     suggestion_action.trigger()
-    assert window.last_message_editor.toPlainText() == "comprar sombrinha hoje"
+    assert window.editor.toPlainText() == "comprar sombrinha hoje"
     window.close()
 
 
@@ -4458,29 +4665,24 @@ def test_editor_context_menu_with_emoji_prefix_replaces_accurately(
     )
 
     captured_menus: list[QMenu] = []
-    orig_create = window.last_message_editor.createStandardContextMenu
+    orig_create = window.editor.createStandardContextMenu
 
     def intercepted_create(*args, **kwargs):
         m = orig_create(*args, **kwargs)
         if m is None:
-            m = QMenu(window.last_message_editor)
+            m = QMenu(window.editor)
         m.exec = lambda *a, **kw: captured_menus.append(m)
         m.exec_ = lambda *a, **kw: captured_menus.append(m)
         return m
 
-    monkeypatch.setattr(window.last_message_editor, "createStandardContextMenu", intercepted_create)
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", intercepted_create)
 
-    # Texto com emoji não-BMP antes da palavra incorreta:
-    # Em UTF-16: '😀' ocupa índices 0 e 1, ' ' ocupa 2, e 'errrrooo' ocupa 3..10 (tamanho 8).
-    # Em Python: '😀' len 1, ' ' len 1, 'errrrooo' índices 2..10.
-    # O clique em qualquer posição da palavra (início=3, meio=6, fim=10) deve selecionar
-    # exatamente 'errrrooo' e substituir sem resíduos.
     for test_pos in (3, 6, 10):
-        window.last_message_editor.setPlainText("😀 errrrooo final")
-        cursor = window.last_message_editor.textCursor()
+        window.editor.setPlainText("😀 errrrooo final")
+        cursor = window.editor.textCursor()
         cursor.setPosition(test_pos)
-        window.last_message_editor.setTextCursor(cursor)
-        pos = window.last_message_editor.cursorRect(cursor).center()
+        window.editor.setTextCursor(cursor)
+        pos = window.editor.cursorRect(cursor).center()
 
         captured_menus.clear()
         window._show_editor_context_menu(pos)
@@ -4494,16 +4696,16 @@ def test_editor_context_menu_with_emoji_prefix_replaces_accurately(
         suggestion_action.trigger()
 
         # Substituição exata: sem comer espaço antes e sem sobrar letras depois
-        assert window.last_message_editor.toPlainText() == "😀 correto final"
+        assert window.editor.toPlainText() == "😀 correto final"
 
     # Teste adicional com múltiplos emojis e caracteres não-BMP:
     # '🚀🎉' (4 unidades UTF-16) + ' ' (1 unidade) -> 'errrrooo' começa na unidade 5
     for test_pos in (5, 8, 12):
-        window.last_message_editor.setPlainText("🚀🎉 errrrooo ok")
-        cursor = window.last_message_editor.textCursor()
+        window.editor.setPlainText("🚀🎉 errrrooo ok")
+        cursor = window.editor.textCursor()
         cursor.setPosition(test_pos)
-        window.last_message_editor.setTextCursor(cursor)
-        pos = window.last_message_editor.cursorRect(cursor).center()
+        window.editor.setTextCursor(cursor)
+        pos = window.editor.cursorRect(cursor).center()
 
         captured_menus.clear()
         window._show_editor_context_menu(pos)
@@ -4513,7 +4715,7 @@ def test_editor_context_menu_with_emoji_prefix_replaces_accurately(
         suggestion_action = next(a for a in menu.actions() if a.text() == "correto")
         suggestion_action.trigger()
 
-        assert window.last_message_editor.toPlainText() == "🚀🎉 correto ok"
+        assert window.editor.toPlainText() == "🚀🎉 correto ok"
 
     window.close()
 
@@ -4529,25 +4731,25 @@ def test_editor_context_menu_skips_spellcheck_actions_during_review_and_readonly
         qapp,
         spell_checker=checker,
     )
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
 
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
-    pos = window.last_message_editor.cursorRect(cursor).center()
+    window.editor.setTextCursor(cursor)
+    pos = window.editor.cursorRect(cursor).center()
 
     captured_menus: list[QMenu] = []
-    orig_create = window.last_message_editor.createStandardContextMenu
+    orig_create = window.editor.createStandardContextMenu
 
     def intercepted_create(*args, **kwargs):
         m = orig_create(*args, **kwargs)
         if m is None:
-            m = QMenu(window.last_message_editor)
+            m = QMenu(window.editor)
         m.exec = lambda *a, **kw: captured_menus.append(m)
         m.exec_ = lambda *a, **kw: captured_menus.append(m)
         return m
 
-    monkeypatch.setattr(window.last_message_editor, "createStandardContextMenu", intercepted_create)
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", intercepted_create)
 
     # 1. Durante _is_reviewing: sem sugestões nem ação de ignorar
     window._is_reviewing = True
@@ -4559,7 +4761,7 @@ def test_editor_context_menu_skips_spellcheck_actions_during_review_and_readonly
 
     # 2. Quando editor isReadOnly(): sem sugestões nem ação de ignorar
     window._is_reviewing = False
-    window.last_message_editor.setReadOnly(True)
+    window.editor.setReadOnly(True)
     captured_menus.clear()
     window._show_editor_context_menu(pos)
     assert len(captured_menus) == 1
@@ -4568,7 +4770,7 @@ def test_editor_context_menu_skips_spellcheck_actions_during_review_and_readonly
     assert 'Ignorar "errado"' not in actions_during_readonly
 
     # 3. Em estado normal editável: sugestões e ignorar presentes
-    window.last_message_editor.setReadOnly(False)
+    window.editor.setReadOnly(False)
     captured_menus.clear()
     window._show_editor_context_menu(pos)
     assert len(captured_menus) == 1
@@ -4591,27 +4793,27 @@ def test_editor_context_menu_at_token_end_boundary_has_no_spellcheck_actions(
         qapp,
         spell_checker=checker,
     )
-    window.last_message_editor.setPlainText("palavra errado, aqui")
+    window.editor.setPlainText("palavra errado, aqui")
 
     captured_menus: list[QMenu] = []
-    orig_create = window.last_message_editor.createStandardContextMenu
+    orig_create = window.editor.createStandardContextMenu
 
     def intercepted_create(*args, **kwargs):
         m = orig_create(*args, **kwargs)
         if m is None:
-            m = QMenu(window.last_message_editor)
+            m = QMenu(window.editor)
         m.exec = lambda *a, **kw: captured_menus.append(m)
         m.exec_ = lambda *a, **kw: captured_menus.append(m)
         return m
 
-    monkeypatch.setattr(window.last_message_editor, "createStandardContextMenu", intercepted_create)
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", intercepted_create)
 
     # Token "errado" vai do índice 8 ao 14.
     # 1. Posição 13 (dentro de "errado"): deve conter sugestões e opção "Ignorar"
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(13)
-    window.last_message_editor.setTextCursor(cursor)
-    pos_inside = window.last_message_editor.cursorRect(cursor).center()
+    window.editor.setTextCursor(cursor)
+    pos_inside = window.editor.cursorRect(cursor).center()
     window._show_editor_context_menu(pos_inside)
     assert len(captured_menus) == 1
     actions_inside = [a.text() for a in captured_menus[0].actions()]
@@ -4621,8 +4823,8 @@ def test_editor_context_menu_at_token_end_boundary_has_no_spellcheck_actions(
     # 2. Posição 14 (exatamente em token_end, sobre a vírgula ','): não deve conter ações de spellcheck
     captured_menus.clear()
     cursor.setPosition(14)
-    window.last_message_editor.setTextCursor(cursor)
-    pos_at_comma = window.last_message_editor.cursorRect(cursor).center()
+    window.editor.setTextCursor(cursor)
+    pos_at_comma = window.editor.cursorRect(cursor).center()
     window._show_editor_context_menu(pos_at_comma)
     assert len(captured_menus) == 1
     actions_at_comma = [a.text() for a in captured_menus[0].actions()]
@@ -4630,11 +4832,11 @@ def test_editor_context_menu_at_token_end_boundary_has_no_spellcheck_actions(
     assert 'Ignorar "errado"' not in actions_at_comma
 
     # 3. Posição 14 em texto com espaço logo após token_end ("palavra errado aqui"): não deve conter ações
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
     captured_menus.clear()
     cursor.setPosition(14)  # sobre o caractere de espaço após "errado"
-    window.last_message_editor.setTextCursor(cursor)
-    pos_at_space = window.last_message_editor.cursorRect(cursor).center()
+    window.editor.setTextCursor(cursor)
+    pos_at_space = window.editor.cursorRect(cursor).center()
     window._show_editor_context_menu(pos_at_space)
     assert len(captured_menus) == 1
     actions_at_space = [a.text() for a in captured_menus[0].actions()]
@@ -4658,9 +4860,9 @@ def test_editor_context_menu_does_not_leak_qmenu_on_repeated_invocations(
         local_store=store,
         spell_checker=checker,
     )
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
 
-    orig_create = window.last_message_editor.createStandardContextMenu
+    orig_create = window.editor.createStandardContextMenu
 
     def non_blocking_create(*args, **kwargs):
         m = orig_create(*args, **kwargs)
@@ -4669,25 +4871,24 @@ def test_editor_context_menu_does_not_leak_qmenu_on_repeated_invocations(
             m.exec_ = lambda *a, **kw: None
         return m
 
-    monkeypatch.setattr(window.last_message_editor, "createStandardContextMenu", non_blocking_create)
+    monkeypatch.setattr(window.editor, "createStandardContextMenu", non_blocking_create)
 
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
-    pos = window.last_message_editor.cursorRect(cursor).center()
+    window.editor.setTextCursor(cursor)
+    pos = window.editor.cursorRect(cursor).center()
 
     # Abre o menu repetidas vezes
     for _ in range(5):
         window._show_editor_context_menu(pos)
 
     # Processa os eventos DeferredDelete postados por deleteLater()
-    for child in window.last_message_editor.findChildren(QMenu):
+    for child in window.editor.findChildren(QMenu):
         QApplication.sendPostedEvents(child, QEvent.Type.DeferredDelete)
 
-    # Nenhum QMenu deve permanecer retido como filho de self.last_message_editor
-    assert len(window.last_message_editor.findChildren(QMenu)) == 0
+    # Nenhum QMenu deve permanecer retido como filho de self.editor
+    assert len(window.editor.findChildren(QMenu)) == 0
     window.close()
-
 
 def test_spell_popup_visible_on_cursor_in_misspelled_word_and_hidden_on_valid_or_space(
     qapp,
@@ -4698,15 +4899,15 @@ def test_spell_popup_visible_on_cursor_in_misspelled_word_and_hidden_on_valid_or
         suggestions={"errado": ["correto", "erado"]},
     )
     window, _ = make_window(qapp, spell_checker=checker)
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
     qapp.processEvents()
 
     assert window._spell_popup.isVisible() is False
 
     # 1. Cursor posicionado dentro de "errado" (posição 10)
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
 
     assert window._spell_popup.isVisible() is True
@@ -4717,22 +4918,26 @@ def test_spell_popup_visible_on_cursor_in_misspelled_word_and_hidden_on_valid_or
 
     # 2. Cursor movido para palavra válida "palavra" (posição 2)
     cursor.setPosition(2)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is False
 
     # 3. Cursor movido de volta para "errado" (posição 11)
     cursor.setPosition(11)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is True
 
     # 4. Cursor movido para o espaço após "errado" (posição 14)
     cursor.setPosition(14)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is False
 
+    # 5. Backup ser preenchido não dispara popup
+    window.last_message_editor.setPlainText("errado")
+    qapp.processEvents()
+    assert window._spell_popup.isVisible() is False
     window.close()
 
 
@@ -4743,11 +4948,11 @@ def test_spell_popup_click_suggestion_replaces_word(qapp) -> None:
         suggestions={"errado": ["correto"]},
     )
     window, _ = make_window(qapp, spell_checker=checker)
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
 
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
 
     assert window._spell_popup.isVisible() is True
@@ -4759,14 +4964,13 @@ def test_spell_popup_click_suggestion_replaces_word(qapp) -> None:
     QTest.mouseClick(chip, Qt.MouseButton.LeftButton)
     qapp.processEvents()
 
-    assert window.last_message_editor.toPlainText() == "palavra correto aqui"
+    assert window.editor.toPlainText() == "palavra correto aqui"
     assert window._spell_popup.isVisible() is False
-    assert window.last_message_editor.hasFocus() is True
+    assert window.editor.hasFocus() is True
 
     # Testa histórico de desfazer (Undo)
-    window.last_message_editor.undo()
-    assert window.last_message_editor.toPlainText() == "palavra errado aqui"
-
+    window.editor.undo()
+    assert window.editor.toPlainText() == "palavra errado aqui"
     window.close()
 
 
@@ -4778,11 +4982,11 @@ def test_spell_popup_click_ignore_adds_to_ignored_and_rehighlights(qapp) -> None
         suggestions={"errado": ["correto"]},
     )
     window, _ = make_window(qapp, local_store=store, spell_checker=checker)
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
 
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
 
     assert window._spell_popup.isVisible() is True
@@ -4795,16 +4999,15 @@ def test_spell_popup_click_ignore_adds_to_ignored_and_rehighlights(qapp) -> None
     qapp.processEvents()
 
     assert window._spell_popup.isVisible() is False
-    assert window.last_message_editor.hasFocus() is True
+    assert window.editor.hasFocus() is True
     assert checker.is_ignored("errado") is True
     assert "errado" in store.get_spellcheck_ignored_words()
 
     # Ao mover o cursor novamente para a palavra ignorada, o popup não abre
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is False
-
     window.close()
 
 
@@ -4815,11 +5018,11 @@ def test_spell_popup_hover_trigger_after_timer(qapp) -> None:
         suggestions={"errado": ["correto"]},
     )
     window, _ = make_window(qapp, spell_checker=checker)
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
 
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)
-    pos_errado = window.last_message_editor.cursorRect(cursor).center()
+    pos_errado = window.editor.cursorRect(cursor).center()
 
     # Simula hover do mouse sobre "errado"
     hover_event = QMouseEvent(
@@ -4830,7 +5033,7 @@ def test_spell_popup_hover_trigger_after_timer(qapp) -> None:
         Qt.MouseButton.NoButton,
         Qt.KeyboardModifier.NoModifier,
     )
-    window.eventFilter(window.last_message_editor.viewport(), hover_event)
+    window.eventFilter(window.editor.viewport(), hover_event)
 
     assert window._hover_spell_timer.isActive() is True
     assert window._last_hover_pos == pos_errado
@@ -4853,32 +5056,31 @@ def test_spell_popup_suppressed_during_review_and_readonly(qapp) -> None:
         suggestions={"errado": ["correto"]},
     )
     window, _ = make_window(qapp, spell_checker=checker)
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
 
     # 1. Durante revisão com IA
     window._is_reviewing = True
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is False
 
     # 2. Modo somente leitura
     window._is_reviewing = False
-    window.last_message_editor.setReadOnly(True)
+    window.editor.setReadOnly(True)
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is False
 
     # 3. Corretor desabilitado no highlighter
-    window.last_message_editor.setReadOnly(False)
+    window.editor.setReadOnly(False)
     window.highlighter.enabled = False
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is False
-
     window.close()
 
 
@@ -4889,12 +5091,12 @@ def test_spell_popup_automatic_dismissal_events(qapp) -> None:
         suggestions={"errado": ["correto"]},
     )
     window, _ = make_window(qapp, spell_checker=checker)
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
 
     # Abre o balão
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is True
 
@@ -4902,19 +5104,19 @@ def test_spell_popup_automatic_dismissal_events(qapp) -> None:
     key_event = QKeyEvent(
         QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier
     )
-    consumed = window.eventFilter(window.last_message_editor, key_event)
+    consumed = window.eventFilter(window.editor, key_event)
     assert consumed is True
     assert window._spell_popup.isVisible() is False
 
     # Abre novamente
     cursor.setPosition(11)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is True
 
     # 2. Evento Leave no viewport inicia timer de tolerância e timeout fecha o popup
     leave_event = QEvent(QEvent.Type.Leave)
-    window.eventFilter(window.last_message_editor.viewport(), leave_event)
+    window.eventFilter(window.editor.viewport(), leave_event)
     assert window._popup_dismiss_timer.isActive() is True
     assert window._spell_popup.isVisible() is True
     QCursor.setPos(QPoint(0, 0))
@@ -4923,18 +5125,18 @@ def test_spell_popup_automatic_dismissal_events(qapp) -> None:
     assert window._spell_popup.isVisible() is False
     # Abre novamente
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is True
 
     # 3. Evento Wheel fecha o popup
     wheel_event = QEvent(QEvent.Type.Wheel)
-    window.eventFilter(window.last_message_editor.viewport(), wheel_event)
+    window.eventFilter(window.editor.viewport(), wheel_event)
     assert window._spell_popup.isVisible() is False
 
     # Abre novamente
     cursor.setPosition(11)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is True
 
@@ -4945,7 +5147,7 @@ def test_spell_popup_automatic_dismissal_events(qapp) -> None:
 
     # Abre novamente
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is True
     # 5. Movimentação da janela fecha o popup
@@ -4962,11 +5164,11 @@ def test_spell_popup_no_suggestions_displays_label(qapp) -> None:
         suggestions={"xyz": []},
     )
     window, _ = make_window(qapp, spell_checker=checker)
-    window.last_message_editor.setPlainText("xyz")
+    window.editor.setPlainText("xyz")
 
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(1)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
 
     assert window._spell_popup.isVisible() is True
@@ -4985,10 +5187,10 @@ def test_spell_popup_cleaned_up_on_close(qapp) -> None:
         suggestions={"errado": ["correto"]},
     )
     window, _ = make_window(qapp, spell_checker=checker)
-    window.last_message_editor.setPlainText("errado")
-    cursor = window.last_message_editor.textCursor()
+    window.editor.setPlainText("errado")
+    cursor = window.editor.textCursor()
     cursor.setPosition(2)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup is not None
     assert window._spell_popup.isVisible() is True
@@ -5004,18 +5206,18 @@ def test_spell_popup_pointer_transition_and_hover_tolerance(qapp) -> None:
         suggestions={"errado": ["correto"]},
     )
     window, _ = make_window(qapp, spell_checker=checker)
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
 
     # Posiciona no token com erro para abrir popup
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is True
 
     # 1. Ponteiro sai do viewport em direção ao popup: timer de 200ms inicia, popup permanece visível
     leave_vp = QEvent(QEvent.Type.Leave)
-    window.eventFilter(window.last_message_editor.viewport(), leave_vp)
+    window.eventFilter(window.editor.viewport(), leave_vp)
     assert window._popup_dismiss_timer.isActive() is True
     assert window._spell_popup.isVisible() is True
 
@@ -5043,18 +5245,16 @@ def test_spell_popup_pointer_transition_and_hover_tolerance(qapp) -> None:
     assert window._spell_popup.isVisible() is False
     # 6. Se o dismiss timer disparar quando o mouse não estiver no popup, popup fecha
     cursor.setPosition(11)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is True
-    window.eventFilter(window.last_message_editor.viewport(), leave_vp)
+    window.eventFilter(window.editor.viewport(), leave_vp)
     assert window._popup_dismiss_timer.isActive() is True
     window._is_mouse_over_popup = False
     QCursor.setPos(QPoint(0, 0))
     window._on_popup_dismiss_timer_timeout()
     assert window._spell_popup.isVisible() is False
-
     window.close()
-
 
 def test_spell_popup_screen_edge_clamping_and_above_positioning(qapp) -> None:
     checker = FakeSpellChecker(
@@ -5112,31 +5312,29 @@ def test_spell_popup_dismissed_on_scrollbar_scroll(qapp) -> None:
         suggestions={"errado": ["correto"]},
     )
     window, _ = make_window(qapp, spell_checker=checker)
-    window.last_message_editor.setPlainText("palavra errado aqui")
+    window.editor.setPlainText("palavra errado aqui")
 
     # Abre o popup
-    cursor = window.last_message_editor.textCursor()
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is True
 
     # 1. Rolagem da barra vertical fecha o popup
-    window.last_message_editor.verticalScrollBar().valueChanged.emit(10)
+    window.editor.verticalScrollBar().valueChanged.emit(10)
     assert window._spell_popup.isVisible() is False
 
     # Abre novamente
     cursor.setPosition(11)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is True
 
     # 2. Rolagem da barra horizontal fecha o popup
-    window.last_message_editor.horizontalScrollBar().valueChanged.emit(5)
+    window.editor.horizontalScrollBar().valueChanged.emit(5)
     assert window._spell_popup.isVisible() is False
-
     window.close()
-
 def test_usable_cleanup_error_enters_audio_ready_and_can_be_sent(qapp) -> None:
     capture = make_capture(b"usable-audio-pcm-cleanup-error")
     recorder = FakeRecorder(
@@ -5165,8 +5363,8 @@ def test_usable_cleanup_error_enters_audio_ready_and_can_be_sent(qapp) -> None:
     window._send_pending_audio()
     wait_for_worker(qapp, window)
     assert transcriber.calls == [capture.wav_bytes]
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "synthetic transcript"
+    assert window.editor.toPlainText() == "synthetic transcript"
+    assert window.last_message_editor.toPlainText() == ""
     window.close()
 
 
@@ -5501,8 +5699,8 @@ def test_transcription_failure_preserves_capture_and_allows_byte_identical_retry
     wait_for_worker(qapp, window)
 
     assert window.state is AppState.READY
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "sucesso na segunda tentativa"
+    assert window.editor.toPlainText() == "sucesso na segunda tentativa"
+    assert window.last_message_editor.toPlainText() == ""
     assert len(transcriber.calls) == 2
     assert transcriber.calls[0] == transcriber.calls[1] == capture.wav_bytes
     window.close()
@@ -5594,8 +5792,8 @@ def test_transcription_failure_teardown_race_blocks_retry_until_thread_finished(
     assert window._thread is None
     assert window._worker is None
     assert window.state is AppState.READY
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "sucesso na segunda tentativa"
+    assert window.editor.toPlainText() == "sucesso na segunda tentativa"
+    assert window.last_message_editor.toPlainText() == ""
     assert len(transcriber.calls) == 2
     assert transcriber.calls[0] == transcriber.calls[1] == capture.wav_bytes
     window.close()
@@ -5648,10 +5846,9 @@ def test_three_global_activations_start_stop_send_and_no_network_after_stop(qapp
     assert window.state is AppState.READY
     assert raises == ["raise"]  # Still only 1 raise from stop
     assert transcriber.calls == [recorder.capture.wav_bytes]
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "Texto transcrito com sucesso"
-    assert QApplication.clipboard().text() == "Texto transcrito com sucesso"
-    assert window.status_label.text() == "Texto copiado e movido para Última mensagem."
+    assert window.editor.toPlainText() == "Texto transcrito com sucesso"
+    assert window.last_message_editor.toPlainText() == ""
+    assert "Transcrição pronta" in window.status_label.text()
 
     window.close()
 
@@ -5705,20 +5902,20 @@ def test_space_shortcut_inserts_in_text_inputs_and_triggers_primary_outside(qapp
     window.show()
     qapp.processEvents()
 
-    # 1. Focus in transcription_editor -> Space inserts a space character and does NOT toggle recording
-    window.transcription_editor.setFocus()
-    assert window.transcription_editor.hasFocus() is True
-    window.transcription_editor.setPlainText("hello")
-    cursor = window.transcription_editor.textCursor()
+    # 1. Focus in editor -> Space inserts a space character and does NOT toggle recording
+    window.editor.setFocus()
+    assert window.editor.hasFocus() is True
+    window.editor.setPlainText("hello")
+    cursor = window.editor.textCursor()
     cursor.movePosition(QTextCursor.MoveOperation.End)
-    window.transcription_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
 
-    QTest.keyClick(window.transcription_editor, Qt.Key.Key_Space)
+    QTest.keyClick(window.editor, Qt.Key.Key_Space)
     qapp.processEvents()
     assert window.state is AppState.IDLE
-    assert window.transcription_editor.toPlainText() == "hello "
+    assert window.editor.toPlainText() == "hello "
 
-    # 2. Focus in last_message_editor -> Space inserts a space character and does NOT toggle recording
+    # 2. Focus in last_message_editor -> Space does NOT toggle recording
     window.last_message_editor.setFocus()
     assert window.last_message_editor.hasFocus() is True
     window.last_message_editor.setPlainText("world")
@@ -5729,7 +5926,7 @@ def test_space_shortcut_inserts_in_text_inputs_and_triggers_primary_outside(qapp
     QTest.keyClick(window.last_message_editor, Qt.Key.Key_Space)
     qapp.processEvents()
     assert window.state is AppState.IDLE
-    assert window.last_message_editor.toPlainText() == "world "
+    assert window.last_message_editor.toPlainText() == "world"
 
     # 3. Focus in real API-key QLineEdit (without caller-installed event filter) -> Space inserts a space
     api_dialog, key_input = window._create_api_key_dialog()
@@ -5777,9 +5974,10 @@ def test_space_shortcut_inserts_in_text_inputs_and_triggers_primary_outside(qapp
 
     window.close()
 
-def test_current_nonblank_blocks_audio_send_with_exact_status_and_preserves_wav(qapp) -> None:
+
+def test_send_audio_in_audio_ready_transcribes_and_places_text_in_editor(qapp) -> None:
     capture = make_capture(b"test_nonblank_wav")
-    transcriber = FakeTranscriber()
+    transcriber = FakeTranscriber(text="Texto transcrito com sucesso")
     window, _ = make_window(
         qapp,
         settings=Settings(api_key="active-token"),
@@ -5793,25 +5991,20 @@ def test_current_nonblank_blocks_audio_send_with_exact_status_and_preserves_wav(
     assert window.state is AppState.AUDIO_READY
     assert window._pending_capture is capture
 
-    # 2. Current transcription contains nonblank text
-    window.transcription_editor.setPlainText("Texto não arquivado")
-
-    # 3. Attempt to send -> blocked, WAV preserved, exact status
+    # 2. Enviar para Gemini
     window._send_pending_audio()
-    assert window.state is AppState.AUDIO_READY
-    assert window._pending_capture is capture
-    assert transcriber.calls == []
-    assert window.status_label.text() == "Copie e arquive a transcrição atual antes de enviar outro áudio."
+    assert window.state is AppState.TRANSCRIBING
+    wait_for_worker(qapp, window)
 
-    # 4. User copies and archives current text
-    window.copy_and_archive_button.click()
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "Texto não arquivado"
+    assert window.state is AppState.READY
+    assert window.editor.toPlainText() == "Texto transcrito com sucesso"
+    assert window.last_message_editor.toPlainText() == ""
+    assert transcriber.calls == [capture.wav_bytes]
 
     window.close()
 
 
-def test_automatic_clipboard_and_archive_flow(qapp) -> None:
+def test_automatic_clipboard_and_clear_flow(qapp) -> None:
     transcriber = FakeTranscriber(text="Mensagem 1")
     recorder = FakeRecorder(capture=make_capture(b"wav_1"))
     window, _ = make_window(
@@ -5828,25 +6021,14 @@ def test_automatic_clipboard_and_archive_flow(qapp) -> None:
     wait_for_worker(qapp, window)
 
     assert window.state is AppState.READY
-    assert window.transcription_editor.toPlainText() == ""
+    assert window.editor.toPlainText() == "Mensagem 1"
+    assert window.last_message_editor.toPlainText() == ""
+
+    # 2. Clear text moves to last_message_editor and clears editor
+    window.clear_button.click()
+    assert window.editor.toPlainText() == ""
     assert window.last_message_editor.toPlainText() == "Mensagem 1"
-    assert QApplication.clipboard().text() == "Mensagem 1"
-    assert window._pending_capture is None
-    assert not window.last_message_editor.textCursor().hasSelection()
-    assert window.status_label.text() == "Texto copiado e movido para Última mensagem."
-
-    # 2. Record and send message 2 -> overwrites single in-memory last message
-    transcriber.text = "Mensagem 2"
-    recorder.capture = make_capture(b"wav_2")
-    window._start_recording()
-    window._finish_recording()
-    window._send_pending_audio()
-    wait_for_worker(qapp, window)
-
-    assert window.state is AppState.READY
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "Mensagem 2"
-    assert QApplication.clipboard().text() == "Mensagem 2"
+    assert window.status_label.text() == "Texto apagado; cópia mantida na última mensagem."
 
     window.close()
 
@@ -5860,38 +6042,34 @@ def test_per_block_actions_affect_only_intended_editor(qapp) -> None:
         terminal=terminal,
     )
 
-    window.transcription_editor.setPlainText("Texto no bloco atual")
+    window.editor.setPlainText("Texto no bloco atual")
     window.last_message_editor.setPlainText("Texto no bloco anterior")
     window.state = AppState.READY
     window._update_actions()
 
-    assert window.copy_and_archive_button.isEnabled() is True
-    assert window.copy_last_button.isEnabled() is True
-    assert window.clear_last_button.isEnabled() is True
+    assert window.copy_button.isEnabled() is True
+    assert window.clear_button.isEnabled() is True
     assert window.terminal_button.isEnabled() is True
+    assert window.review_button.isEnabled() is True
 
-    # 1. Copy last message copies only last_message_editor
+    # 1. Copy copies only editor
     QApplication.clipboard().clear()
-    window.copy_last_button.click()
-    assert QApplication.clipboard().text() == "Texto no bloco anterior"
-    assert window.transcription_editor.toPlainText() == "Texto no bloco atual"
-
-    # 2. Clear last message clears only last_message_editor
-    window.clear_last_button.click()
-    assert window.last_message_editor.toPlainText() == ""
-    assert window.transcription_editor.toPlainText() == "Texto no bloco atual"
-    assert window.state is AppState.IDLE
-
-    # 3. Copy and archive moves current to last and clears current
-    window.copy_and_archive_button.click()
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "Texto no bloco atual"
+    window.copy_button.click()
     assert QApplication.clipboard().text() == "Texto no bloco atual"
-    assert window.state is AppState.READY
+    assert window.editor.toPlainText() == "Texto no bloco atual"
 
-    # 4. Terminal send uses only last_message_editor
+    # 2. Terminal send uses only editor
     window.send_to_terminal()
     assert terminal.send_calls == [("Texto no bloco atual", None)]
+
+    # 3. Clear moves editor text to last_message_editor
+    window.clear_button.click()
+    assert window.editor.toPlainText() == ""
+    assert window.last_message_editor.toPlainText() == "Texto no bloco atual"
+    assert window.state is AppState.IDLE
+    assert not window.copy_button.isEnabled()
+    assert not window.clear_button.isEnabled()
+    assert not window.terminal_button.isEnabled()
 
     window.close()
 
@@ -5906,27 +6084,27 @@ def test_proofreading_exact_whitespace_and_one_step_undo(qapp) -> None:
         transcriber=transcriber,
     )
 
-    window.last_message_editor.setPlainText(original_text)
+    window.editor.setPlainText(original_text)
     assert window.review_button.isEnabled() is True
 
     # 1. Proofreading sends untrimmed original text
     window.review_button.click()
     assert window._is_reviewing is True
-    assert window.last_message_editor.isReadOnly() is True
+    assert window.editor.isReadOnly() is True
 
     wait_for_proofreading_worker(qapp, window)
     assert transcriber.proofread_calls == [original_text]
 
     # 2. Success replaces document, auto-copies to clipboard, sets cursor at end
-    assert window.last_message_editor.toPlainText() == revised_text
+    assert window.editor.toPlainText() == revised_text
     assert QApplication.clipboard().text() == revised_text
     assert window.status_label.text() == "Texto revisado e copiado."
-    assert not window.last_message_editor.textCursor().hasSelection()
-    assert window.last_message_editor.isReadOnly() is False
+    assert not window.editor.textCursor().hasSelection()
+    assert window.editor.isReadOnly() is False
 
     # 3. One single Undo restores exact byte-for-byte original
-    window.last_message_editor.document().undo()
-    assert window.last_message_editor.toPlainText() == original_text
+    window.editor.document().undo()
+    assert window.editor.toPlainText() == original_text
 
     window.close()
 
@@ -5973,45 +6151,49 @@ def test_playback_toggle_and_resource_safety(qapp) -> None:
 
 def test_no_legacy_aliases(qapp) -> None:
     window, _ = make_window(qapp)
-    assert not hasattr(window, "editor")
-    assert not hasattr(window, "send_to_gemini_button")
-    assert not hasattr(window, "copy_button")
-    assert not hasattr(window, "clear_text_button")
-    assert not hasattr(window, "_toggle_recording")
-    assert hasattr(window, "transcription_editor")
+    assert hasattr(window, "editor")
+    assert not hasattr(window, "transcription_editor")
     assert hasattr(window, "last_message_editor")
+    assert window.last_message_editor.isReadOnly() is True
+    assert window.last_message_editor.placeholderText() == "A mensagem apagada mais recentemente aparecerá aqui."
     assert hasattr(window, "record_button")
     assert hasattr(window, "record_again_button")
     assert hasattr(window, "play_audio_button")
-    assert hasattr(window, "copy_and_archive_button")
-    assert hasattr(window, "copy_last_button")
-    assert hasattr(window, "clear_last_button")
+    assert hasattr(window, "copy_button")
+    assert not hasattr(window, "copy_last_button")
+    assert not hasattr(window, "copy_and_archive_button")
+    assert hasattr(window, "clear_button")
+    assert not hasattr(window, "clear_last_button")
+    assert not hasattr(window, "copy_last_message")
+    assert not hasattr(window, "clear_last_message")
     assert hasattr(window, "terminal_button")
     assert hasattr(window, "review_button")
     window.close()
 
-def test_spelling_operates_only_on_last_message_editor(qapp) -> None:
+
+def test_spelling_operates_on_editor_and_last_message_is_readonly(qapp) -> None:
     checker = FakeSpellChecker(
         available=True,
         valid_words=("palavra", "aqui"),
     )
     window, _ = make_window(qapp, spell_checker=checker)
 
-    # 1. Misspelled word in last_message_editor triggers popup
-    window.last_message_editor.setPlainText("palavra errado aqui")
-    cursor = window.last_message_editor.textCursor()
+    # 1. Misspelled word in editor triggers popup
+    window.editor.setPlainText("palavra errado aqui")
+    cursor = window.editor.textCursor()
     cursor.setPosition(10)
-    window.last_message_editor.setTextCursor(cursor)
+    window.editor.setTextCursor(cursor)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is True
 
-    # 2. Typing in transcription_editor does not use spell popup
-    window.last_message_editor.clear()
+    # 2. last_message_editor is read-only and does not use spell popup
+    window.editor.clear()
     window._hide_spell_popup()
-    window.transcription_editor.setPlainText("palavra errado aqui")
-    cursor_trans = window.transcription_editor.textCursor()
-    cursor_trans.setPosition(10)
-    window.transcription_editor.setTextCursor(cursor_trans)
+    assert window.last_message_editor.isReadOnly() is True
+    window.last_message_editor.setPlainText("palavra errado aqui")
+    cursor_last = window.last_message_editor.textCursor()
+    cursor_last.setPosition(10)
+    window.last_message_editor.setTextCursor(cursor_last)
     qapp.processEvents()
     assert window._spell_popup.isVisible() is False
 
@@ -6048,7 +6230,8 @@ def test_focus_if_workflow_active_conditions(qapp) -> None:
 
     window.close()
 
-def test_manual_archive_during_audio_ready_preserves_capture_and_state(qapp) -> None:
+
+def test_clear_during_audio_ready_preserves_capture_and_state(qapp) -> None:
     capture = make_capture(b"preserved_audio_ready_pcm")
     transcriber = FakeTranscriber(text="Texto transcrito do audio preservado")
     recorder = FakeRecorder(capture=capture)
@@ -6065,14 +6248,13 @@ def test_manual_archive_during_audio_ready_preserves_capture_and_state(qapp) -> 
     assert window.state is AppState.AUDIO_READY
     assert window._pending_capture is capture
 
-    # 2. Put text in transcription_editor
-    window.transcription_editor.setPlainText("Texto rascunho anterior")
+    # 2. Put text in editor
+    window.editor.setPlainText("Texto rascunho anterior")
 
-    # 3. User clicks manual "Copiar e arquivar" while in AUDIO_READY
-    window.copy_and_archive_button.click()
-    assert QApplication.clipboard().text() == "Texto rascunho anterior"
+    # 3. User clicks "Apagar" while in AUDIO_READY
+    window.clear_button.click()
     assert window.last_message_editor.toPlainText() == "Texto rascunho anterior"
-    assert window.transcription_editor.toPlainText() == ""
+    assert window.editor.toPlainText() == ""
 
     # State MUST remain AUDIO_READY and pending capture MUST be preserved!
     assert window.state is AppState.AUDIO_READY
@@ -6084,15 +6266,14 @@ def test_manual_archive_during_audio_ready_preserves_capture_and_state(qapp) -> 
     wait_for_worker(qapp, window)
 
     assert window.state is AppState.READY
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "Texto transcrito do audio preservado"
-    assert QApplication.clipboard().text() == "Texto transcrito do audio preservado"
+    assert window.editor.toPlainText() == "Texto transcrito do audio preservado"
+    assert window.last_message_editor.toPlainText() == "Texto rascunho anterior"
     assert window._pending_capture is None
 
     window.close()
 
 
-def test_manual_archive_during_recording_preserves_recording_state_and_stream(qapp) -> None:
+def test_clear_during_recording_preserves_recording_state_and_stream(qapp) -> None:
     capture = make_capture(b"recording_capture_pcm")
     recorder = FakeRecorder(capture=capture)
     window, _ = make_window(
@@ -6107,14 +6288,14 @@ def test_manual_archive_during_recording_preserves_recording_state_and_stream(qa
     assert window.state is AppState.RECORDING
     assert recorder.recording is True
 
-    # 2. Put text in transcription_editor
-    window.transcription_editor.setPlainText("Texto rascunho durante gravacao")
+    # 2. Put text in editor
+    window.editor.setPlainText("Texto rascunho durante gravacao")
 
-    # 3. User clicks manual "Copiar e arquivar" while RECORDING
-    window.copy_and_archive_button.click()
-    assert QApplication.clipboard().text() == "Texto rascunho durante gravacao"
+    # 3. User clears editor while RECORDING
+    assert window.clear_button.isEnabled() is False
+    window.clear_text()
     assert window.last_message_editor.toPlainText() == "Texto rascunho durante gravacao"
-    assert window.transcription_editor.toPlainText() == ""
+    assert window.editor.toPlainText() == ""
 
     # State MUST remain RECORDING and stream MUST still be recording!
     assert window.state is AppState.RECORDING
@@ -6180,7 +6361,7 @@ def test_debounce_exact_boundary_and_reject(qapp, monkeypatch) -> None:
     window.close()
 
 
-def test_debounce_blocked_send_by_nonblank_text_does_not_consume_debounce(
+def test_debounce_in_audio_ready_advances_to_transcribing_immediately(
     qapp, monkeypatch
 ) -> None:
     bridge = FakeInputShortcutBridge()
@@ -6202,29 +6383,14 @@ def test_debounce_blocked_send_by_nonblank_text_does_not_consume_debounce(
     window._finish_recording()
     assert window.state is AppState.AUDIO_READY
 
-    # 2. Current editor has nonblank text
-    window.transcription_editor.setPlainText("texto não arquivado")
-
-    # 3. Global shortcut arrives at t=50.00 -> send blocked by nonblank text, debounce timestamp NOT consumed
+    # 2. Global shortcut arrives at t=50.00 -> advances to transcribing
     current_time = 50.00
-    bridge.mouse_activated.emit(bridge.mouse_generation, "x1")
-    assert window.state is AppState.AUDIO_READY
-    assert "Copie e arquive a transcrição atual antes de enviar outro áudio." in window.status_label.text()
-
-    # 4. User archives current text
-    window._copy_and_archive_current_transcription()
-    assert window.transcription_editor.toPlainText() == ""
-    assert window.last_message_editor.toPlainText() == "texto não arquivado"
-    assert window.state is AppState.AUDIO_READY
-
-    # 5. Global shortcut arrives at t=50.10 (only 0.10s after blocked attempt at 50.00).
-    # Because the blocked attempt did NOT consume debounce, this send is ACCEPTED immediately!
-    current_time = 50.10
     bridge.mouse_activated.emit(bridge.mouse_generation, "x1")
     assert window.state is AppState.TRANSCRIBING
     wait_for_worker(qapp, window)
     assert window.state is AppState.READY
-    assert window.last_message_editor.toPlainText() == "Texto transcrito apos desbloqueio"
+    assert window.editor.toPlainText() == "Texto transcrito apos desbloqueio"
+    assert window.last_message_editor.toPlainText() == ""
 
     window.close()
 
@@ -6273,7 +6439,6 @@ def test_debounce_no_op_during_transcribing_proofreading_closing_or_teardown_doe
     assert window.state is AppState.RECORDING
 
     window.close()
-
 
 def test_global_stop_from_initially_inactive_window_raises_and_focuses_play(
     qapp, monkeypatch
@@ -6798,11 +6963,13 @@ def test_media_generations_isolate_stale_callbacks_and_prevent_corruption(qapp) 
     assert window.state is AppState.TRANSCRIBING
     wait_for_worker(qapp, window)
     assert window.state is AppState.READY
-    assert window.status_label.text() == "Texto copiado e movido para Última mensagem."
+    assert window.status_label.text() == "Transcrição pronta. Revise, copie ou envie ao terminal."
+    assert window.editor.toPlainText() == "Texto final de teste de geracao"
+    assert window.last_message_editor.toPlainText() == ""
 
     # 8. Delayed callbacks from all 3 adapters arriving in READY must NOT overwrite status, state, or focus
     # Focus distinct sentinel widget before stale callbacks in READY
-    sentinel2 = window.transcription_editor
+    sentinel2 = window.editor
     sentinel2.setFocus()
     assert QApplication.focusWidget() is sentinel2
 
@@ -6814,7 +6981,7 @@ def test_media_generations_isolate_stale_callbacks_and_prevent_corruption(qapp) 
     assert QApplication.focusWidget() is sentinel2
     gen1_error_adapter(None, "erro tardio em READY")
     assert QApplication.focusWidget() is sentinel2
-    assert window.status_label.text() == "Texto copiado e movido para Última mensagem."
+    assert window.status_label.text() == "Transcrição pronta. Revise, copie ou envie ao terminal."
     assert window.state is AppState.READY
     assert window._audio_buffer is None
     assert window._is_playing_audio is False
@@ -6825,7 +6992,7 @@ def test_media_generations_isolate_stale_callbacks_and_prevent_corruption(qapp) 
     assert QApplication.focusWidget() is sentinel2
     media_player.errorOccurred.emit(object(), "erro em READY")
     assert QApplication.focusWidget() is sentinel2
-    assert window.status_label.text() == "Texto copiado e movido para Última mensagem."
+    assert window.status_label.text() == "Transcrição pronta. Revise, copie ou envie ao terminal."
     assert window.state is AppState.READY
     assert window._audio_buffer is None
     assert window._is_playing_audio is False
@@ -6982,14 +7149,12 @@ def test_minimum_size_layout_and_splitter_visibility(qapp) -> None:
     sizes = window.message_splitter.sizes()
     assert len(sizes) == 2
     assert sizes[0] >= 100
-    assert sizes[1] >= 100
-    # 1:1 ratio within documented small pixel tolerance matching setSizes([200, 200])
-    assert abs(sizes[0] - sizes[1]) <= 10
+    assert sizes[1] >= 70
 
     # Both editor viewports have meaningful minimum height and width
-    assert window.transcription_editor.isVisible()
-    assert window.transcription_editor.viewport().height() >= 50
-    assert window.transcription_editor.viewport().width() >= 150
+    assert window.editor.isVisible()
+    assert window.editor.viewport().height() >= 50
+    assert window.editor.viewport().width() >= 150
 
     assert window.last_message_editor.isVisible()
     assert window.last_message_editor.viewport().height() >= 50
@@ -7007,4 +7172,831 @@ def test_minimum_size_layout_and_splitter_visibility(qapp) -> None:
     for _ in range(3):
         qapp.processEvents()
     assert window.message_splitter.sizes() == sizes
+    window.close()
+
+
+def test_live_transcription_e2e_pcm_chunks_interim_final_usage_and_archive(
+    qapp, tmp_path
+) -> None:
+    db_path = tmp_path / "test_live_e2e.sqlite3"
+    store = LocalStore(db_path)
+    recorder = FakeRecorder()
+
+    created_workers: list[FakeLiveWorker] = []
+
+    def make_live_worker(key: str, q: Any) -> FakeLiveWorker:
+        w = FakeLiveWorker(
+            key,
+            q,
+            final_text="Eu quero corrigir esta fala.",
+            auto_emit_on_run=False,
+            usage=TokenUsage(
+                input_tokens=80,
+                output_tokens=20,
+                thought_tokens=None,
+                cached_tokens=15,
+                tool_use_tokens=None,
+                total_tokens=100,
+            ),
+        )
+        created_workers.append(w)
+        return w
+
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=FakeTranscriber(),
+        recorder=recorder,
+        local_store=store,
+        live_worker_factory=make_live_worker,
+    )
+
+    # 1. Start recording
+    window._start_recording()
+    assert window.state is AppState.RECORDING
+    assert len(created_workers) == 1
+    live_worker = created_workers[0]
+    assert live_worker.api_key == "active-key"
+    assert window.editor.toPlainText() == ""
+
+    # 2. Interim hypothesis arrives while speaking
+    live_worker.interim.emit("eu quero")
+    qapp.processEvents()
+    assert window.editor.toPlainText() == "eu quero"
+
+    # 3. Final confirmed segment arrives and replaces interim
+    live_worker.final.emit("Eu quero")
+    qapp.processEvents()
+    assert window.editor.toPlainText() == "Eu quero"
+
+    # 4. Next interim appends to confirmed segments
+    live_worker.interim.emit("corrigir esta fala")
+    qapp.processEvents()
+    assert window.editor.toPlainText() == "Eu quero corrigir esta fala"
+
+    # 5. Stop recording -> LIVE_FINALIZING
+    window._finish_recording()
+    assert window.state is AppState.LIVE_FINALIZING
+    assert live_worker.stop_requested is True
+    assert window.status_label.text() == "Finalizando transcrição ao vivo…"
+
+    # 6. Worker finishes with final result
+    live_worker.emit_result()
+    qapp.processEvents()
+
+    assert window.state is AppState.READY
+    assert window.editor.toPlainText() == "Eu quero corrigir esta fala."
+    assert window.last_message_editor.toPlainText() == ""
+    assert "Transcrição pronta" in window.status_label.text()
+
+    # 6a. Pending capture preserved, playback enabled, but one-shot manual send disabled
+    assert window._pending_capture is not None
+    assert window.play_audio_button.isEnabled() is True
+    assert window.record_button.text() == "Gravar"
+    assert window.record_again_button.isEnabled() is False
+    assert window._send_pending_audio() is False
+
+    # Playback can be toggled in READY state
+    window.play_audio_button.click()
+    qapp.processEvents()
+    assert window._is_playing_audio is True
+    assert window.play_audio_button.text() == "Parar reprodução"
+    window.play_audio_button.click()
+    qapp.processEvents()
+    assert window._is_playing_audio is False
+    assert window.play_audio_button.text() == "Reproduzir áudio"
+
+    # Diagnostics updated
+    assert "Modelo: gemini-3.5-transcribe-live" in window.payload_debug.toPlainText()
+    assert "Eu quero corrigir esta fala." in window.return_debug.toPlainText()
+    assert "Entrada: 80" in window.usage_debug.toPlainText()
+    assert "Total: 100" in window.usage_debug.toPlainText()
+
+    # LocalStore recorded exactly one usage entry
+    totals = store.get_token_totals()
+    assert totals.total_tokens == 100
+
+    # 7. Clear text moves text to last_message_editor and clears editor
+    window.clear_button.click()
+    qapp.processEvents()
+    assert window.editor.toPlainText() == ""
+    assert window.last_message_editor.toPlainText() == "Eu quero corrigir esta fala."
+    assert window.status_label.text() == "Texto apagado; cópia mantida na última mensagem."
+    assert not window.copy_button.isEnabled()
+    assert not window.clear_button.isEnabled()
+    assert not window.terminal_button.isEnabled()
+
+    # 8. Second clear when editor is empty does not alter backup and displays exact status
+    window.clear_text()
+    qapp.processEvents()
+    assert window.editor.toPlainText() == ""
+    assert window.last_message_editor.toPlainText() == "Eu quero corrigir esta fala."
+    assert window.status_label.text() == "Não há texto para apagar."
+    assert window.state is AppState.READY
+    assert window.play_audio_button.isEnabled() is True
+
+    # 9. Verify directly via raw SQLite queries that backup/transcription sentinel is NEVER persisted
+    sentinel_text = "Eu quero corrigir esta fala."
+    with sqlite3.connect(db_path) as conn:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        ]
+        assert len(tables) > 0
+        for table in tables:
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            for row in rows:
+                for cell in row:
+                    assert sentinel_text not in str(cell)
+                    assert "corrigir esta fala" not in str(cell)
+                    assert "transcrição" not in str(cell).lower()
+
+    # The backup remains available in memory in last_message_editor
+    assert window.last_message_editor.toPlainText() == sentinel_text
+    window.close()
+
+
+def test_live_transcription_overflow_timeout_fallback_e2e(qapp, tmp_path) -> None:
+    db_path = tmp_path / "test_live_fallback.sqlite3"
+    store = LocalStore(db_path)
+    live_worker = FakeLiveWorker(
+        "active-key",
+        None,
+        error="O buffer de áudio ao vivo estourou.",
+        auto_emit_on_run=False,
+        usage=TokenUsage(input_tokens=10, output_tokens=0, total_tokens=10),
+    )
+    transcriber = FakeTranscriber(
+        text="Transcrição manual fallback com sucesso",
+        usage=TokenUsage(input_tokens=15, output_tokens=5, total_tokens=20),
+    )
+    recorder = FakeRecorder()
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=transcriber,
+        recorder=recorder,
+        local_store=store,
+        live_worker_factory=lambda key, q: live_worker,
+    )
+
+    window._start_recording()
+    # Partial text in editor during recording
+    live_worker.interim.emit("texto parcial")
+    qapp.processEvents()
+    assert window.editor.toPlainText() == "texto parcial"
+
+    window._finish_recording()
+    assert window.state is AppState.LIVE_FINALIZING
+
+    # Signal live failure (overflow / timeout)
+    live_worker.emit_result()
+    qapp.processEvents()
+
+    assert window.state is AppState.AUDIO_READY
+    assert "continua disponível para envio manual" in window.status_label.text()
+    assert window.editor.toPlainText() == "texto parcial"
+    assert window.last_message_editor.toPlainText() == ""
+    assert window._pending_capture is not None
+
+    # Usage for failed live call recorded
+    totals_after_live = store.get_token_totals()
+    assert totals_after_live.total_tokens == 10
+
+    # Manual fallback via Send to Gemini (primary action in AUDIO_READY)
+    window._perform_primary_action()
+    assert window.state is AppState.TRANSCRIBING
+    wait_for_worker(qapp, window)
+
+    assert window.state is AppState.READY
+    assert window.editor.toPlainText() == "Transcrição manual fallback com sucesso"
+    assert window.last_message_editor.toPlainText() == ""
+    # Total usage accumulated correctly (10 + 20 = 30)
+    totals_final = store.get_token_totals()
+    assert totals_final.total_tokens == 30
+
+    window.close()
+
+
+def test_live_transcription_discards_late_signals_from_old_generation(qapp) -> None:
+    worker1 = FakeLiveWorker("key", None, auto_emit_on_run=False, final_text="Texto antigo 1")
+    worker2 = FakeLiveWorker("key", None, auto_emit_on_run=False, final_text="Texto novo 2")
+    workers = [worker1, worker2]
+
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=FakeTranscriber(),
+        live_worker_factory=lambda key, q: workers.pop(0),
+    )
+
+    # Start session 1
+    window._start_recording()
+    gen1 = window._live_generation
+    assert window._live_worker is worker1
+
+    # Trigger error to advance generation and invalidate session 1
+    window._set_error("Erro forçado na sessão 1")
+    assert window.state is AppState.ERROR
+    assert window._live_generation > gen1
+
+    # Worker 1 emits late signals - should be discarded and not change ERROR to READY
+    worker1.interim.emit("interim tardio")
+    worker1.final.emit("final tardio")
+    worker1.emit_result()
+    qapp.processEvents()
+
+    assert window.state is AppState.ERROR
+    assert window.editor.toPlainText() == ""
+    assert window.status_label.text() == "Erro forçado na sessão 1"
+
+    window.close()
+
+
+def test_incompatible_sample_rate_starts_manual_recording(qapp) -> None:
+    recorder = FakeRecorder(reject_require_sample_rate=True)
+    created_workers: list[FakeLiveWorker] = []
+
+    def make_live_worker(key: str, q: Any) -> FakeLiveWorker:
+        w = FakeLiveWorker(key, q)
+        created_workers.append(w)
+        return w
+
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=FakeTranscriber(),
+        recorder=recorder,
+        live_worker_factory=make_live_worker,
+    )
+
+    window._start_recording()
+    assert window.state is AppState.RECORDING
+    assert len(created_workers) == 0
+    assert "transcrição ao vivo indisponível; o áudio será mantido para envio manual" in window.status_label.text()
+    assert len(recorder.start_calls) == 2
+    assert recorder.start_calls[0]["require_sample_rate"] == 16000
+    assert recorder.start_calls[1]["require_sample_rate"] is None
+
+    window.close()
+
+
+def test_close_event_defers_close_and_cancels_live_worker_nonblockingly(qapp) -> None:
+    live_worker = FakeLiveWorker("key", None, auto_emit_on_run=False)
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=FakeTranscriber(),
+        live_worker_factory=lambda key, q: live_worker,
+    )
+
+    window._start_recording()
+    assert window._live_worker is not None
+    assert window._live_queue is not None
+    thread = window._live_thread
+    assert thread is not None
+    assert thread.isRunning()
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+    assert close_event.isAccepted() is False
+    assert window._close_pending is True
+    assert window.isVisible() is False
+    assert live_worker.force_cancelled is True or live_worker.stop_requested is True
+    assert window._is_closing is True
+    assert thread in [th for th, _w, _q in window._live_sessions.values()]
+
+    live_worker.finished.emit(
+        LiveTranscriptionResult(
+            "texto",
+            LiveTranscriptionDebug(
+                model="gemini-3.5-transcribe-live",
+                language_code="pt-BR",
+                mode="SMART",
+                audio_bytes=1600,
+                response_text="texto",
+                error=None,
+            ),
+        )
+    )
+    thread.quit()
+    thread.wait(1000)
+    qapp.processEvents()
+
+    assert window._live_worker is None
+    assert window._live_thread is None
+    assert window._live_sessions == {}
+
+def test_repeated_sample_rate_fallback_and_stale_signals_leave_no_orphaned_live_threads(
+    qapp,
+) -> None:
+    # 1. Repeated sample rate fallback cycles
+    recorder = FakeRecorder(reject_require_sample_rate=True)
+    created_workers: list[FakeLiveWorker] = []
+
+    def failing_worker_factory(key: str, q: Any) -> FakeLiveWorker:
+        w = FakeLiveWorker(key, q, auto_emit_on_run=False)
+        created_workers.append(w)
+        return w
+
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=FakeTranscriber(),
+        recorder=recorder,
+        live_worker_factory=failing_worker_factory,
+    )
+
+    for _ in range(3):
+        window._start_recording()
+        assert window.state is AppState.RECORDING
+        assert window._live_worker is None
+        assert window._live_thread is None
+        assert (
+            "transcrição ao vivo indisponível; o áudio será mantido para envio manual"
+            in window.status_label.text()
+        )
+        window._finish_recording()
+        assert window.state is AppState.AUDIO_READY
+
+    # Factory was never called because recorder rejected 16 kHz before worker creation
+    assert len(created_workers) == 0
+    # No child QThreads exist on window
+    assert len([c for c in window.children() if isinstance(c, QThread)]) == 0
+
+
+def test_live_pending_worker_blocks_restart_and_deferred_close_cancels_sessions(qapp) -> None:
+    worker1 = FakeLiveWorker("key", None, auto_emit_on_run=False, final_text="Texto 1")
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=FakeTranscriber(),
+        live_worker_factory=lambda key, q: worker1,
+    )
+
+    # Start session 1
+    window._start_recording()
+    assert window._live_worker is worker1
+    thread1 = window._live_thread
+    assert thread1 is not None
+    assert thread1.isRunning()
+
+    # Finish recording -> LIVE_FINALIZING
+    window._finish_recording()
+    assert window.state is AppState.LIVE_FINALIZING
+
+    # Attempt to start a new recording while thread1 is still running
+    window._start_recording()
+    assert "ainda está em encerramento" in window.status_label.text()
+    assert window.state is AppState.LIVE_FINALIZING
+    assert window._live_worker is worker1
+    assert window._live_thread is thread1
+
+    # closeEvent defers close non-blockingly and requests worker/thread cancellation
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+    assert close_event.isAccepted() is False
+    assert window._close_pending is True
+    assert worker1.force_cancelled is True
+
+    # Repeated closeEvent while running is safely ignored
+    second_close = QCloseEvent()
+    window.closeEvent(second_close)
+    assert second_close.isAccepted() is False
+
+    # Thread completes -> deferred close runs
+    worker1.finished.emit(
+        LiveTranscriptionResult(
+            "Texto 1",
+            LiveTranscriptionDebug(
+                model="gemini-3.5-transcribe-live",
+                language_code="pt-BR",
+                mode="SMART",
+                audio_bytes=1600,
+                response_text="Texto 1",
+                error=None,
+            ),
+        )
+    )
+    thread1.quit()
+    thread1.wait(1000)
+    qapp.processEvents()
+
+    assert window._live_sessions == {}
+    assert window._live_worker is None
+    assert window._live_thread is None
+
+def test_close_live_thread_strictly_nonblocking_without_wait_or_terminate(qapp) -> None:
+    window, _ = make_window(qapp)
+    live_worker = FakeLiveWorker("key", None)
+    live_thread = FakeRunningThread(timeout_first=True)
+
+    window._live_worker = live_worker  # type: ignore[assignment]
+    window._live_thread = live_thread  # type: ignore[assignment]
+    window._live_sessions[1] = (live_thread, live_worker, None)  # type: ignore[assignment]
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    assert close_event.isAccepted() is False
+    assert window._close_pending is True
+    assert window._is_closing is True
+    assert live_worker.force_cancelled is True
+    assert live_thread.quit_called is True
+    assert live_thread.terminate_called is False
+    assert len(live_thread.wait_calls) == 0
+    assert 1 in window._live_sessions
+
+def test_live_thread_finish_after_set_error_and_deferred_deletes_closes_window_and_store_without_runtime_error(
+    qapp,
+) -> None:
+    store = FakeLocalStore()
+    recorder = FakeRecorder(low_error=True)
+    worker = FakeLiveWorker("key", None, auto_emit_on_run=False)
+
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=FakeTranscriber(),
+        local_store=store,
+        recorder=recorder,
+        live_worker_factory=lambda key, q: worker,
+    )
+
+    # 1. Start recording with Live
+    window._start_recording()
+    assert window.state is AppState.RECORDING
+    thread = window._live_thread
+    assert thread is not None
+    assert thread.isRunning()
+
+    # 2. Trigger an error that calls _set_error
+    from falafacil.audio import AudioRecorderError
+    recorder.fail_stop_error = AudioRecorderError("Falha ao parar captura.")
+    window._finish_recording()
+    assert window.state is AppState.ERROR
+
+    # 3. Worker finishes and thread completes
+    worker.finished.emit(
+        LiveTranscriptionResult(
+            "texto",
+            LiveTranscriptionDebug(
+                model="gemini-3.5-transcribe-live",
+                language_code="pt-BR",
+                mode="SMART",
+                audio_bytes=1600,
+                response_text="texto",
+                error=None,
+            ),
+        )
+    )
+    thread.quit()
+    thread.wait(1000)
+    qapp.processEvents()
+
+    assert window._live_thread is None
+    assert window._live_worker is None
+    assert window._live_sessions == {}
+
+    # 4. Window can close without runtime error
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+    assert close_event.isAccepted()
+    assert store.closed is True
+
+def test_live_finalizing_state_guards_controls_and_handlers(qapp) -> None:
+    fake_controller = FakeHomebrewUpdateController()
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-token"),
+        transcriber=FakeTranscriber(),
+        homebrew_update_controller=fake_controller,
+    )
+    window.state = AppState.LIVE_FINALIZING
+    window._update_actions()
+    window.editor.setPlainText("Texto no editor para cópia")
+    window._update_actions()
+
+    # Controls disabled
+    assert not window.record_button.isEnabled()
+    assert window.record_button.text() == "Finalizando transcrição ao vivo…"
+    assert not window.record_again_button.isEnabled()
+    assert not window.play_audio_button.isEnabled()
+    assert not window.copy_button.isEnabled()
+    assert not window.copy_shortcut.isEnabled()
+    assert not window.review_button.isEnabled()
+    assert not window.clear_button.isEnabled()
+    assert not window.terminal_button.isEnabled()
+    assert not window.microphone_combo.isEnabled()
+    assert not window.refresh_microphones_button.isEnabled()
+
+    # Copy action is no-op during LIVE_FINALIZING
+    QApplication.clipboard().setText("clipboard inicial")
+    window.copy_text()
+    assert QApplication.clipboard().text() == "clipboard inicial"
+    # Handlers inert in LIVE_FINALIZING
+    window._on_install_updates_clicked()
+    assert fake_controller.install_calls == 0
+
+    started = window._start_recording()
+    assert started is False
+
+    window._start_replacement_recording()
+    assert window.state is AppState.LIVE_FINALIZING
+
+    # Finish recording while already finalizing does not alter state
+    window._finish_recording()
+    assert window.state is AppState.LIVE_FINALIZING
+
+    window._apply_model_preference()
+    window._configure_api_key()
+    window._request_shortcut_configuration("mouse")
+    window._deactivate_shortcut("mouse")
+    assert window.state is AppState.LIVE_FINALIZING
+    window.close()
+
+
+def test_live_failure_before_events_preserves_preexisting_editor_text(qapp) -> None:
+    live_worker = FakeLiveWorker("key", None, error="Erro de conexão", auto_emit_on_run=False)
+    recorder = FakeRecorder()
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=FakeTranscriber(),
+        recorder=recorder,
+        live_worker_factory=lambda key, q: live_worker,
+    )
+    window.editor.setPlainText("Texto preexistente mantido")
+    window.last_message_editor.setPlainText("Backup mantido")
+    window._start_recording()
+    assert window.state is AppState.RECORDING
+
+    # Live fails before any interim/final event
+    live_worker.emit_result()
+    qapp.processEvents()
+
+    assert window.editor.toPlainText() == "Texto preexistente mantido"
+    assert window.last_message_editor.toPlainText() == "Backup mantido"
+    window.close()
+
+
+def test_close_event_defers_and_waits_for_running_installer(qapp) -> None:
+    order: list[str] = []
+    store = FakeLocalStore(order_log=order)
+    bridge = FakeInputShortcutBridge(order_log=order)
+    installer = FakeShortcutInstaller(order_log=order, running=True)
+    window, _ = make_window(
+        qapp,
+        local_store=store,
+        input_shortcut_bridge=bridge,
+        shortcut_service_installer=installer,
+    )
+
+    close_event1 = QCloseEvent()
+    window.closeEvent(close_event1)
+
+    # Deferred close: event ignored, window hidden, _close_pending set, cancel called
+    assert close_event1.isAccepted() is False
+    assert window._close_pending is True
+    assert window._is_closing is True
+    assert installer.cancel_count == 1
+    assert store.closed is False
+
+    # Second close event while installer is still running is also ignored
+    close_event2 = QCloseEvent()
+    window.closeEvent(close_event2)
+    assert close_event2.isAccepted() is False
+    assert store.closed is False
+
+    # Installer finishes -> deferred close completes and closes store
+    installer.running = False
+    installer.finished.emit(False, "Cancelado")
+    qapp.processEvents()
+    assert store.closed is True
+    assert window._close_pending is False
+
+
+def test_editor_and_last_message_height_constraints_and_layout_order(qapp) -> None:
+    window, _ = make_window(qapp)
+
+    # Height constraints
+    assert window.editor.minimumHeight() == 120
+    assert window.editor.maximumHeight() == 190
+    assert window.last_message_editor.minimumHeight() == 70
+    assert window.last_message_editor.maximumHeight() == 110
+
+    # Message splitter contains both editors before the actions row
+    assert window.message_splitter.count() == 2
+    assert window.editor.parent().parent() is window.message_splitter or window.editor.parent() is window.message_splitter
+    assert window.last_message_editor.parent().parent() is window.message_splitter or window.last_message_editor.parent() is window.message_splitter
+    assert window.record_button.parent() is not window.message_splitter
+    assert window.copy_button.parent() is not window.message_splitter
+    window.close()
+
+
+def test_live_usable_capture_stop_error_stays_finalizing_until_worker_fails(qapp) -> None:
+    capture = make_capture(b"usable-audio-pcm-stop-error-with-live")
+    recorder = FakeRecorder(
+        capture=capture,
+        fail_stop_error=AudioRecorderError("Falha ao fechar o stream de áudio."),
+    )
+    live_worker = FakeLiveWorker(
+        "active-key",
+        None,
+        error="Conexão Live fechada com erro.",
+        auto_emit_on_run=False,
+    )
+    transcriber = FakeTranscriber(text="Transcrição manual pós-falha Live")
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=transcriber,
+        recorder=recorder,
+        live_worker_factory=lambda key, q: live_worker,
+    )
+
+    # 1. Start recording with Live
+    window._start_recording()
+    assert window.state is AppState.RECORDING
+
+    # 2. Finish recording with stop_exc and usable capture
+    window._finish_recording()
+
+    # State MUST be LIVE_FINALIZING, NOT AUDIO_READY
+    assert window.state is AppState.LIVE_FINALIZING
+    assert window._pending_capture is capture
+    assert live_worker.stop_requested is True
+    assert window.status_label.text() == "Finalizando transcrição ao vivo…"
+
+    # Attempting to send one-shot during LIVE_FINALIZING MUST be blocked
+    assert window._send_pending_audio() is False
+    assert window.state is AppState.LIVE_FINALIZING
+    assert len(transcriber.calls) == 0
+
+    # 3. Live worker fails
+    live_worker.emit_result()
+    qapp.processEvents()
+
+    # State transitions to AUDIO_READY via _on_live_failed
+    assert window.state is AppState.AUDIO_READY
+    assert "continua disponível para envio manual" in window.status_label.text()
+    assert window._pending_capture is capture
+
+    # 4. Fallback one-shot sending now works
+    assert window._send_pending_audio() is True
+    assert window.state is AppState.TRANSCRIBING
+    wait_for_worker(qapp, window)
+
+    assert window.state is AppState.READY
+    assert window.editor.toPlainText() == "Transcrição manual pós-falha Live"
+    assert window.last_message_editor.toPlainText() == ""
+    assert transcriber.calls == [capture.wav_bytes]
+    window.close()
+
+
+def test_live_preserved_capture_stop_error_restores_previous_capture_and_ignores_late_live_success(qapp) -> None:
+    first_capture = make_capture(b"first-usable-audio-preserved")
+    recorder = FakeRecorder(capture=first_capture)
+    live_worker = FakeLiveWorker(
+        "active-key",
+        None,
+        error="Erro Live na primeira sessão",
+        auto_emit_on_run=False,
+    )
+    transcriber = FakeTranscriber(text="Transcrição manual da captura preservada")
+    store = FakeLocalStore()
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=transcriber,
+        recorder=recorder,
+        local_store=store,
+        live_worker_factory=lambda key, q: live_worker,
+    )
+
+    # 1. Establish first usable pending capture in AUDIO_READY
+    window._start_recording()
+    window._finish_recording()
+    live_worker.emit_result()
+    qapp.processEvents()
+    assert window.state is AppState.AUDIO_READY
+    assert window._pending_capture is first_capture
+
+    second_live_worker = FakeLiveWorker(
+        "active-key",
+        None,
+        final_text="Texto Live da gravação substituta que falhou",
+        auto_emit_on_run=False,
+    )
+    window.live_worker_factory = lambda key, q: second_live_worker
+    recorder.fail_stop_error = AudioRecorderError("Falha ao fechar segundo stream")
+    recorder.capture = AudioCapture(
+        wav_bytes=b"",
+        pcm_bytes=b"",
+        frames=0,
+        duration_seconds=0.0,
+        rms=0.0,
+        peak=0.0,
+    )
+
+    window.record_again_button.click()
+    assert window.state is AppState.RECORDING
+    assert window._preserved_capture is first_capture
+
+    # 3. Finish recording with stop error and empty capture
+    window._finish_recording()
+
+    # State MUST transition immediately to AUDIO_READY with preserved capture
+    assert window.state is AppState.AUDIO_READY
+    assert window._pending_capture is first_capture
+    assert window._preserved_capture is None
+    assert second_live_worker.stop_requested is True
+    assert "Falha ao fechar segundo stream" in window.status_label.text()
+
+    # 4. Second Live worker finishes with late success - MUST BE IGNORED
+    second_live_worker.emit_result()
+    qapp.processEvents()
+
+    # Verify editor, state, pending capture, and usage are untouched
+    assert window.state is AppState.AUDIO_READY
+    assert window.editor.toPlainText() != "Texto Live da gravação substituta que falhou"
+    assert window._pending_capture is first_capture
+    assert len(store.records) == 0
+
+    # 5. Fallback one-shot send processes the preserved capture
+    assert window._send_pending_audio() is True
+    assert window.state is AppState.TRANSCRIBING
+    wait_for_worker(qapp, window)
+
+    assert window.state is AppState.READY
+    assert window.editor.toPlainText() == "Transcrição manual da captura preservada"
+    assert transcriber.calls == [first_capture.wav_bytes]
+    window.close()
+
+
+def test_live_preserved_capture_unusable_restores_and_ignores_late_signals(qapp) -> None:
+    first_capture = make_capture(b"first-usable-audio-preserved-unusable-case")
+    recorder = FakeRecorder(capture=first_capture)
+    live_worker = FakeLiveWorker(
+        "active-key",
+        None,
+        error="Erro Live",
+        auto_emit_on_run=False,
+    )
+    transcriber = FakeTranscriber(text="Transcrição manual da captura 1")
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=transcriber,
+        recorder=recorder,
+        live_worker_factory=lambda key, q: live_worker,
+    )
+
+    window._start_recording()
+    window._finish_recording()
+    live_worker.emit_result()
+    qapp.processEvents()
+    assert window.state is AppState.AUDIO_READY
+    assert window._pending_capture is first_capture
+
+    second_live_worker = FakeLiveWorker(
+        "active-key",
+        None,
+        final_text="Texto Live tardio",
+        auto_emit_on_run=False,
+    )
+    window.live_worker_factory = lambda key, q: second_live_worker
+    # Simulate unusable capture without stop exception (e.g. silent audio / 0 RMS)
+    recorder.fail_stop_error = None
+    recorder.capture = AudioCapture(
+        wav_bytes=b"RIFF...",
+        pcm_bytes=b"\x00\x00" * 100,
+        frames=100,
+        duration_seconds=0.1,
+        rms=0.0,
+        peak=0.0,
+    )
+
+    window.record_again_button.click()
+    assert window.state is AppState.RECORDING
+    assert window._preserved_capture is first_capture
+
+    window._finish_recording()
+    assert window.state is AppState.AUDIO_READY
+    assert window._pending_capture is first_capture
+    assert window._preserved_capture is None
+    assert second_live_worker.stop_requested is True
+
+    # Late signals (interim, final, finished, failed) must be discarded
+    second_live_worker.interim.emit("Interim tardio")
+    second_live_worker.final.emit("Final tardio")
+    second_live_worker.emit_result()
+    second_live_worker.failed.emit("Erro tardio", None)
+    qapp.processEvents()
+
+    assert window.state is AppState.AUDIO_READY
+    assert window.editor.toPlainText() == ""
+    assert window._pending_capture is first_capture
     window.close()

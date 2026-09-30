@@ -1,22 +1,36 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from dataclasses import FrozenInstanceError
+import types
 from typing import Any
 
+import numpy as np
 import pytest
 from PySide6.QtWidgets import QApplication
 
+import falafacil.transcription
+from falafacil.audio import PcmChunkQueue
 from falafacil.config import DEFAULT_MODEL
 from falafacil.transcription import (
     INLINE_LIMIT_BYTES,
+    LIVE_FINAL_TIMEOUT_MS,
+    LIVE_LANGUAGE,
+    LIVE_MIME_TYPE,
+    LIVE_MODEL,
+    LIVE_MODE,
     PROMPT,
     REQUEST_TIMEOUT_MS,
     GeminiTranscriber,
+    LiveTranscriptionDebug,
+    LiveTranscriptionResult,
+    LiveTranscriptionWorker,
     TokenUsage,
     TranscriptionDebug,
     TranscriptionError,
     TranscriptionWorker,
+    _extract_live_usage,
     _extract_usage,
     _friendly_api_error,
     _to_int,
@@ -709,3 +723,1068 @@ def test_worker_unexpected_exception_emits_generic_error_without_sensitive_detai
     assert debug is not None
     assert secret not in (debug.error or "")
     assert secret not in (debug.response_text or "")
+
+
+class FakeLiveSession:
+    def __init__(
+        self,
+        turns_messages: list[list[Any]] | None = None,
+        *,
+        raise_on_receive: Exception | None = None,
+        hang_after_messages: bool = False,
+        hang_on_connect: bool = False,
+        hang_on_send: bool = False,
+        turn_delays: dict[int, float] | None = None,
+    ) -> None:
+        self.sent_realtime_inputs: list[dict[str, Any]] = []
+        self.turns_messages = list(turns_messages or [])
+        self.raise_on_receive = raise_on_receive
+        self.hang_after_messages = hang_after_messages
+        self.hang_on_connect = hang_on_connect
+        self.hang_on_send = hang_on_send
+        self.turn_delays = turn_delays or {}
+        self.closed = False
+        self.current_turn = 0
+        self.stream_end_received = asyncio.Event()
+
+    async def send_realtime_input(
+        self,
+        *,
+        audio: Any = None,
+        audio_stream_end: bool | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.sent_realtime_inputs.append(
+            {
+                "audio": audio,
+                "audio_stream_end": audio_stream_end,
+                **kwargs,
+            }
+        )
+        if audio_stream_end:
+            self.stream_end_received.set()
+        if self.hang_on_send:
+            await asyncio.sleep(3600)
+
+    async def receive(self):
+        if self.raise_on_receive is not None:
+            raise self.raise_on_receive
+        if self.current_turn < len(self.turns_messages):
+            turn_idx = self.current_turn
+            if (
+                turn_idx == len(self.turns_messages) - 1
+                and not self.stream_end_received.is_set()
+            ):
+                return
+            messages = self.turns_messages[turn_idx]
+            self.current_turn += 1
+            for msg in messages:
+                yield msg
+            delay = self.turn_delays.get(turn_idx, 0.0)
+            if delay > 0.0:
+                await asyncio.sleep(delay)
+        elif self.hang_after_messages:
+            await asyncio.sleep(3600)
+
+    async def __aenter__(self):
+        if self.hang_on_connect:
+            await asyncio.sleep(3600)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.closed = True
+
+
+class FakeLiveClient:
+    def __init__(self, session: FakeLiveSession) -> None:
+        self.session = session
+        self.connect_calls: list[dict[str, Any]] = []
+
+        class FakeLive:
+            def __init__(self, outer: FakeLiveClient) -> None:
+                self._outer = outer
+
+            def connect(self, *, model: str, config: Any) -> FakeLiveSession:
+                self._outer.connect_calls.append({"model": model, "config": config})
+                return self._outer.session
+
+        class FakeAio:
+            def __init__(self, outer: FakeLiveClient) -> None:
+                self.live = FakeLive(outer)
+
+        self.aio = FakeAio(self)
+
+
+def _make_server_message(
+    *,
+    interim_text: str | None = None,
+    final_text: str | None = None,
+    finished: bool | None = None,
+    turn_complete: bool = False,
+    generation_complete: bool = False,
+    usage: dict[str, Any] | None = None,
+) -> types.SimpleNamespace:
+    server_content = None
+    if interim_text is not None or final_text is not None or turn_complete or generation_complete:
+        interim_obj = types.SimpleNamespace(text=interim_text) if interim_text is not None else None
+        input_obj = (
+            types.SimpleNamespace(text=final_text, finished=finished)
+            if final_text is not None
+            else None
+        )
+        server_content = types.SimpleNamespace(
+            interim_input_transcription=interim_obj,
+            input_transcription=input_obj,
+            turn_complete=turn_complete,
+            generation_complete=generation_complete,
+        )
+    usage_meta = None
+    if usage is not None:
+        usage_meta = types.SimpleNamespace(**usage)
+    return types.SimpleNamespace(
+        server_content=server_content,
+        usage_metadata=usage_meta,
+    )
+
+
+def test_live_worker_configures_smart_pt_br_and_model() -> None:
+    QApplication.instance() or QApplication([])
+    session = FakeLiveSession([
+        [
+            _make_server_message(final_text="Olá mundo.", turn_complete=True),
+        ]
+    ])
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    queue.finish()
+
+    worker = LiveTranscriptionWorker("test-key", queue, client=client, model="custom-live-model")
+    worker.request_stop()
+    worker.run()
+
+    assert len(client.connect_calls) == 1
+    call = client.connect_calls[0]
+    assert call["model"] == "custom-live-model"
+    config = call["config"]
+    assert config.response_modalities == ["TEXT"]
+    assert config.input_audio_transcription.language_codes == ["pt-BR"]
+    assert config.input_audio_transcription.mode == "SMART"
+
+
+def test_live_worker_streams_pcm_blobs_and_sends_audio_stream_end() -> None:
+    QApplication.instance() or QApplication([])
+    session = FakeLiveSession([
+        [
+            _make_server_message(final_text="Segmento final.", turn_complete=True),
+        ]
+    ])
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    chunk1 = (np.ones(400, dtype=np.int16) * 1000).tobytes()
+    chunk2 = (np.ones(400, dtype=np.int16) * 1200).tobytes()
+    queue.enqueue(chunk1)
+    queue.enqueue(chunk2)
+    queue.finish()
+
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    worker.request_stop()
+    worker.run()
+
+    inputs = session.sent_realtime_inputs
+    assert len(inputs) == 3
+    assert inputs[0]["audio"].data == chunk1
+    assert inputs[0]["audio"].mime_type == LIVE_MIME_TYPE
+    assert inputs[1]["audio"].data == chunk2
+    assert inputs[1]["audio"].mime_type == LIVE_MIME_TYPE
+    assert inputs[2]["audio_stream_end"] is True
+
+
+def test_live_worker_emits_interim_and_deduplicates_final_segments() -> None:
+    QApplication.instance() or QApplication([])
+    session = FakeLiveSession([
+        [
+            _make_server_message(interim_text="eu"),
+            _make_server_message(interim_text="eu quero"),
+            _make_server_message(final_text="Eu quero"),
+            _make_server_message(final_text="Eu quero"),  # duplicate should be ignored
+            _make_server_message(interim_text="falar"),
+            _make_server_message(final_text="falar em português."),
+            _make_server_message(
+                turn_complete=True,
+                usage={
+                    "prompt_token_count": 50,
+                    "response_token_count": 12,
+                    "thoughts_token_count": None,
+                    "cached_content_token_count": 10,
+                    "tool_use_prompt_token_count": None,
+                    "total_token_count": 62,
+                },
+            ),
+        ]
+    ])
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    queue.finish()
+
+    interim_events: list[str] = []
+    final_events: list[str] = []
+    finished_results: list[LiveTranscriptionResult] = []
+
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    worker.interim.connect(interim_events.append)
+    worker.final.connect(final_events.append)
+    worker.finished.connect(finished_results.append)
+
+    worker.request_stop()
+    worker.run()
+
+    assert interim_events == ["eu", "eu quero", "falar"]
+    assert final_events == ["Eu quero", "falar em português."]
+    assert len(finished_results) == 1
+    res = finished_results[0]
+    assert res.text == "Eu quero falar em português."
+    assert res.debug.model == LIVE_MODEL
+    assert res.debug.language_code == LIVE_LANGUAGE
+    assert res.debug.mode == LIVE_MODE
+    assert res.debug.audio_bytes == 1600
+    assert res.debug.usage == TokenUsage(
+        input_tokens=50,
+        output_tokens=12,
+        thought_tokens=None,
+        cached_tokens=10,
+        tool_use_tokens=None,
+        total_tokens=62,
+    )
+
+
+def test_live_worker_respects_finished_flag_and_ignores_unconfirmed_progressions() -> None:
+    QApplication.instance() or QApplication([])
+    session = FakeLiveSession([
+        [
+            _make_server_message(final_text="Eu", finished=False),
+            _make_server_message(final_text="Eu quero", finished=False),
+            _make_server_message(final_text="Eu quero", finished=True),
+            _make_server_message(final_text="corrigir esta fala.", finished=None),
+            _make_server_message(turn_complete=True),
+        ]
+    ])
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    queue.finish()
+
+    final_events: list[str] = []
+    finished_results: list[LiveTranscriptionResult] = []
+
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    worker.final.connect(final_events.append)
+    worker.finished.connect(finished_results.append)
+    worker.request_stop()
+    worker.run()
+
+    assert final_events == ["Eu quero", "corrigir esta fala."]
+    assert len(finished_results) == 1
+    assert finished_results[0].text == "Eu quero corrigir esta fala."
+
+
+def test_live_worker_loops_after_turn_complete_across_multiple_turns() -> None:
+    QApplication.instance() or QApplication([])
+    session = FakeLiveSession([
+        [
+            _make_server_message(final_text="Primeira parte.", turn_complete=True),
+        ],
+        [
+            _make_server_message(final_text="Segunda parte.", turn_complete=True),
+        ],
+    ])
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+
+    finished_results: list[LiveTranscriptionResult] = []
+    final_events: list[str] = []
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+
+    def on_final(text: str) -> None:
+        final_events.append(text)
+        if len(final_events) == 1:
+            queue.finish()
+            worker.request_stop()
+
+    worker.final.connect(on_final)
+    worker.finished.connect(finished_results.append)
+    worker.run()
+
+    assert len(finished_results) == 1
+    assert finished_results[0].text == "Primeira parte. Segunda parte."
+    assert final_events == ["Primeira parte.", "Segunda parte."]
+
+
+def test_live_worker_preserves_final_received_in_subsequent_receive_after_prior_final() -> None:
+    QApplication.instance() or QApplication([])
+    session = FakeLiveSession(
+        [
+            [
+                _make_server_message(
+                    final_text="Primeira parte confirmada.",
+                    finished=True,
+                    turn_complete=True,
+                ),
+            ],
+            [
+                _make_server_message(
+                    final_text="Segunda parte confirmada.",
+                    finished=True,
+                    turn_complete=True,
+                ),
+            ],
+        ],
+        turn_delays={0: 0.05},
+    )
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+
+    interim_events: list[str] = []
+    final_events: list[str] = []
+    finished_results: list[LiveTranscriptionResult] = []
+    failed_events: list[tuple[str, Any]] = []
+
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+
+    def on_final(text: str) -> None:
+        final_events.append(text)
+        if len(final_events) == 1:
+            queue.finish()
+            worker.request_stop()
+
+    worker.interim.connect(interim_events.append)
+    worker.final.connect(on_final)
+    worker.finished.connect(finished_results.append)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+    worker.run()
+
+    assert len(failed_events) == 0
+    assert len(finished_results) == 1
+    assert (
+        finished_results[0].text
+        == "Primeira parte confirmada. Segunda parte confirmada."
+    )
+    assert final_events == [
+        "Primeira parte confirmada.",
+        "Segunda parte confirmada.",
+    ]
+    assert session.closed is True
+
+
+def test_live_worker_prior_final_followed_by_empty_or_interim_or_usage_post_end_cycle_times_out(
+    monkeypatch,
+) -> None:
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(falafacil.transcription, "LIVE_FINAL_TIMEOUT_MS", 100)
+    session = FakeLiveSession(
+        [
+            [
+                _make_server_message(
+                    final_text="Fala anterior ao stop.",
+                    finished=True,
+                ),
+            ],
+            [
+                _make_server_message(interim_text="fala pós-stop não confirmada"),
+                _make_server_message(
+                    usage={
+                        "prompt_token_count": 40,
+                        "response_token_count": 15,
+                        "total_token_count": 55,
+                    }
+                ),
+            ],
+        ],
+        turn_delays={0: 0.01},
+        hang_after_messages=True,
+    )
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+
+    final_events: list[str] = []
+    interim_events: list[str] = []
+    failed_events: list[tuple[str, Any]] = []
+    finished_results: list[LiveTranscriptionResult] = []
+
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+
+    def on_final(text: str) -> None:
+        final_events.append(text)
+        if len(final_events) == 1:
+            queue.finish()
+            worker.request_stop()
+
+    worker.interim.connect(interim_events.append)
+    worker.final.connect(on_final)
+    worker.finished.connect(finished_results.append)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+    worker.run()
+
+    assert len(finished_results) == 0
+    assert len(failed_events) == 1
+    msg, dbg = failed_events[0]
+    assert "tempo limite" in msg
+    assert dbg.response_text == "Fala anterior ao stop."
+    assert dbg.error == msg
+    assert dbg.usage == TokenUsage(
+        input_tokens=40,
+        output_tokens=15,
+        thought_tokens=None,
+        cached_tokens=None,
+        tool_use_tokens=None,
+        total_tokens=55,
+    )
+    assert session.closed is True
+
+
+def test_live_worker_turn_complete_post_end_followed_by_final_in_subsequent_receive_succeeds() -> None:
+    QApplication.instance() or QApplication([])
+    session = FakeLiveSession(
+        [
+            [
+                _make_server_message(
+                    final_text="Segmento acumulado pré-stop.",
+                    finished=True,
+                ),
+            ],
+            [
+                # Post-end turn_complete arrives first without final text
+                _make_server_message(turn_complete=True),
+            ],
+            [
+                # Final text arrives in subsequent receive cycle
+                _make_server_message(
+                    final_text="Segmento final pós-turn-complete.",
+                    finished=True,
+                ),
+            ],
+        ],
+        turn_delays={0: 0.01, 1: 0.01},
+    )
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    final_events: list[str] = []
+    finished_results: list[LiveTranscriptionResult] = []
+    failed_events: list[tuple[str, Any]] = []
+
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+
+    def on_final(text: str) -> None:
+        final_events.append(text)
+        if len(final_events) == 1:
+            queue.finish()
+            worker.request_stop()
+
+    worker.final.connect(on_final)
+    worker.finished.connect(finished_results.append)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+    worker.run()
+
+    assert len(failed_events) == 0
+    assert len(finished_results) == 1
+    assert (
+        finished_results[0].text
+        == "Segmento acumulado pré-stop. Segmento final pós-turn-complete."
+    )
+    assert final_events == [
+        "Segmento acumulado pré-stop.",
+        "Segmento final pós-turn-complete.",
+    ]
+    assert session.closed is True
+
+def test_live_worker_empty_transcription_times_out_and_emits_failed(monkeypatch) -> None:
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(falafacil.transcription, "LIVE_FINAL_TIMEOUT_MS", 40)
+    session = FakeLiveSession([], hang_after_messages=True)
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    queue.finish()
+
+    failed_events: list[tuple[str, Any]] = []
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+    worker.request_stop()
+    worker.run()
+
+    assert len(failed_events) == 1
+    msg, dbg = failed_events[0]
+    assert "tempo limite" in msg
+    assert dbg.audio_bytes == 1600
+    assert dbg.response_text == ""
+    assert dbg.error == msg
+
+
+def test_live_worker_empty_transcription_with_turn_complete_times_out_and_emits_sanitized_failure(
+    monkeypatch,
+) -> None:
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(falafacil.transcription, "LIVE_FINAL_TIMEOUT_MS", 40)
+    session = FakeLiveSession([
+        [
+            _make_server_message(turn_complete=True),
+        ]
+    ])
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    queue.finish()
+
+    failed_events: list[tuple[str, Any]] = []
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+    worker.request_stop()
+    worker.run()
+
+    assert len(failed_events) == 1
+    msg, dbg = failed_events[0]
+    assert "tempo limite" in msg
+    assert dbg.audio_bytes == 1600
+    assert dbg.response_text == ""
+    assert dbg.error == msg
+
+def test_live_worker_buffer_overflow_emits_sanitized_failure() -> None:
+    QApplication.instance() or QApplication([])
+    session = FakeLiveSession([
+        [
+            _make_server_message(final_text="Texto parcial"),
+        ]
+    ])
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue(maxsize=1)
+    queue.enqueue(b"chunk1")
+    queue.enqueue(b"chunk2_overflow")  # Triggers overflow
+    assert queue.overflowed
+
+    failed_events: list[tuple[str, Any]] = []
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+    worker.request_stop()
+    worker.run()
+
+    assert len(failed_events) == 1
+    msg, dbg = failed_events[0]
+    assert "buffer de áudio ao vivo estourou" in msg
+
+
+def test_live_worker_api_error_sanitizes_secret_and_classifies_error() -> None:
+    QApplication.instance() or QApplication([])
+    secret = "secret-token-live-abc12345"
+    session = FakeLiveSession(
+        raise_on_receive=RuntimeError(f"HTTP 401 Unauthorized with key {secret} at https://internal.google.com/endpoint")
+    )
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    queue.finish()
+
+    failed_events: list[tuple[str, Any]] = []
+    worker = LiveTranscriptionWorker(secret, queue, client=client)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+    worker.request_stop()
+    worker.run()
+
+    assert len(failed_events) == 1
+    msg, dbg = failed_events[0]
+    assert msg == "Chave Gemini inválida ou ausente. Verifique GEMINI_API_KEY."
+    assert secret not in msg
+    assert "internal.google.com" not in msg
+    assert dbg is not None
+    assert secret not in (dbg.error or "")
+    assert "internal.google.com" not in (dbg.error or "")
+
+
+def test_live_usage_extraction_converts_all_live_fields() -> None:
+    raw_live_usage = {
+        "prompt_token_count": 100,
+        "response_token_count": 25,
+        "thoughts_token_count": 5,
+        "cached_content_token_count": 40,
+        "tool_use_prompt_token_count": 2,
+        "total_token_count": 172,
+    }
+    usage = _extract_live_usage(raw_live_usage)
+    assert usage == TokenUsage(
+        input_tokens=100,
+        output_tokens=25,
+        thought_tokens=5,
+        cached_tokens=40,
+        tool_use_tokens=2,
+        total_tokens=172,
+    )
+
+    # Handles all None
+    assert _extract_live_usage(None) is None
+    assert _extract_live_usage({}) is None
+
+
+def test_live_worker_timeout_with_pending_receiver_emits_failed_and_preserves_partial_debug(
+    monkeypatch,
+) -> None:
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(falafacil.transcription, "LIVE_FINAL_TIMEOUT_MS", 50)
+
+    session = FakeLiveSession(
+        [
+            [
+                _make_server_message(interim_text="Segmento parcial não confirmado"),
+                _make_server_message(
+                    usage={
+                        "prompt_token_count": 30,
+                        "response_token_count": 10,
+                        "total_token_count": 40,
+                    }
+                ),
+            ]
+        ],
+        hang_after_messages=True,
+    )
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    queue.finish()
+
+    interim_events: list[str] = []
+    finished_results: list[LiveTranscriptionResult] = []
+    failed_events: list[tuple[str, Any]] = []
+
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    worker.interim.connect(interim_events.append)
+    worker.finished.connect(finished_results.append)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+
+    worker.request_stop()
+    worker.run()
+
+    assert interim_events == ["Segmento parcial não confirmado"]
+    assert len(finished_results) == 0
+    assert len(failed_events) == 1
+    msg, dbg = failed_events[0]
+    assert "tempo limite" in msg
+    assert dbg.response_text == ""
+    assert dbg.audio_bytes == 1600
+    assert dbg.usage == TokenUsage(
+        input_tokens=30,
+        output_tokens=10,
+        thought_tokens=None,
+        cached_tokens=None,
+        tool_use_tokens=None,
+        total_tokens=40,
+    )
+    assert dbg.error == msg
+    assert session.closed is True
+
+
+def test_live_worker_pending_connect_times_out_and_emits_sanitized_failure(
+    monkeypatch,
+) -> None:
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(falafacil.transcription, "LIVE_FINAL_TIMEOUT_MS", 40)
+
+    secret = "secret-token-live-connect-999"
+    session = FakeLiveSession(hang_on_connect=True)
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    queue.finish()
+
+    finished_results: list[LiveTranscriptionResult] = []
+    failed_events: list[tuple[str, Any]] = []
+
+    worker = LiveTranscriptionWorker(secret, queue, client=client)
+    worker.finished.connect(finished_results.append)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+
+    worker.request_stop()
+    worker.run()
+
+    assert len(finished_results) == 0
+    assert len(failed_events) == 1
+    msg, dbg = failed_events[0]
+    assert "tempo limite" in msg
+    assert secret not in msg
+    assert dbg is not None
+    assert dbg.audio_bytes == 0
+    assert secret not in (dbg.error or "")
+
+
+def test_live_worker_pending_connect_force_cancel_terminates_cleanly_without_signals() -> None:
+    import threading
+    import time
+    QApplication.instance() or QApplication([])
+
+    session = FakeLiveSession(hang_on_connect=True)
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    queue.finish()
+
+    finished_results: list[LiveTranscriptionResult] = []
+    failed_events: list[tuple[str, Any]] = []
+
+    worker = LiveTranscriptionWorker("key", queue, client=client)
+    worker.finished.connect(finished_results.append)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+
+    thread = threading.Thread(target=worker.run)
+    thread.start()
+
+    time.sleep(0.05)
+    worker.force_cancel()
+    thread.join(timeout=1.0)
+
+    assert thread.is_alive() is False
+    assert len(finished_results) == 0
+    assert len(failed_events) == 0
+
+
+def test_live_worker_pending_send_times_out_and_emits_sanitized_failure(
+    monkeypatch,
+) -> None:
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(falafacil.transcription, "LIVE_FINAL_TIMEOUT_MS", 40)
+
+    secret = "secret-token-live-send-888"
+    session = FakeLiveSession(hang_on_send=True)
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    queue.finish()
+
+    finished_results: list[LiveTranscriptionResult] = []
+    failed_events: list[tuple[str, Any]] = []
+
+    worker = LiveTranscriptionWorker(secret, queue, client=client)
+    worker.finished.connect(finished_results.append)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+
+    worker.request_stop()
+    worker.run()
+
+    assert len(finished_results) == 0
+    assert len(failed_events) == 1
+    msg, dbg = failed_events[0]
+    assert "tempo limite" in msg
+    assert secret not in msg
+    assert dbg is not None
+    assert secret not in (dbg.error or "")
+    assert session.closed is True
+
+
+def test_live_worker_pending_send_force_cancel_terminates_cleanly_without_signals() -> None:
+    import threading
+    import time
+    QApplication.instance() or QApplication([])
+
+    session = FakeLiveSession(hang_on_send=True)
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+    queue.finish()
+
+    finished_results: list[LiveTranscriptionResult] = []
+    failed_events: list[tuple[str, Any]] = []
+
+    worker = LiveTranscriptionWorker("key", queue, client=client)
+    worker.finished.connect(finished_results.append)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+
+    thread = threading.Thread(target=worker.run)
+    thread.start()
+
+    time.sleep(0.05)
+    worker.force_cancel()
+    thread.join(timeout=1.0)
+
+    assert thread.is_alive() is False
+    assert len(finished_results) == 0
+    assert len(failed_events) == 0
+    assert session.closed is True
+
+
+def test_live_worker_below_rms_threshold_never_sends_pcm_blobs_and_sends_audio_stream_end(
+    monkeypatch,
+) -> None:
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(falafacil.transcription, "LIVE_FINAL_TIMEOUT_MS", 40)
+    session = FakeLiveSession([
+        [
+            _make_server_message(turn_complete=True),
+        ]
+    ])
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    # Low amplitude chunks (sample value 1, RMS ~ 0.00003 < MIN_RMS_LEVEL 0.005)
+    low_chunk1 = b"\x01\x00" * 800
+    low_chunk2 = b"\x00\x00" * 800
+    queue.enqueue(low_chunk1)
+    queue.enqueue(low_chunk2)
+    queue.finish()
+
+    failed_events: list[tuple[str, Any]] = []
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+    worker.request_stop()
+    worker.run()
+
+    # Assert no audio blobs were transmitted to the session
+    assert len(session.sent_realtime_inputs) == 1
+    assert session.sent_realtime_inputs[0].get("audio") is None
+    assert session.sent_realtime_inputs[0].get("audio_stream_end") is True
+    assert session.closed is True
+
+    # Assert worker emitted failed with audio_bytes == 0
+    assert len(failed_events) == 1
+    msg, dbg = failed_events[0]
+    assert "tempo limite" in msg
+    assert dbg.audio_bytes == 0
+
+def test_live_worker_gating_accumulates_until_threshold_reached_then_flushes_all_in_order() -> None:
+    QApplication.instance() or QApplication([])
+    session = FakeLiveSession([
+        [
+            _make_server_message(final_text="Áudio ativado com sucesso.", turn_complete=True),
+        ]
+    ])
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+
+    # Chunk 1: silence (RMS = 0 < 0.005) -> should be buffered
+    chunk1 = (np.zeros(400, dtype=np.int16)).tobytes()
+    # Chunk 2: voice (RMS of chunk1+chunk2 will be ~ 0.021 > 0.005) -> opens gate and flushes chunk1 & chunk2
+    chunk2 = (np.ones(400, dtype=np.int16) * 1000).tobytes()
+    # Chunk 3: subsequent voice chunk -> sent directly
+    chunk3 = (np.ones(400, dtype=np.int16) * 1500).tobytes()
+
+    queue.enqueue(chunk1)
+    queue.enqueue(chunk2)
+    queue.enqueue(chunk3)
+    queue.finish()
+
+    finished_results: list[LiveTranscriptionResult] = []
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    worker.finished.connect(finished_results.append)
+    worker.request_stop()
+    worker.run()
+
+    inputs = session.sent_realtime_inputs
+    assert len(inputs) == 4
+    assert inputs[0]["audio"].data == chunk1
+    assert inputs[1]["audio"].data == chunk2
+    assert inputs[2]["audio"].data == chunk3
+    assert inputs[3]["audio_stream_end"] is True
+
+    assert len(finished_results) == 1
+    res = finished_results[0]
+    assert res.text == "Áudio ativado com sucesso."
+    assert res.debug.audio_bytes == len(chunk1) + len(chunk2) + len(chunk3)
+    assert session.closed is True
+
+
+def test_live_worker_receive_started_before_stream_end_confirms_on_single_cycle_after_stream_end() -> None:
+    QApplication.instance() or QApplication([])
+
+    class SingleCyclePreEndSession:
+        def __init__(self) -> None:
+            self.cycle = 0
+            self.closed = False
+            self.sent_realtime_inputs: list[dict[str, Any]] = []
+            self.stream_end_sent = asyncio.Event()
+
+        async def send_realtime_input(self, **kwargs) -> None:
+            self.sent_realtime_inputs.append(kwargs)
+            if kwargs.get("audio_stream_end"):
+                self.stream_end_sent.set()
+
+        async def receive(self):
+            current = self.cycle
+            self.cycle += 1
+            if current == 0:
+                # receive() was opened BEFORE stream-end was sent
+                await self.stream_end_sent.wait()
+                # Yield single final+turn_complete caused by audio_stream_end in this same receive call
+                yield _make_server_message(
+                    final_text="Texto confirmado no mesmo ciclo após stream end.",
+                    finished=True,
+                    turn_complete=True,
+                )
+            else:
+                # If worker mistakenly requires a second cycle, hang
+                await asyncio.sleep(3600)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            self.closed = True
+
+    session = SingleCyclePreEndSession()
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    finished_results: list[LiveTranscriptionResult] = []
+    final_events: list[str] = []
+    failed_events: list[tuple[str, Any]] = []
+    worker.final.connect(final_events.append)
+    worker.finished.connect(finished_results.append)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+
+    import threading
+    thread = threading.Thread(target=worker.run)
+    thread.start()
+
+    queue.finish()
+    worker.request_stop()
+    thread.join(timeout=3.0)
+
+    assert thread.is_alive() is False
+    QApplication.processEvents()
+    assert len(failed_events) == 0
+    assert len(finished_results) == 1
+    assert (
+        finished_results[0].text
+        == "Texto confirmado no mesmo ciclo após stream end."
+    )
+    assert session.closed is True
+    assert session.cycle == 1
+
+
+def test_live_worker_final_before_stream_end_in_same_receive_call_does_not_confirm_without_post_end_event(
+    monkeypatch,
+) -> None:
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(falafacil.transcription, "LIVE_FINAL_TIMEOUT_MS", 100)
+
+    class FinalBeforeEndInSameCallSession:
+        def __init__(self) -> None:
+            self.cycle = 0
+            self.closed = False
+            self.sent_realtime_inputs: list[dict[str, Any]] = []
+            self.stream_end_sent = asyncio.Event()
+
+        async def send_realtime_input(self, **kwargs) -> None:
+            self.sent_realtime_inputs.append(kwargs)
+            if kwargs.get("audio_stream_end"):
+                self.stream_end_sent.set()
+
+        async def receive(self):
+            current = self.cycle
+            self.cycle += 1
+            if current == 0:
+                # 1. Yield final BEFORE stream_end is sent
+                yield _make_server_message(
+                    final_text="Texto pré-fim não pode confirmar encerramento.",
+                    finished=True,
+                )
+                # 2. Wait until stream_end is sent
+                await self.stream_end_sent.wait()
+                # 3. Yield interim and usage only (no turn_complete, no new final)
+                yield _make_server_message(interim_text="interim após fim")
+                yield _make_server_message(
+                    usage={
+                        "prompt_token_count": 10,
+                        "response_token_count": 5,
+                        "total_token_count": 15,
+                    }
+                )
+                # 4. Hang so receiver must time out if not confirmed
+                await asyncio.sleep(3600)
+            else:
+                await asyncio.sleep(3600)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            self.closed = True
+
+    session = FinalBeforeEndInSameCallSession()
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+    queue.enqueue((np.ones(800, dtype=np.int16) * 1000).tobytes())
+
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    finished_results: list[LiveTranscriptionResult] = []
+    final_events: list[str] = []
+    failed_events: list[tuple[str, Any]] = []
+
+    def on_final(text: str) -> None:
+        final_events.append(text)
+        # When first final is received, stop the worker/queue so sender sends stream_end
+        queue.finish()
+        worker.request_stop()
+
+    worker.final.connect(on_final)
+    worker.finished.connect(finished_results.append)
+    worker.failed.connect(lambda msg, dbg: failed_events.append((msg, dbg)))
+
+    worker.run()
+
+    assert len(finished_results) == 0
+    assert len(failed_events) == 1
+    msg, dbg = failed_events[0]
+    assert "tempo limite" in msg
+    assert dbg.response_text == "Texto pré-fim não pode confirmar encerramento."
+    assert session.closed is True
+
+
+def test_live_worker_many_silent_chunks_accumulate_incrementally_then_open_gate_and_flush_in_order() -> None:
+    QApplication.instance() or QApplication([])
+    session = FakeLiveSession([
+        [
+            _make_server_message(final_text="Fala detectada após silêncio longo.", turn_complete=True),
+        ]
+    ])
+    client = FakeLiveClient(session)
+    queue = PcmChunkQueue()
+
+    # Enqueue 60 small low-amplitude chunks (each 160 bytes of zeros/near-zero)
+    silent_chunks: list[bytes] = []
+    for i in range(60):
+        chunk = (np.ones(80, dtype=np.int16) * (i % 2)).tobytes()
+        silent_chunks.append(chunk)
+        queue.enqueue(chunk)
+
+    # Loud voice chunk that pulls the accumulated RMS above MIN_RMS_LEVEL
+    loud_chunk = (np.ones(1600, dtype=np.int16) * 4000).tobytes()
+    queue.enqueue(loud_chunk)
+
+    # Subsequent chunk sent after gate is already open
+    post_gate_chunk = (np.ones(800, dtype=np.int16) * 2000).tobytes()
+    queue.enqueue(post_gate_chunk)
+    queue.finish()
+
+    finished_results: list[LiveTranscriptionResult] = []
+    worker = LiveTranscriptionWorker("test-key", queue, client=client)
+    worker.finished.connect(finished_results.append)
+    worker.request_stop()
+    worker.run()
+
+    inputs = session.sent_realtime_inputs
+    # 60 silent chunks + 1 loud chunk + 1 post-gate chunk + 1 audio_stream_end
+    assert len(inputs) == 63
+    for i in range(60):
+        assert inputs[i]["audio"].data == silent_chunks[i]
+        assert inputs[i]["audio"].mime_type == LIVE_MIME_TYPE
+    assert inputs[60]["audio"].data == loud_chunk
+    assert inputs[61]["audio"].data == post_gate_chunk
+    assert inputs[62]["audio_stream_end"] is True
+
+    assert len(finished_results) == 1
+    res = finished_results[0]
+    assert res.text == "Fala detectada após silêncio longo."
+    expected_bytes = sum(len(c) for c in silent_chunks) + len(loud_chunk) + len(post_gate_chunk)
+    assert res.debug.audio_bytes == expected_bytes
+    assert session.closed is True

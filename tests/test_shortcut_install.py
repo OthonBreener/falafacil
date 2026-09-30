@@ -37,7 +37,7 @@ class FakeProcess(QObject):
         self.terminated = False
         self.killed = False
         self.wait_result = wait_result
-
+        self._state = QProcess.ProcessState.NotRunning
     def setProcessEnvironment(self, environment) -> None:
         self.environment = environment
 
@@ -49,7 +49,7 @@ class FakeProcess(QObject):
 
     def start(self) -> None:
         self.started = True
-
+        self._state = QProcess.ProcessState.Running
     def terminate(self) -> None:
         self.terminated = True
 
@@ -57,11 +57,10 @@ class FakeProcess(QObject):
         self.killed = True
 
     def waitForFinished(self, timeout: int) -> bool:
-        assert timeout == 1000
         return self.wait_result
 
     def state(self) -> QProcess.ProcessState:
-        return QProcess.ProcessState.NotRunning
+        return self._state
 
 
 def _qapp() -> QApplication:
@@ -135,11 +134,35 @@ def test_ui_installer_reports_success_cancel_and_forces_slow_process(
     )
     cancelled.finished.connect(lambda ok, message: cancel_results.append((ok, message)))
     cancelled.install()
-    cancelled.cancel()
+    assert cancelled.running is True
+    cancelled.cancel(kill_grace_ms=10)
     assert slow_process.terminated is True
-    assert slow_process.killed is True
+    # Immediate return without blocking; process remains running until signal
+    assert cancelled.running is True
+    assert cancel_results == []
+
+    slow_process._state = QProcess.ProcessState.NotRunning
+    slow_process.finished.emit(127, QProcess.ExitStatus.CrashExit)
+    assert cancelled.running is False
     assert cancel_results == [(False, AUTHORIZATION_CANCELLED_MESSAGE)]
 
+    # Grace period kill fallback
+    slow_kill_process = FakeProcess(wait_result=False)
+    cancel_kill_results: list[tuple[bool, str]] = []
+    cancelled_kill = ShortcutServiceInstaller(
+        process_factory=lambda _parent: slow_kill_process,
+        bundle_resolver=lambda: bundle,
+    )
+    cancelled_kill.finished.connect(lambda ok, message: cancel_kill_results.append((ok, message)))
+    cancelled_kill.install()
+    cancelled_kill.cancel(kill_grace_ms=0)
+    _qapp().processEvents()
+    assert slow_kill_process.terminated is True
+    assert slow_kill_process.killed is True
+    slow_kill_process._state = QProcess.ProcessState.NotRunning
+    slow_kill_process.finished.emit(127, QProcess.ExitStatus.CrashExit)
+    assert cancelled_kill.running is False
+    assert cancel_kill_results == [(False, AUTHORIZATION_CANCELLED_MESSAGE)]
 
 def _prepare_privileged_install(tmp_path: Path, monkeypatch) -> Path:
     source = tmp_path / "source-bundle"

@@ -42,9 +42,11 @@ Para alteração documental, verificar links e confirmar cada promessa contra c�
 
 Além dos comandos gerais, validar o fluxo crítico afetado com os testes determinísticos e fakes disponíveis. A validação deve respeitar estes limites de `AGENTS.md`:
 
-- gravação mono `int16`, fechamento do stream e saída WAV em 16 kHz;
-- envio ao Gemini somente depois da ação explícita de envio, sem bloquear a interface;
-- worker Qt sem acesso a widgets fora do thread principal;
+- gravação mono `int16`, fechamento do stream, suporte a sink `PcmChunkQueue` e saída WAV em 16 kHz;
+- transcrição ao vivo como caminho primário via Live API (`gemini-3.5-transcribe-live`, modo `SMART`, `audio_stream_end=True`), transição para `LIVE_FINALIZING` e fallback transparente para `AUDIO_READY` em caso de erro;
+- dois blocos de texto: `Transcrição atual` editável e `Última mensagem` somente leitura em memória; `clear_text()`/botão de apagar move o texto exato não vazio ao backup; segundo apagar vazio preserva backup; ações de cópia, terminal e revisão com IA usam exclusivamente o editor atual; backup não habilita ações nem é persistido no SQLite;
+- envio manual e revisão profunda ao Gemini com `store=False`, sem bloquear a interface;
+- worker Qt sem acesso a widgets fora do thread principal e sem deixar threads órfãos no fechamento;
 - chave ausente, erro de captura, resposta vazia e falha de integração deixam a janela recuperável;
 - mouse e teclado independentes e simultâneos em ambientes declarados X11/Wayland; pressão correspondente avança o fluxo via `_perform_primary_action` nos três estágios globais aceitos (início de gravação sem roubo de foco/elevação da janela; parada e elevação da janela para revisão do áudio capturado sem chamadas de rede; terceiro acionamento no estado `AUDIO_READY` despacha o envio ao Gemini), enquanto soltura, repetição, trigger diferente, modificador extra e geração antiga não acionam; atalhos globais compartilham debounce de 0,35 s e reconexão automática com temporizador único de 1000 ms;
 - normalização segura e persistência separada de `recording_mouse_button`/`recording_keyboard_shortcut` no schema v1, somente após ACK, com fail-soft de escrita;
@@ -53,7 +55,7 @@ Além dos comandos gerais, validar o fluxo crítico afetado com os testes determ
 - autorização assíncrona sem shell/segredo, retomada da captura, socket `0600` por UID, daemon não-root/hardened e operação manual/`Space` preservadas em falha;
 - encerramento ordenado e não bloqueante: cancelamento do instalador, desconexão de `InputShortcutBridge`, liberação de recursos de áudio e fechamento de `LocalStore` ocorrem uma única vez na UI, mantendo fechamento diferido sem `QThread.wait()` enquanto workers finalizam;
 - configurações com seis grupos ordenados (`Chave API`, `Modelo Gemini`, `Atalho do mouse`, `Atalho do teclado`, `Corretor ortográfico`, `Atualizações`); grupo `Atualizações` com versão instalada, status, barra de progresso indeterminada durante execução e botão literal `Instalar atualizações`;
-- atualização Homebrew protegida contra cliques duplicados e estados busy (`RECORDING`/`TRANSCRIBING`), orientando instalação via brew em ambiente sem marker e oferecendo diálogo de reinício com opções literais `Reiniciar agora` e `Mais tarde`;
+- atualização Homebrew protegida contra cliques duplicados e estados busy (`RECORDING`/`TRANSCRIBING`/`LIVE_FINALIZING`), orientando instalação via brew em ambiente sem marker e oferecendo diálogo de reinício com opções literais `Reiniciar agora` e `Mais tarde`;
 - `closeEvent` bloqueia na primeira linha enquanto uma atualização Homebrew estiver em andamento, emitindo aviso sem mutar `_is_closing` e executando o encerramento ordenado somente após a finalização;
 - separação explícita entre a atualização do aplicativo via Homebrew e a atualização privilegiada do serviço de atalhos globais (gerenciada por `PROTOCOL_VERSION`/pkexec);
 - limite de payload inline de 20 MiB (`INLINE_LIMIT_BYTES`) aplicado exclusivamente à transcrição de áudio WAV (a revisão profunda textual envia o texto integral com `store=False` sem reivindicar limite de 20 MiB) e ausência de segredo em métricas, logs ou mensagens;
@@ -61,7 +63,7 @@ Além dos comandos gerais, validar o fluxo crítico afetado com os testes determ
 
 Smoke físico só é exigível quando o ambiente fornece Ubuntu/systemd/polkit, `/dev/input` legível pelo serviço e mouse/teclado auxiliares. Repetir em X11 e Wayland quando ambos estiverem disponíveis: configurar `x1` e `Ctrl+Alt+R`, testar fora de foco, desconectar/reconectar dispositivos e confirmar isolamento ao desativar cada binding. Sem esses recursos, registrar exatamente o não observado e usar as provas determinísticas; nunca declarar smoke físico como executado.
 
-A regra de terminal é obrigatória: em Wayland, sem `xdotool` ou em caso de falha, os botões `Copiar novamente` e `Copiar e arquivar` atuam como fallback seguro. `TerminalBridge` não executa comando, não envia Enter e não promete colagem automática Wayland. Em X11, o envio para terminal salvo revalida PID/processo, ativa a janela sincronamente (`windowactivate --sync`), confirma a ativação e cola via `Ctrl+Shift+V` e clipboard, falhando de forma fechada sem redetecção se o alvo for inválido; o envio para janela ativa detectada cola diretamente sem confirmação de ativação ou alteração de foco; nenhum fluxo envia Enter.
+A regra de terminal é obrigatória: em Wayland, sem `xdotool` ou em caso de falha, o botão `Copiar` atua como fallback seguro. `TerminalBridge` não executa comando, não envia Enter e não promete colagem automática Wayland. Em X11, o envio para terminal salvo revalida PID/processo, ativa a janela sincronamente (`windowactivate --sync`), confirma a ativação e cola via `Ctrl+Shift+V` e clipboard, falhando de forma fechada sem redetecção se o alvo for inválido; o envio para janela ativa detectada cola diretamente sem confirmação de ativação ou alteração de foco; nenhum fluxo envia Enter.
 ### `packaging/` ou scripts de instalação
 
 Quando a alteração tocar `packaging/` ou `scripts/`, executar também o gate do bundle:
@@ -70,13 +72,13 @@ Quando a alteração tocar `packaging/` ou `scripts/`, executar também o gate d
 poetry install --extras build
 poetry run pip install --no-deps -e .
 ./scripts/build_executable.sh
-./dist/falafacil --update-probe 0.4.0
+./dist/falafacil --update-probe 0.5.0
 tmp_home=$(mktemp -d)
 HOME="$tmp_home" ./scripts/install_desktop.sh "$PWD/dist/falafacil"
 env -u GEMINI_API_KEY -u GOOGLE_API_KEY -u LD_LIBRARY_PATH HOME="$tmp_home" QT_QPA_PLATFORM=offscreen timeout 5s "$tmp_home/.local/bin/falafacil" || [ $? -eq 124 ]
 ```
 
-O bundle compilado deve responder `--update-probe 0.4.0` com código de saída 0, instalar o desktop entry em `$tmp_home/.local/share/applications/falafacil.desktop` modo `0644` apontando para o executável instalado via dispatch `--install-user-desktop` e abrir offscreen em smoke controlado do binário instalado (`$tmp_home/.local/bin/falafacil` com `GEMINI_API_KEY`, `GOOGLE_API_KEY` e `LD_LIBRARY_PATH` explicitamente desarmados, encerrado via timeout 124 ou controle de processo, sem esperar que uma aplicação GUI encerre naturalmente) sem exigir rede, chave, microfone, terminal ou pacote `libportaudio2` do host (PortAudio é embutido no executável one-file). O primeiro startup sob Homebrew registra o desktop entry automaticamente antes de exibir a janela, enquanto execuções a partir do código-fonte ou modo developer não realizam escritas automáticas (coberto deterministicamente em `tests/test_homebrew_update.py` e `tests/test_desktop_install.py`). Quando o serviço/instalador de atalhos globais ou `PROTOCOL_VERSION` mudarem, o smoke instalado também abre `Configurações`, solicita `Autorizar integração global`, confirma retomada automática e verifica `falafacil-shortcutd@<uid>.socket` ativo, socket `/run/falafacil-shortcutd-<uid>.sock` `0600` do usuário e serviço com usuário dinâmico/grupo `input` e fronteira de leitura restrita a dispositivos de entrada (`DevicePolicy=closed` e `char-input`). A suíte determinística nunca aciona polkit ou systemd reais.
+O bundle compilado deve responder `--update-probe 0.5.0` com código de saída 0, instalar o desktop entry em `$tmp_home/.local/share/applications/falafacil.desktop` modo `0644` apontando para o executável instalado via dispatch `--install-user-desktop` e abrir offscreen em smoke controlado do binário instalado (`$tmp_home/.local/bin/falafacil` com `GEMINI_API_KEY`, `GOOGLE_API_KEY` e `LD_LIBRARY_PATH` explicitamente desarmados, encerrado via timeout 124 ou controle de processo, sem esperar que uma aplicação GUI encerre naturalmente) sem exigir rede, chave, microfone, terminal ou pacote `libportaudio2` do host (PortAudio é embutido no executável one-file). O primeiro startup sob Homebrew registra o desktop entry automaticamente antes de exibir a janela, enquanto execuções a partir do código-fonte ou modo developer não realizam escritas automáticas (coberto deterministicamente em `tests/test_homebrew_update.py` e `tests/test_desktop_install.py`). Quando o serviço/instalador de atalhos globais ou `PROTOCOL_VERSION` mudarem, o smoke instalado também abre `Configurações`, solicita `Autorizar integração global`, confirma retomada automática e verifica `falafacil-shortcutd@<uid>.socket` ativo, socket `/run/falafacil-shortcutd-<uid>.sock` `0600` do usuário e serviço com usuário dinâmico/grupo `input` e fronteira de leitura restrita a dispositivos de entrada (`DevicePolicy=closed` e `char-input`). A suíte determinística nunca aciona polkit ou systemd reais.
 ## Critério de aprovação
 
 O gate passa somente quando todos os critérios aplicáveis forem observáveis:
@@ -91,3 +93,13 @@ O gate passa somente quando todos os critérios aplicáveis forem observáveis:
 - o `revisor` recebe evidência suficiente e responde `APROVADO` somente após eliminar achados e validações ausentes.
 
 Uma falha ou bloqueio de ambiente deve ser reportado como `FAIL` com comando e traceback mínimo; não deve ser mascarado por stub, mock falso, no-op ou `TODO`. Alterações não aprovadas retornam ao ciclo `implementador → testador → revisor`.
+
+## Fontes técnicas oficiais
+
+- **Gemini Live API & Transcrição**:
+  - Live Transcribe: [https://ai.google.dev/gemini-api/docs/live-api/live-transcribe](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)
+  - Live API Reference: [https://ai.google.dev/api/live](https://ai.google.dev/api/live)
+  - Python GenAI SDK: [https://googleapis.github.io/python-genai/genai.html](https://googleapis.github.io/python-genai/genai.html)
+  - Python GenAI SDK Changelog: [https://raw.githubusercontent.com/googleapis/python-genai/main/CHANGELOG.md](https://raw.githubusercontent.com/googleapis/python-genai/main/CHANGELOG.md)
+- **Claude Voice Dictation**:
+  - Claude Code Voice Dictation: [https://code.claude.com/docs/en/voice-dictation](https://code.claude.com/docs/en/voice-dictation) (distinção entre Claude Desktop no Linux, onde ditado não está disponível oficialmente, e Claude Code).
