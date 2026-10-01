@@ -12,10 +12,14 @@ from google.genai import types
 import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot
 
-from .audio import MIN_RMS_LEVEL, PcmChunkQueue
+from .audio import (
+    MAX_CAPTURE_WAV_BYTES,
+    MIN_RMS_LEVEL,
+    PcmChunkQueue,
+)
 from .config import DEFAULT_MODEL
 
-INLINE_LIMIT_BYTES = 20 * 1024 * 1024
+INLINE_LIMIT_BYTES = MAX_CAPTURE_WAV_BYTES
 REQUEST_TIMEOUT_MS = 120_000
 LIVE_MODEL = "gemini-3.5-transcribe-live"
 LIVE_MIME_TYPE = "audio/pcm;rate=16000"

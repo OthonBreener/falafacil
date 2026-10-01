@@ -35,6 +35,7 @@ from falafacil.shortcuts import (
 )
 from falafacil.terminal import TerminalBridgeError, TerminalTarget
 from falafacil.transcription import (
+    INLINE_LIMIT_BYTES,
     LiveTranscriptionDebug,
     LiveTranscriptionResult,
     TokenUsage,
@@ -3826,6 +3827,23 @@ def test_main_window_layout_settings_fullscreen_and_grabs(qapp) -> None:
     qapp.processEvents()
     assert window.editor.height() > 0
     assert window.last_message_editor.height() > 0
+    assert window.width() == 760
+    assert window.main_splitter.widget(0).width() > 0
+    assert window.main_splitter.widget(1).width() > 0
+    assert window.usage_chart.width() > 0
+    assert window.usage_chart.height() > 0
+    assert all(
+        button.width() > 0
+        for button in (
+            window.record_button,
+            window.record_again_button,
+            window.play_audio_button,
+            window.review_button,
+            window.copy_button,
+            window.terminal_button,
+            window.clear_button,
+        )
+    )
     assert not window.grab().isNull()
 
     observed: dict[str, object] = {}
@@ -3867,6 +3885,108 @@ def test_main_window_layout_settings_fullscreen_and_grabs(qapp) -> None:
     qapp.processEvents()
     assert not window.isFullScreen()
     window.close()
+def test_adjustable_splitters_resize_diagnostic_and_chart(qapp) -> None:
+    window, _ = make_window(qapp)
+    qapp.processEvents()
+    initial_diagnostic_width = window.main_splitter.widget(1).width()
+    window.main_splitter.setSizes([500, 580])
+    qapp.processEvents()
+    assert window.main_splitter.widget(1).width() != initial_diagnostic_width
+    assert window.main_splitter.widget(1).width() > 0
+
+    initial_chart_height = window.usage_chart.height()
+    window.diagnostic_splitter.setSizes([170, 320])
+    qapp.processEvents()
+    assert window.usage_chart.height() != initial_chart_height
+    assert window.usage_chart.height() > 0
+    window.close()
+
+
+def test_compact_overlay_actions_flags_and_state_sync(qapp) -> None:
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=FakeTranscriber(),
+    )
+    assert window.compact_mode_button.isChecked() is False
+    window.compact_mode_button.click()
+    qapp.processEvents()
+
+    overlay = window._compact_overlay
+    assert overlay is not None
+    assert overlay.isVisible()
+    assert overlay.windowFlags() & Qt.WindowType.Tool
+    assert overlay.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+    assert [button.text() for button in (
+        overlay.speak_button,
+        overlay.send_button,
+        overlay.copy_button,
+    )] == ["Falar", "Enviar para IA", "Copiar"]
+    assert overlay.send_button.isEnabled() is False
+    assert overlay.copy_button.isEnabled() is False
+
+    window.editor.setPlainText("texto pronto")
+    window.state = AppState.READY
+    window._update_actions()
+    assert overlay.copy_button.isEnabled() is True
+    assert overlay.send_button.isEnabled() is False
+
+    window._pending_capture = make_capture()
+    window.state = AppState.AUDIO_READY
+    window._update_actions()
+    assert overlay.send_button.isEnabled() is True
+    assert overlay.copy_button.isEnabled() is True
+
+    window.state = AppState.TRANSCRIBING
+    window._update_actions()
+    assert overlay.speak_button.isEnabled() is False
+    assert overlay.send_button.isEnabled() is False
+    assert overlay.copy_button.isEnabled() is False
+
+    overlay.close()
+    qapp.processEvents()
+    assert overlay.isVisible() is False
+    assert window.compact_mode_button.isChecked() is False
+    window.close()
+
+
+def test_large_pending_audio_is_recoverable_without_worker_or_network(qapp) -> None:
+    transcriber = FakeTranscriber()
+    capture = make_capture(wav_bytes=b"R" * (INLINE_LIMIT_BYTES + 1))
+    window, _ = make_window(
+        qapp,
+        settings=Settings(api_key="active-key"),
+        transcriber=transcriber,
+    )
+    window._pending_capture = capture
+    window.state = AppState.AUDIO_READY
+    window._update_actions()
+    window.compact_mode_button.click()
+    qapp.processEvents()
+    overlay = window._compact_overlay
+    assert overlay is not None
+    assert overlay.send_button.isEnabled() is False
+    assert window.record_button.isEnabled() is False
+    assert window.record_again_button.isEnabled() is True
+
+    assert window._send_pending_audio() is False
+    qapp.processEvents()
+
+    assert window.isVisible()
+    assert window.state is AppState.AUDIO_READY
+    assert window._pending_capture is capture
+    assert window._thread is None
+    assert window._worker is None
+    assert transcriber.calls == []
+    assert "longa demais" in window.status_label.text()
+    assert "longa demais" in window.audio_debug.toPlainText()
+    window.close()
+    qapp.processEvents()
+    qapp.processEvents()
+    assert window._compact_overlay is None
+    assert all(widget is not overlay for widget in QApplication.topLevelWidgets())
+    assert window.compact_mode_button.isChecked() is False
+
 
 
 def test_mouse_rejected_button_keeps_capture_dialog_open(qapp) -> None:
@@ -7778,14 +7898,15 @@ def test_close_event_defers_and_waits_for_running_installer(qapp) -> None:
     assert window._close_pending is False
 
 
-def test_editor_and_last_message_height_constraints_and_layout_order(qapp) -> None:
+def test_editor_and_last_message_minimums_and_layout_order(qapp) -> None:
     window, _ = make_window(qapp)
 
-    # Height constraints
+    # The splitters own the available height; editors no longer reserve a
+    # maximum-height band.
     assert window.editor.minimumHeight() == 120
-    assert window.editor.maximumHeight() == 190
+    assert window.editor.maximumHeight() > 190
     assert window.last_message_editor.minimumHeight() == 70
-    assert window.last_message_editor.maximumHeight() == 110
+    assert window.last_message_editor.maximumHeight() > 110
 
     # Message splitter contains both editors before the actions row
     assert window.message_splitter.count() == 2

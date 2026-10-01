@@ -16,6 +16,16 @@ import numpy as np
 SAMPLE_RATE = 16_000
 CHANNELS = 1
 SAMPLE_WIDTH = 2
+WAV_HEADER_BYTES = 44
+MAX_CAPTURE_WAV_BYTES = 20 * 1024 * 1024
+MAX_CAPTURE_PCM_BYTES = MAX_CAPTURE_WAV_BYTES - WAV_HEADER_BYTES
+def _capture_pcm_limit_for_source_rate(source_rate: int) -> int:
+    if source_rate >= SAMPLE_RATE:
+        return MAX_CAPTURE_PCM_BYTES
+    target_frames = MAX_CAPTURE_PCM_BYTES // SAMPLE_WIDTH
+    source_frames = max(0, (target_frames * source_rate) // SAMPLE_RATE - 1)
+    return source_frames * SAMPLE_WIDTH
+
 MIN_RMS_LEVEL = 0.005
 _SAMPLE_RATE_CANDIDATES = (SAMPLE_RATE, 48_000, 44_100, 32_000, 22_050, 8_000)
 _CHUNK_QUEUE_SENTINEL = object()
@@ -311,8 +321,11 @@ class AudioRecorder:
         self._stream_factory = stream_factory or _default_stream_factory
         self._device = device
         self._capture_sample_rate = SAMPLE_RATE
+        self._capture_pcm_limit = MAX_CAPTURE_PCM_BYTES
         self._stream: Any | None = None
         self._chunks: list[bytes] = []
+        self._captured_pcm_bytes = 0
+        self._capture_overflowed = False
         self._status: str | None = None
         self._last_capture: AudioCapture | None = None
         self._pcm_sink: Callable[[bytes], None] | None = None
@@ -337,6 +350,9 @@ class AudioRecorder:
             if self._stream is not None:
                 raise AudioRecorderError("Já existe uma gravação em andamento.")
             self._chunks = []
+            self._captured_pcm_bytes = 0
+            self._capture_overflowed = False
+            self._capture_pcm_limit = MAX_CAPTURE_PCM_BYTES
             self._status = None
             self._last_capture = None
             self._pcm_sink = pcm_sink
@@ -369,6 +385,9 @@ class AudioRecorder:
                     sample_rate = _resolve_sample_rate(sd, device)
             elif require_sample_rate is not None:
                 sample_rate = require_sample_rate
+            with self._lock:
+                self._capture_sample_rate = sample_rate
+                self._capture_pcm_limit = _capture_pcm_limit_for_source_rate(sample_rate)
 
             stream_kwargs: dict[str, Any] = {
                 "device": device,
@@ -425,6 +444,7 @@ class AudioRecorder:
             pcm_bytes = b"".join(self._chunks)
             sample_rate = self._capture_sample_rate
             status = self._status
+            capture_overflowed = self._capture_overflowed
 
         capture = _build_capture(pcm_bytes, sample_rate)
         with self._lock:
@@ -432,6 +452,10 @@ class AudioRecorder:
 
         if not pcm_bytes:
             raise AudioRecorderError("Nenhum áudio foi capturado.")
+        if capture_overflowed:
+            raise AudioRecorderError(
+                "A captura excedeu o limite de 20 MiB. Grave uma fala mais curta."
+            )
         if capture.rms < MIN_RMS_LEVEL:
             raise AudioRecorderError(
                 "O áudio capturado está muito baixo. Verifique o microfone e tente novamente."
@@ -462,10 +486,22 @@ class AudioRecorder:
         status_text = str(status) if status else None
         chunk = indata.copy().tobytes()
         with self._lock:
-            if status_text:
-                self._status = status_text
-            self._chunks.append(chunk)
-            sink = self._pcm_sink
+            if self._capture_overflowed:
+                self._status = "A captura excedeu o limite máximo de áudio."
+                sink = self._pcm_sink
+            else:
+                if status_text:
+                    self._status = status_text
+                remaining = self._capture_pcm_limit - self._captured_pcm_bytes
+                accepted_limit = max(0, remaining - (remaining % SAMPLE_WIDTH))
+                accepted = chunk[:accepted_limit]
+                if len(accepted) < len(chunk):
+                    self._capture_overflowed = True
+                    self._status = "A captura excedeu o limite máximo de áudio."
+                if accepted:
+                    self._chunks.append(accepted)
+                    self._captured_pcm_bytes += len(accepted)
+                sink = self._pcm_sink
         if sink is not None:
             try:
                 sink(chunk)
