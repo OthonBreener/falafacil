@@ -136,7 +136,7 @@ def test_main_startup_with_persisted_model_and_persisted_key(
     assert exit_code == 0
     assert fake_app.org_name == "FalaFácil"
     assert fake_app.app_name == "FalaFácil"
-    assert fake_app.app_version == "0.5.0"
+    assert fake_app.app_version == "0.6.0"
     assert len(created_windows) == 1
     window = created_windows[0]
     assert window.live_worker_factory is not None
