@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStyle,
     QTabWidget,
@@ -91,6 +92,7 @@ from .spell_highlighter import SpellHighlighter
 from .spellcheck import LocalSpellChecker, utf16_code_unit_offsets
 from .transcription import (
     GeminiTranscriber,
+    INLINE_LIMIT_BYTES,
     LiveTranscriptionDebug,
     LiveTranscriptionResult,
     LiveTranscriptionWorker,
@@ -184,7 +186,7 @@ class TokenUsageChart(QWidget):
         self.last_rendered_legend_text_rects: dict[str, QRectF] = {}
         self.last_rendered_bar_rects: tuple[QRectF, ...] = ()
         self.last_rendered_plot_rect: QRectF | None = None
-        self.setMinimumHeight(140)
+        self.setMinimumHeight(170)
 
     @property
     def status(self) -> str:
@@ -211,10 +213,10 @@ class TokenUsageChart(QWidget):
         self.update()
 
     def sizeHint(self) -> QSize:
-        return QSize(280, 180)
+        return QSize(300, 210)
 
     def minimumSizeHint(self) -> QSize:
-        return QSize(200, 140)
+        return QSize(220, 170)
 
     def paintEvent(self, event: QPaintEvent) -> None:
         del event
@@ -634,6 +636,91 @@ class SpellSuggestionPopup(QFrame):
         self.ignore_selected.emit(word)
 
 
+class CompactOverlay(QWidget):
+    """Janela compacta, não modal e sempre visível para o fluxo principal."""
+
+    closed = Signal()
+
+    def __init__(self, parent_window: "MainWindow") -> None:
+        super().__init__(
+            None,
+            Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self._parent_window = parent_window
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        self.setWindowTitle("FalaFácil — modo compacto")
+        self.setAccessibleName("Modo compacto do FalaFácil")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        self.speak_button = QPushButton("Falar", self)
+        self.speak_button.setAccessibleName("Falar")
+        self.speak_button.clicked.connect(parent_window._perform_primary_action)
+        layout.addWidget(self.speak_button)
+
+        self.send_button = QPushButton("Enviar para IA", self)
+        self.send_button.setAccessibleName("Enviar para IA")
+        self.send_button.clicked.connect(parent_window._send_pending_audio)
+        layout.addWidget(self.send_button)
+
+        self.copy_button = QPushButton("Copiar", self)
+        self.copy_button.setAccessibleName("Copiar")
+        self.copy_button.clicked.connect(parent_window.copy_text)
+        layout.addWidget(self.copy_button)
+
+        self.setMinimumWidth(270)
+        self.adjustSize()
+
+    def sync(
+        self,
+        *,
+        primary_text: str,
+        primary_enabled: bool,
+        send_enabled: bool,
+        copy_enabled: bool,
+        busy: bool,
+    ) -> None:
+        if primary_text == "Parar e revisar áudio":
+            compact_primary_text = "Parar"
+        elif primary_text == "Finalizando transcrição ao vivo…":
+            compact_primary_text = "Finalizando…"
+        else:
+            compact_primary_text = "Falar"
+        self.speak_button.setText(compact_primary_text)
+        self.speak_button.setEnabled(primary_enabled)
+        self.send_button.setEnabled(send_enabled and not busy)
+        self.copy_button.setEnabled(copy_enabled and not busy)
+        self.setProperty("busy", busy)
+        self.setWindowTitle(
+            "FalaFácil — modo compacto (ocupado)" if busy
+            else "FalaFácil — modo compacto"
+        )
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def dispose(self) -> None:
+        """Destrói a janela quando a janela principal é encerrada."""
+        self._parent_window = None
+        for button in (self.speak_button, self.send_button, self.copy_button):
+            try:
+                button.clicked.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        try:
+            self.closed.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        self.hide()
+        self.deleteLater()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.hide()
+        self.closed.emit()
+        event.ignore()
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -702,6 +789,7 @@ class MainWindow(QMainWindow):
         self._active_playback_generation: int | None = None
         self._media_adapters: tuple[Callable, ...] = ()
         self._spell_popup: SpellSuggestionPopup | None = None
+        self._compact_overlay: CompactOverlay | None = None
         if spell_checker is not None:
             self.spell_checker = spell_checker
         else:
@@ -889,8 +977,8 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget(self)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
         self._settings_dialog: QDialog | None = None
         # These controls belong to the transient settings dialog.  Keep the
         # references explicit so they can be invalidated when Qt destroys the
@@ -935,6 +1023,14 @@ class MainWindow(QMainWindow):
         self.settings_button.clicked.connect(self._open_settings_dialog)
         header.addWidget(self.settings_button)
 
+        self.compact_mode_button = QToolButton(central)
+        self.compact_mode_button.setCheckable(True)
+        self.compact_mode_button.setText("▣")
+        self.compact_mode_button.setToolTip("Mostrar ou ocultar o modo compacto")
+        self.compact_mode_button.setAccessibleName("Modo compacto")
+        self.compact_mode_button.clicked.connect(self._toggle_compact_overlay)
+        header.addWidget(self.compact_mode_button)
+
         self.fullscreen_button = QToolButton(central)
         self.fullscreen_button.setFixedSize(36, 36)
         self.fullscreen_button.clicked.connect(self._toggle_fullscreen)
@@ -943,12 +1039,15 @@ class MainWindow(QMainWindow):
 
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal, central)
         self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(8)
 
         left_panel = QWidget(self.main_splitter)
+        left_panel.setMinimumWidth(380)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(12)
+        left_layout.setSpacing(6)
         microphone_row = QHBoxLayout()
+        microphone_row.setSpacing(6)
         microphone_row.addWidget(QLabel("Microfone", left_panel))
         self.microphone_combo = QComboBox(left_panel)
         self.microphone_combo.setEditable(False)
@@ -963,19 +1062,20 @@ class MainWindow(QMainWindow):
 
         self.message_splitter = QSplitter(Qt.Orientation.Vertical, left_panel)
         self.message_splitter.setChildrenCollapsible(False)
+        self.message_splitter.setHandleWidth(8)
+
 
         # Bloco superior: Transcrição atual
         current_block = QWidget(self.message_splitter)
         current_layout = QVBoxLayout(current_block)
         current_layout.setContentsMargins(0, 0, 0, 0)
-        current_layout.setSpacing(8)
+        current_layout.setSpacing(4)
 
         current_layout.addWidget(QLabel("Transcrição atual", current_block))
         self.editor = QPlainTextEdit(current_block)
         self.editor.setPlaceholderText("A transcrição aparecerá aqui.")
         self.editor.setTabChangesFocus(False)
         self.editor.setMinimumHeight(120)
-        self.editor.setMaximumHeight(190)
         self.editor.textChanged.connect(self._update_actions)
         current_layout.addWidget(self.editor, stretch=1)
         self.message_splitter.addWidget(current_block)
@@ -984,7 +1084,7 @@ class MainWindow(QMainWindow):
         last_block = QWidget(self.message_splitter)
         last_layout = QVBoxLayout(last_block)
         last_layout.setContentsMargins(0, 0, 0, 0)
-        last_layout.setSpacing(8)
+        last_layout.setSpacing(4)
 
         last_layout.addWidget(QLabel("Última mensagem", last_block))
         self.last_message_editor = QPlainTextEdit(last_block)
@@ -994,14 +1094,14 @@ class MainWindow(QMainWindow):
         )
         self.last_message_editor.setTabChangesFocus(False)
         self.last_message_editor.setMinimumHeight(70)
-        self.last_message_editor.setMaximumHeight(110)
         last_layout.addWidget(self.last_message_editor, stretch=1)
 
         self.message_splitter.addWidget(last_block)
-        self.message_splitter.setSizes([300, 90])
+        self.message_splitter.setSizes([420, 120])
         left_layout.addWidget(self.message_splitter, stretch=1)
 
         actions_layout = QHBoxLayout()
+        actions_layout.setSpacing(6)
         self.record_button = QPushButton("Gravar", left_panel)
         self.record_button.setToolTip("Ação principal: grava, pausa para revisar ou envia áudio")
         self.record_button.clicked.connect(self._perform_primary_action)
@@ -1039,6 +1139,22 @@ class MainWindow(QMainWindow):
         self.clear_button.setToolTip("Apaga o texto da transcrição atual")
         self.clear_button.clicked.connect(self.clear_text)
         actions_layout.addWidget(self.clear_button)
+        action_buttons = (
+            self.record_button,
+            self.record_again_button,
+            self.play_audio_button,
+            self.review_button,
+            self.copy_button,
+            self.terminal_button,
+            self.clear_button,
+        )
+        for index, button in enumerate(action_buttons):
+            button.setMinimumWidth(0)
+            button.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Fixed,
+            )
+            actions_layout.setStretch(index, 1)
         left_layout.addLayout(actions_layout)
 
         self.status_label = QLabel(left_panel)
@@ -1046,9 +1162,10 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.status_label)
 
         right_panel = QWidget(self.main_splitter)
+        right_panel.setMinimumWidth(260)
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
+        right_layout.setSpacing(6)
         diagnostic_title = QLabel("Diagnóstico", right_panel)
         diagnostic_font = QFont(diagnostic_title.font())
         diagnostic_font.setBold(True)
@@ -1058,7 +1175,9 @@ class MainWindow(QMainWindow):
             Qt.Orientation.Vertical, right_panel
         )
         self.diagnostic_splitter.setChildrenCollapsible(False)
+        self.diagnostic_splitter.setHandleWidth(8)
         self.diagnostic_tabs = QTabWidget(self.diagnostic_splitter)
+        self.diagnostic_tabs.setMinimumHeight(150)
         self.audio_debug = self._new_debug_editor(self.diagnostic_tabs)
         self.payload_debug = self._new_debug_editor(self.diagnostic_tabs)
         self.return_debug = self._new_debug_editor(self.diagnostic_tabs)
@@ -1069,6 +1188,7 @@ class MainWindow(QMainWindow):
         self.diagnostic_tabs.addTab(self.usage_debug, "Consumo")
 
         chart_panel = QWidget(self.diagnostic_splitter)
+        chart_panel.setMinimumHeight(190)
         chart_layout = QVBoxLayout(chart_panel)
         chart_layout.setContentsMargins(0, 0, 0, 0)
         chart_layout.addWidget(QLabel("Gráfico de consumo de tokens", chart_panel))
@@ -1078,13 +1198,30 @@ class MainWindow(QMainWindow):
         self.diagnostic_splitter.addWidget(chart_panel)
         self.diagnostic_splitter.setStretchFactor(0, 3)
         self.diagnostic_splitter.setStretchFactor(1, 2)
+        self.diagnostic_splitter.setSizes([270, 220])
         right_layout.addWidget(self.diagnostic_splitter, stretch=1)
 
         self.main_splitter.addWidget(left_panel)
         self.main_splitter.addWidget(right_panel)
         self.main_splitter.setStretchFactor(0, 3)
         self.main_splitter.setStretchFactor(1, 2)
-        self.main_splitter.setSizes([660, 440])
+        self.main_splitter.setSizes([680, 400])
+        splitter_style = (
+            "QSplitter::handle { background: palette(mid); }"
+            "QSplitter::handle:hover { background: palette(highlight); }"
+        )
+        for splitter in (
+            self.main_splitter,
+            self.message_splitter,
+            self.diagnostic_splitter,
+        ):
+            splitter.setStyleSheet(splitter_style)
+            for index in range(max(0, splitter.count() - 1)):
+                splitter.handle(index).setCursor(
+                    Qt.CursorShape.SizeHorCursor
+                    if splitter.orientation() == Qt.Orientation.Horizontal
+                    else Qt.CursorShape.SizeVerCursor
+                )
         layout.addWidget(self.main_splitter, stretch=1)
         self.setCentralWidget(central)
 
@@ -1101,6 +1238,77 @@ class MainWindow(QMainWindow):
         editor.setReadOnly(True)
         editor.setMaximumBlockCount(200)
         return editor
+    @Slot()
+    def _toggle_compact_overlay(self) -> None:
+        if self._compact_overlay is None:
+            self._compact_overlay = CompactOverlay(self)
+            self._compact_overlay.closed.connect(self._on_compact_overlay_closed)
+        if self._compact_overlay.isVisible():
+            self._compact_overlay.hide()
+            self.compact_mode_button.setChecked(False)
+            return
+        self._position_compact_overlay()
+        self._compact_overlay.show()
+        self.compact_mode_button.setChecked(True)
+        self._sync_compact_overlay()
+
+    def _position_compact_overlay(self) -> None:
+        if self._compact_overlay is None:
+            return
+        self._compact_overlay.adjustSize()
+        screen = QGuiApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        available = (
+            screen.availableGeometry()
+            if screen is not None
+            else QRect(0, 0, 1920, 1080)
+        )
+        size = self._compact_overlay.sizeHint()
+        x = available.right() - size.width() - 12
+        y = available.top() + 12
+        self._compact_overlay.move(
+            max(available.left() + 4, x),
+            max(available.top() + 4, y),
+        )
+
+    @Slot()
+    def _on_compact_overlay_closed(self) -> None:
+        if not getattr(self, "_is_closing", False):
+            self.compact_mode_button.setChecked(False)
+
+    def _close_compact_overlay(self) -> None:
+        overlay = self._compact_overlay
+        self._compact_overlay = None
+        if overlay is not None:
+            try:
+                overlay.dispose()
+            except RuntimeError:
+                pass
+        if hasattr(self, "compact_mode_button"):
+            self.compact_mode_button.setChecked(False)
+
+    def _sync_compact_overlay(self) -> None:
+        overlay = self._compact_overlay
+        if overlay is None or not hasattr(self, "record_button"):
+            return
+        overlay.sync(
+            primary_text=self.record_button.text(),
+            primary_enabled=self.record_button.isEnabled(),
+            send_enabled=(
+                self.state is AppState.AUDIO_READY
+                and self._pending_audio_inline_valid()
+            ),
+            copy_enabled=self.copy_button.isEnabled(),
+            busy=(
+                self.state
+                in (AppState.RECORDING, AppState.TRANSCRIBING, AppState.LIVE_FINALIZING)
+                or self._thread is not None
+                or self._worker is not None
+                or self._is_reviewing
+            ),
+        )
+
 
     @Slot()
     def _open_settings_dialog(self) -> None:
@@ -2531,6 +2739,16 @@ class MainWindow(QMainWindow):
             return False
         if self._thread is not None or self._worker is not None:
             return False
+        capture = self._pending_capture
+        if len(capture.wav_bytes) > INLINE_LIMIT_BYTES:
+            message = (
+                "A fala ficou longa demais para o envio direto. "
+                "Grave uma fala mais curta."
+            )
+            self._render_audio_debug(capture, error=message)
+            self.status_label.setText(message)
+            self._update_actions()
+            return False
         if self.transcriber is None or not self.settings.has_api_key:
             self._set_error(self.settings.missing_api_key_message)
             return False
@@ -3036,12 +3254,20 @@ class MainWindow(QMainWindow):
         self._origin_terminal_target = None
         self.status_label.setText("Texto colado no terminal ativo, sem pressionar Enter.")
 
+    def _pending_audio_inline_valid(self) -> bool:
+        capture = self._pending_capture
+        return (
+            capture is not None
+            and len(capture.wav_bytes) <= INLINE_LIMIT_BYTES
+        )
+
     def _update_actions(self) -> None:
         worker_busy = self._thread is not None or self._worker is not None
         busy = self.state in (AppState.TRANSCRIBING, AppState.LIVE_FINALIZING) or worker_busy
         recording = self.state is AppState.RECORDING
         finalizing = self.state is AppState.LIVE_FINALIZING
         audio_ready = self.state is AppState.AUDIO_READY and not worker_busy
+        audio_sendable = audio_ready and self._pending_audio_inline_valid()
         has_text = bool(self.editor.toPlainText().strip())
         reviewing = self._is_reviewing
 
@@ -3061,7 +3287,11 @@ class MainWindow(QMainWindow):
             and not reviewing
             and self.settings.has_api_key
             and self.transcriber is not None
-            and (self._microphone_available or audio_ready)
+            and (
+                audio_sendable
+                if self.state is AppState.AUDIO_READY
+                else self._microphone_available
+            )
         )
 
         self.record_again_button.setEnabled(
@@ -3104,6 +3334,7 @@ class MainWindow(QMainWindow):
         self.refresh_microphones_button.setEnabled(not busy and not recording and not finalizing and not reviewing)
         self.settings_button.setEnabled(True)
         self._update_settings_dialog()
+        self._sync_compact_overlay()
         if not self.settings.has_api_key and self.state is AppState.IDLE:
             self.status_label.setText(self.settings.missing_api_key_message)
     def _show_editor_context_menu(self, pos: QPoint) -> None:
@@ -3393,6 +3624,10 @@ class MainWindow(QMainWindow):
 
     def __del__(self) -> None:
         try:
+            self._close_compact_overlay()
+        except Exception:
+            pass
+        try:
             app = QApplication.instance()
             if app is not None:
                 app.removeEventFilter(self)
@@ -3640,6 +3875,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._is_closing = True
+        self._close_compact_overlay()
         self._live_generation += 1
         if hasattr(self, "_hover_spell_timer") and self._hover_spell_timer.isActive():
             self._hover_spell_timer.stop()

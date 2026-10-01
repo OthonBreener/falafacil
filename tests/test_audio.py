@@ -12,6 +12,8 @@ from falafacil.audio import (
     AudioDevice,
     AudioRecorder,
     AudioRecorderError,
+    MAX_CAPTURE_PCM_BYTES,
+    MAX_CAPTURE_WAV_BYTES,
     MIN_RMS_LEVEL,
     PcmChunkQueue,
     serialize_wav,
@@ -121,6 +123,64 @@ def test_recorder_keeps_empty_capture_and_closes_stream() -> None:
     assert recorder.last_capture() is not None
     assert recorder.last_capture().frames == 0
     assert stream.closed
+def test_recorder_bounds_oversized_capture_and_closes_stream() -> None:
+    class BytesInput:
+        def __init__(self, value: bytes) -> None:
+            self.value = value
+
+        def copy(self) -> "BytesInput":
+            return self
+
+        def tobytes(self) -> bytes:
+            return self.value
+
+    stream = FakeStream()
+    recorder = AudioRecorder(stream_factory=lambda **kwargs: stream)
+    recorder.start()
+    oversized_pcm = b"\xe8\x03" * (MAX_CAPTURE_PCM_BYTES // 2 + 1)
+    recorder._callback(BytesInput(oversized_pcm), 0, None, None)
+    recorder._callback(BytesInput(b"\x10\x00" * 4), 0, None, "late-backend-status")
+    assert recorder._captured_pcm_bytes == MAX_CAPTURE_PCM_BYTES
+    assert recorder.last_status() == "A captura excedeu o limite máximo de áudio."
+
+    with pytest.raises(AudioRecorderError, match="excedeu o limite de 20 MiB"):
+        recorder.stop()
+
+    capture = recorder.last_capture()
+    assert capture is not None
+    assert len(capture.wav_bytes) == MAX_CAPTURE_WAV_BYTES
+    assert recorder._captured_pcm_bytes == MAX_CAPTURE_PCM_BYTES
+    assert sum(len(chunk) for chunk in recorder._chunks) <= MAX_CAPTURE_PCM_BYTES
+    assert recorder.last_status() == "A captura excedeu o limite máximo de áudio."
+    assert stream.stopped
+    assert stream.closed
+    assert not recorder.is_recording()
+def test_recorder_bounds_oversized_low_native_rate_after_resampling() -> None:
+    class BytesInput:
+        def __init__(self, value: bytes) -> None:
+            self.value = value
+
+        def copy(self) -> "BytesInput":
+            return self
+
+        def tobytes(self) -> bytes:
+            return self.value
+
+    stream = FakeStream()
+    recorder = AudioRecorder(stream_factory=lambda **kwargs: stream)
+    recorder.start(require_sample_rate=8_000)
+    oversized_pcm = b"\xe8\x03" * (recorder._capture_pcm_limit // 2 + 1)
+    recorder._callback(BytesInput(oversized_pcm), 0, None, None)
+
+    with pytest.raises(AudioRecorderError, match="excedeu o limite de 20 MiB"):
+        recorder.stop()
+
+    capture = recorder.last_capture()
+    assert capture is not None
+    assert len(capture.wav_bytes) <= MAX_CAPTURE_WAV_BYTES
+    assert stream.closed
+
+
 
 
 def test_recorder_rejects_duplicate_start() -> None:

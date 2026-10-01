@@ -11,7 +11,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 import falafacil.transcription
-from falafacil.audio import PcmChunkQueue
+from falafacil.audio import MAX_CAPTURE_WAV_BYTES, PcmChunkQueue
 from falafacil.config import DEFAULT_MODEL
 from falafacil.transcription import (
     INLINE_LIMIT_BYTES,
@@ -322,6 +322,7 @@ def test_transcriber_bounds_requests_with_a_positive_timeout(monkeypatch) -> Non
 
 
 def test_transcriber_rejects_empty_and_oversized_audio() -> None:
+    assert INLINE_LIMIT_BYTES == MAX_CAPTURE_WAV_BYTES
     transcriber = GeminiTranscriber(client=FakeClient())
 
     with pytest.raises(TranscriptionError, match="vazio"):
